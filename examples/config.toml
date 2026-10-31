@@ -1,0 +1,44 @@
+# Example brain config. Copy to ~/.config/brain/config.toml, or run `brain init`.
+# Every key can be overridden by an environment variable named
+# BRAIN_<SECTION>__<KEY>, e.g. BRAIN_STORAGE__BUCKET.
+
+[storage]
+backend = "s3"                    # "s3" or "local"
+bucket = "my-team-brain"
+prefix = "brain/"
+endpoint_url = ""                 # set for S3-compatible stores, e.g. "https://s3.internal:9000"
+region = ""
+profile = ""                      # AWS profile; empty uses the standard AWS credential chain
+addressing_style = "auto"         # "path" is often required by S3-compatible stores
+path = ""                         # only for backend = "local"
+
+[tls]                             # applies to both the model endpoint and S3
+ca_bundle = ""                    # empty uses the OS trust store
+client_cert = ""                  # for mTLS
+client_key = ""
+
+[llm]                             # any OpenAI-compatible endpoint
+base_url = "https://llm-gateway.internal/v1"
+api_key_env = "BRAIN_API_KEY"     # name of the env var that holds the key, not the key
+chat_model = ""
+extract_model = ""
+embed_model = ""
+doc_model = ""
+embed_dim = 0                     # 0 means detect
+structured_output = "auto"        # "auto", "tool", "native", or "prompted"
+timeout_seconds = 120
+
+[index]
+path = ""                         # default: ~/.cache/brain/<store-hash>/index.db; keep it off NFS
+
+[threads]
+inactivity_days = 21
+
+[lease]
+ttl_seconds = 900
+
+[server]
+port = 8765
+
+[worker]
+poll_seconds = 60

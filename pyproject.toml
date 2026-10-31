@@ -1,0 +1,55 @@
+[project]
+name = "brain-journal"
+version = "0.1.0"
+description = "A work journal that an LLM turns into a linked, searchable knowledge graph"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "boto3>=1.36",
+    "httpx2>=2.16.0",
+    "openai>=3.41.0",
+    "pydantic>=2.14.2",
+    "pydantic-ai-slim[openai]>=2.63.0",
+    "pydantic-settings>=2.16.2",
+    "ruamel-yaml>=0.19.1",
+    "sqlite-vec>=0.1.9",
+    "truststore>=0.10.5",
+    "typer>=0.27.3",
+]
+
+[project.scripts]
+brain = "brain.cli.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/brain"]
+
+[dependency-groups]
+dev = [
+    "moto[s3,server]>=5.2.5",
+    "pyright>=1.1.414",
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+    "trustme>=1.2.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["live: needs a real model endpoint (BRAIN_LIVE_TESTS=1)"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "BLE"]
+ignore = ["E501"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"

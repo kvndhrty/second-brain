@@ -218,10 +218,21 @@ fragments:
     dream: true
   f-e-20261030T143205Z-07:
     deleted: true                 # you rejected this fragment
-mentions:                         # name as written in this entry -> entity id
-  "Mike": mike-chen
-  "the platform folks": platform-team
+  f-e-20261030T143205Z-08:
+    answers: [f-e-20261012T090000Z-02]      # accepted: this fragment answers an earlier question
+    not_answers: [f-e-20261001T090000Z-04]  # rejected proposal; not asked again
+mentions:                         # name as written in this entry -> entity id, per type
+  person:
+    "Mike": mike-chen
+    "the vendor rep": null        # null: not an entity, stop asking
+  org:
+    "the platform folks": platform-team
+  theme:
+    "capacity stuff": capacity-planning
 ```
+
+Unknown keys in this file are errors (reported by `brain doctor`), so a typo
+such as `stauts:` is not silently ignored.
 
 When an entry is re-extracted, new fragments are matched to the old fragment
 IDs (section 6, Pipeline) so the changes above still apply to the right
@@ -262,11 +273,15 @@ action items and `null` for other kinds.
 
 ### Resolution sidecar (`generated/resolutions/<entry-id>.json`)
 
-One record per distinct mention: `{surface, type, decision: link|new|pending,
-entity_id?, proposed?: {name, org, role…}, confidence, candidates: [...],
-model, prompt}`. A `new` or `pending` record that is not settled in the
-decisions file becomes a review-queue item. Proposed people and orgs are not
-written to `people/` or `orgs/` until you confirm them.
+`{format, entry_id, extraction_hash, model, prompt, created_at, mentions,
+answers}`. `mentions` has one record per distinct mention: `{surface, type:
+person|org|theme|thread, decision: link|new|pending|ignore, entity_id?,
+proposed?, confidence, candidates: [{entity_id, score}]}`. A `new` or `pending`
+record that is not settled in the decisions file becomes a review-queue item.
+Proposed people and orgs are not written to `people/` or `orgs/` until you
+confirm them. New themes and threads are written with `state: proposed` and
+recorded here as `link`. `answers` holds proposals of the form `{fragment,
+answers, confidence}` ("this fragment answers that earlier question").
 
 ### Embedding sidecar (`generated/embeddings/<model-slug>/<entry-id>.json`)
 
@@ -294,7 +309,16 @@ Linux. That build bundles a recent SQLite with FTS5 and allows
 extension loading, which sqlite-vec needs. `doctor` checks the SQLite version,
 FTS5, and extension loading, and fails clearly if any is missing (for example,
 if someone installs with RHEL's system Python by mistake). Because the index is
-derived, there are no migrations: a schema version mismatch triggers a rebuild.
+derived, there are no migrations: a schema version or embedding-model mismatch
+triggers a rebuild.
+
+The full DDL is in `src/brain/core/index/schema.sql`. Beyond the tables
+below, every derived table has an `owner` column naming the unit whose files
+produced the row. A unit is one entry plus its sidecars and decisions file, or
+one entity plus (for threads) its summary. When any file changes, the rows of
+the affected units are deleted and rebuilt from the current files, so the
+result never depends on the order of changes. `objects.unit` maps each key to
+its unit, and `problems` lists files that could not be parsed.
 
 ```sql
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -513,8 +537,12 @@ class Vault:
 
 ### Index sync
 
-On startup, read `_system/generation.json`. If its counter equals
-`meta.generation`, skip listing. Otherwise list the store, diff against the
+On startup, read `_system/generation.json`. Each write through brain replaces
+it with a new random token. If the token equals `meta.generation`, skip
+listing. (A random token rather than a counter, so two processes that bump it
+at the same moment cannot produce the same value.) Writes made by this process
+update the index directly and advance `meta.generation` only if the index was
+already in sync before the write. Otherwise list the store, diff against the
 `objects` manifest by ETag, and rebuild rows for changed keys. A full listing
 also runs if the last one is older than 24 hours, and on `brain sync --full`.
 `brain reindex` deletes the database and rebuilds from a full listing.
@@ -536,12 +564,14 @@ class LLM:
 - Chat and extraction use `pydantic-ai-slim[openai]` with an OpenAI-compatible
   model pointed at `base_url`. The slim package avoids pulling every provider SDK.
 - Embeddings use the `openai` SDK's embeddings endpoint (already a dependency of
-  the PydanticAI OpenAI model), sharing the same `httpx.Client`. If the
+  the PydanticAI OpenAI model), sharing the same `httpx2.Client`. (openai 3.x and
+  pydantic-ai 2.x use `httpx2`, a separate package from `httpx`; brain uses
+  `httpx2` throughout so the TLS client it builds is the type the SDKs expect.) If the
   installed PydanticAI version has an embeddings API that accepts a custom
   client, use that instead; check at implementation time.
 - `tls.py` builds one `ssl.SSLContext` from `[tls]`: OS trust store via
   `truststore` by default, or `ca_bundle` if set; then
-  `load_cert_chain(client_cert, client_key)` if set. httpx gets the context;
+  `load_cert_chain(client_cert, client_key)` if set. httpx2 gets the context;
   boto3 gets `verify=ca_bundle` and `Config(client_cert=...)`. Proxy env vars
   are honoured by both.
 - `structured_output = "auto" | "tool" | "native" | "prompted"` maps to
@@ -747,18 +777,20 @@ poll_seconds = 60
 
 | # | Decision | Status |
 |---|----------|--------|
-| 1 | Lease per machine; `brain start` combines web, MCP (HTTP), and worker; `brain mcp` stdio kept | proposed after review |
+| 1 | Lease per machine; `brain start` combines web, MCP (HTTP), and worker; `brain mcp` stdio kept | agreed |
 | 2 | Conditional-write support probed at runtime | agreed |
-| 3 | Your changes to extracted data stored in `decisions/<entry-id>.yaml`, applied on top of the extraction | needs confirmation |
-| 4 | Embeddings stored as generated files so `reindex` needs no endpoint | needs confirmation |
+| 3 | Your changes to extracted data stored in `decisions/<entry-id>.yaml`, applied on top of the extraction | agreed |
+| 4 | Embeddings stored as generated files so `reindex` needs no endpoint | agreed |
 | 5 | sqlite-vec as the vector index; uv-managed Python everywhere | agreed |
 | 6 | `dream` is a boolean flag | agreed |
-| 7 | Questions and action items have `state: open | closed`, reversible; the pipeline only proposes closing | proposed after review |
+| 7 | Questions and action items have `state: open | closed`, reversible; the pipeline only proposes closing | agreed |
 | 8 | Brief `since` defaults to the last brief for that node | agreed, expected to change with use |
-| 9 | People and orgs wait for review; themes and threads are created as `proposed` and used immediately | proposed after review |
+| 9 | People and orgs wait for review; themes and threads are created as `proposed` and used immediately | agreed |
 | 10 | One `[tls]` section for both endpoints | agreed |
 | 11 | `brain start` processes pending work in the background; `brain process` for manual runs | agreed |
 | 12 | GitHub only, no PyPI; frontend delivery decided at milestone 4 | agreed |
+| 13 | FIPS mode must work: SHA-256 only, enforced by a test that rejects MD5/SHA-1 in the source | agreed |
+| 14 | Mentions in the decisions file are grouped by type (`person`, `org`, `theme`) | made during milestone 1 |
 
 ## 11. Milestone 1 scope
 

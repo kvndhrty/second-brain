@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: ci/lint.sh
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHON: ${{ matrix.python }}
+      # Ubuntu runners have Docker, so the MinIO tests must run there.
+      BRAIN_TEST_REQUIRE_S3: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: ci/test.sh
+
+  # RHEL 9 is a supported platform. This job runs the suite in Red Hat's UBI 9
+  # image (its OpenSSL build and crypto policy, its filesystem layout) with the
+  # uv-managed Python the install docs recommend. No container runtime inside, so the
+  # MinIO tests skip; moto covers the S3 contract.
+  rhel9:
+    runs-on: ubuntu-latest
+    container: registry.access.redhat.com/ubi9/ubi:latest
+    env:
+      PYTHON: "3.12"
+    steps:
+      - run: dnf install -y --setopt=install_weak_deps=False git tar gzip findutils
+      - uses: actions/checkout@v4
+      - run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - run: PATH="$HOME/.local/bin:$PATH" ci/test.sh

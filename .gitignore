@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.scratch/
+.pytest_cache/
+.ruff_cache/
+dist/
+src/brain/web/static/
+node_modules/
