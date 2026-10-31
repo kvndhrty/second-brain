@@ -48,17 +48,21 @@ second-brain/                     repository (public on GitHub)
 │  │  │  ├─ search.py             FTS5 + vector + rank fusion
 │  │  │  └─ graph.py              recursive-CTE traversals
 │  │  ├─ llm/
-│  │  │  ├─ client.py             PydanticAI models + embedding client
+│  │  │  ├─ client.py             OpenAI-compatible HTTP client, embeddings, doctor helpers
+│  │  │  ├─ models.py             LLM: PydanticAI structured calls in tool/native/prompted mode
+│  │  │  ├─ schemas.py            typed outputs requested from the models
 │  │  │  ├─ prompts.py            loads prompts, computes version stamps
-│  │  │  └─ fake.py               canned structured outputs, deterministic embeddings
+│  │  │  └─ fake.py               FakeLLM (scripted) and FakeOpenAI (HTTP) for tests
 │  │  ├─ pipeline/
 │  │  │  ├─ extract.py
 │  │  │  ├─ match.py              carries fragment IDs across re-extraction
-│  │  │  ├─ resolve.py            entity resolution + review items
 │  │  │  ├─ embed.py
-│  │  │  ├─ threads.py            thread assignment, incremental summaries
+│  │  │  ├─ resolve.py            entity resolution and answer proposals
+│  │  │  ├─ threads.py            incremental thread summaries
 │  │  │  ├─ runner.py             runs pending work; idempotent per entry
-│  │  │  └─ worker.py             background loop used by `brain start`
+│  │  │  └─ worker.py             background loop used by `brain start` (milestone 4)
+│  │  ├─ review.py                review queue: items and the decisions that settle them
+│  │  ├─ answers.py               ask and brief: retrieval, synthesis, citation checks
 │  │  ├─ services.py              Brain façade (the only API front-ends use)
 │  │  └─ doctor.py                checks returning structured results
 │  ├─ prompts/                    extract.md, resolve.md, thread_summary.md, brief.md, ask.md
@@ -587,30 +591,75 @@ version is still visible.
 
 ### Pipeline
 
-Per entry, each step reads files and writes one sidecar. A step runs when its
-sidecar is missing or its input hash or prompt stamp differs. That makes the
-pipeline idempotent and resumable without a job table.
+Per entry, each step reads files and writes one sidecar that records the exact
+version of its input. A step runs when its sidecar is missing or that input has
+changed, which makes the pipeline idempotent and resumable without a job table.
+The index records each entry's `next_step` (`extract`, `embed`, `resolve`, or
+`done`), so `brain process` knows what is pending without reading the store.
+A prompt change does not re-run anything by itself; `brain reextract
+--stale-prompts` does that on request.
 
-1. `extract` → extraction sidecar. The prompt includes active threads (name +
-   summary) and candidate threads chosen by embedding similarity to the entry.
-2. `match` → if a previous extraction existed, map new fragments to old IDs
-   (same kind, span overlap or text similarity above a threshold). A decision
-   whose fragment has no match becomes an `orphaned_decision` review item.
-3. `resolve` → resolution sidecar. Exact unique alias match: link. Otherwise
-   candidates from aliases (`difflib`) and embeddings of `name + context`, then
-   an LLM decision among candidates. Auto-link only when the LLM choice and the
-   top candidate agree above a threshold. New people and orgs wait for review.
-   New themes and threads are created with `state: proposed` and listed in
-   review, but are used immediately (see 10, item 9).
-   The step also proposes `answers` links when a fragment appears to answer an
-   open question or complete an open action item; these never close anything
-   on their own.
-4. `embed` → embedding sidecar.
-5. `threads` → update summaries of affected threads from entries after
-   `through_entry`.
+1. `extract` → extraction sidecar. The prompt includes the 40 most recently
+   active threads (id, name, description, start of the summary) and the names
+   of known people, orgs, and themes, so the model can reuse them. A validator
+   makes the model retry if it names a thread id that was not offered. Spans
+   are found by locating the model's `quote` in the entry (exactly, then
+   case-insensitively, then by fuzzy match), since models are unreliable with
+   character offsets. Fragment ids are carried over from the previous
+   extraction by matching kind and text (`pipeline/match.py`); ids that do not
+   match are never reused.
+2. `embed` → embedding sidecar for the entry and each fragment. Texts whose
+   hash did not change keep their vectors, so editing one sentence re-embeds
+   only what changed. This runs before `resolve` because answer proposals use
+   the vectors.
+3. `resolve` → resolution sidecar.
+   - People and orgs: an exact, unique alias links directly with no model
+     call. Otherwise candidates come from close spellings, first-name or
+     last-name matches, and acronyms; the model chooses among them. A link is
+     made only when the model picks the top candidate with confidence ≥ 0.8.
+     Anything else (a different candidate, "unsure", or "new") goes to review.
+   - Themes: the same, plus embedding similarity of theme names. With no
+     match, a theme file is created with `state: proposed` and used right away.
+   - Threads proposed by the extraction: matched to existing threads by name;
+     otherwise a thread file is created with `state: proposed`.
+   - Answer proposals: open questions and action items from other entries
+     that are close to this entry's fragments by vector similarity are shown
+     to the model, which proposes `answers` links. They appear in review and
+     close nothing on their own.
+4. `threads` → after the entry's steps, summaries of the threads it touches
+   are updated. A summary records `through_entry`; an update sends the
+   previous summary plus only the later fragments.
 
 Pending review items never block processing. An unresolved mention is stored
-without a link until you settle it.
+without a link until you settle it. A failed step leaves the entry saved with
+its remaining steps pending; the error is kept in
+`$XDG_STATE_HOME/brain/pipeline-failures.json` and shown by `brain doctor` and
+`brain show`. Only one process on a machine runs the pipeline at a time
+(a non-blocking lock in the state directory).
+
+Prompts live in `src/brain/prompts/` (`extract`, `resolve`, `answers`,
+`thread_summary`, `brief`, `ask`, and `probe` for `doctor`).
+
+### Review queue
+
+`brain review` walks through items one at a time. Each decision is written to
+files: a decisions-file mention mapping (`person: {"Mike": mike-chen}`) for
+each affected entry, a new or updated entity file, or a thread/theme `state`.
+Linking or creating a person can apply to every entry with the same unsettled
+name, and adds that name as an alias so future entries link without asking.
+Accepting a proposed answer records it on the answering fragment and closes
+the earlier question or action item.
+
+### Testing without a model
+
+`FakeLLM` (`core/llm/fake.py`) runs the real PydanticAI agents against a
+scripted model: by default simple rules over each prompt's input (sentences
+become fragments, capitalized names become people, `#tags` become themes,
+`[[Name]]` assigns a thread), or canned outputs supplied by a test. Its
+embeddings are bag-of-words vectors, so texts that share words are close.
+`BRAIN_FAKE_LLM=1` makes the CLI use it, for trying brain without an endpoint.
+`FakeOpenAI` is a fake OpenAI-compatible HTTP endpoint used to test the real
+client path, including tool, native, and prompted structured output.
 
 ### Where processing runs
 

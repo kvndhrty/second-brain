@@ -24,6 +24,7 @@ from brain.core.formats.sidecars import (
     Extraction,
     ResolutionFile,
     ThreadSummary,
+    bytes_hash,
 )
 from brain.core.formats.yamlio import FormatError
 from brain.core.index.db import IndexDB, vec_blob
@@ -173,8 +174,8 @@ class UnitBuilder:
         else:
             state = "current"
         self.conn.execute(
-            "INSERT INTO entries(id, key, created_at, updated_at, title, body, content_hash, extraction) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO entries(id, key, created_at, updated_at, title, body, content_hash, extraction, next_step) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'extract')",
             (
                 entry.id,
                 entry_key,
@@ -201,7 +202,20 @@ class UnitBuilder:
         fragment_texts: dict[str, str] = {}
         if extraction is not None:
             fragment_texts = self._build_fragments(unit, entry, created, extraction, resolution, decisions)
-        self._build_embeddings(unit, files, entry, fragment_texts)
+        embedded = self._build_embeddings(unit, files, entry, fragment_texts)
+
+        # Which pipeline step this entry needs next. Each step records the
+        # exact version of its input, so a changed input re-runs only what follows.
+        xfile = files.one("extraction")
+        if state != "current" or xfile is None:
+            next_step = "extract"
+        elif self.embed_slug and not {entry.id, *fragment_texts} <= embedded:
+            next_step = "embed"
+        elif resolution is None or resolution.extraction_hash != bytes_hash(xfile.data):
+            next_step = "resolve"
+        else:
+            next_step = "done"
+        self.conn.execute("UPDATE entries SET next_step = ? WHERE id = ?", (next_step, entry.id))
 
     def _build_fragments(
         self,
@@ -391,9 +405,11 @@ class UnitBuilder:
             data={"kind": frag.kind, "entry": entry.id},
         )
 
-    def _build_embeddings(self, unit: str, files: UnitFiles, entry: Entry, fragment_texts: dict[str, str]) -> None:
+    def _build_embeddings(self, unit: str, files: UnitFiles, entry: Entry, fragment_texts: dict[str, str]) -> set[str]:
+        """Index current vectors; return the ids that have one."""
+        embedded: set[str] = set()
         if not self.embed_slug:
-            return
+            return embedded
         for f in files.by_role.get("embedding", []):
             if keys.classify(f.key).model_slug != self.embed_slug:  # type: ignore[union-attr]
                 continue
@@ -415,6 +431,8 @@ class UnitBuilder:
                 self.conn.execute(
                     "INSERT INTO vec_items(rowid, embedding) VALUES (?, ?)", (cur.lastrowid, vec_blob(item.vector()))
                 )
+                embedded.add(item.id)
+        return embedded
 
     # --- entity units ------------------------------------------------------
 
@@ -476,14 +494,17 @@ class UnitBuilder:
         elif isinstance(entity, Thread):
             summary = self._parse(files.one("thread_summary"), lambda f: ThreadSummary.parse(f.data, where=f.key))
             self.conn.execute(
-                "INSERT INTO threads(id, name, state, pinned, merged_into, summary) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO threads(id, name, description, state, pinned, merged_into, summary, summary_through) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     entity.id,
                     entity.name,
+                    entity.description,
                     entity.state,
                     int(entity.pinned),
                     entity.merged_into,
                     summary.summary_md if summary else None,
+                    summary.through_entry if summary else None,
                 ),
             )
             if entity.merged_into:
@@ -496,10 +517,16 @@ class UnitBuilder:
     def refresh_thread_activity(self) -> None:
         self.conn.execute(
             """
-            UPDATE threads SET last_activity = (
-              SELECT MAX(f.created_at) FROM edges e JOIN fragments f ON e.src = 'frag:' || f.id
-              WHERE e.type = 'in_thread' AND e.dst = 'thread:' || threads.id
-            )
+            UPDATE threads SET
+              last_activity = (
+                SELECT MAX(f.created_at) FROM edges e JOIN fragments f ON e.src = 'frag:' || f.id
+                WHERE e.type = 'in_thread' AND e.dst = 'thread:' || threads.id
+              ),
+              last_entry = (
+                SELECT f.entry_id FROM edges e JOIN fragments f ON e.src = 'frag:' || f.id
+                WHERE e.type = 'in_thread' AND e.dst = 'thread:' || threads.id
+                ORDER BY f.created_at DESC, f.entry_id DESC LIMIT 1
+              )
             """
         )
 

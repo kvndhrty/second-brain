@@ -146,3 +146,69 @@ def test_keys_layout():
     assert keys.classify("threads/gpu.md").entity_type == "thread"
     assert keys.classify("_system/lease.json") is None
     assert keys.slugify("Ünïcode & Punctuation!! 2026 plan") == "unicode-punctuation-2026-plan"
+
+
+# --- milestone 2 commands (scripted fake LLM) ------------------------------------
+
+
+@pytest.fixture
+def fake_cfg(tmp_path: Path, monkeypatch) -> Path:
+    monkeypatch.setenv("BRAIN_FAKE_LLM", "1")
+    p = tmp_path / "config.toml"
+    p.write_text(
+        f'[storage]\nbackend = "local"\npath = "{tmp_path / "store"}"\n'
+        '[llm]\nbase_url = "https://fake/v1"\nchat_model = "fake-chat"\nembed_model = "fake-embed"\n'
+    )
+    return p
+
+
+def test_jot_processes_and_points_to_review(fake_cfg):
+    r = run(fake_cfg, "jot", "-m", "Met Jane Doe about the [[GPU quota migration]]. Does MIG work?")
+    assert r.exit_code == 0, r.output
+    assert "extract, embed, resolve" in r.output and "brain review" in r.output
+    r = run(fake_cfg, "process")
+    assert "nothing to process" in r.output
+
+
+def test_jot_without_model_endpoint_leaves_extraction_pending(cfg):
+    r = run(cfg, "jot", "-m", "hello")
+    assert r.exit_code == 0 and "extraction is pending" in r.output
+
+
+def test_show_status_active_ask_brief(fake_cfg):
+    run(fake_cfg, "jot", "-m", "Kicked off the [[GPU quota migration]]. Does the vendor support MIG on the nodes?")
+    r = run(fake_cfg, "show")
+    assert r.exit_code == 0 and "processed" in r.output
+    frag = next(w for w in r.output.split() if w.startswith("f-e-") and w.endswith("-02"))
+    r = run(fake_cfg, "status", frag, "--obe", "--reason", "vendor left")
+    assert r.exit_code == 0, r.output
+    assert "overcome_by_events" in run(fake_cfg, "show").output
+    r = run(fake_cfg, "status", frag)
+    assert r.exit_code == 2 and "nothing to change" in r.output
+    r = run(fake_cfg, "active")
+    assert "GPU quota" in r.output and "proposed" in r.output
+    r = run(fake_cfg, "ask", "does the vendor support MIG?")
+    assert r.exit_code == 0 and "Sources" in r.output
+    r = run(fake_cfg, "brief", "GPU quota migration")
+    assert r.exit_code == 0, r.output
+    assert "Where things stand" in r.output and "last looked: never" in r.output
+    assert "last looked: 20" in run(fake_cfg, "brief", "GPU quota migration").output
+
+
+def test_review_creates_person_and_accepts_thread(fake_cfg, tmp_path):
+    run(fake_cfg, "jot", "-m", "Paired with Zed on the [[Cache rewrite]].")
+    # Person: create "Zed Shaw" with a role and no org. Thread: accept.
+    r = run(fake_cfg, "review", input="c\nZed Shaw\nStaff engineer\n\na\n")
+    assert r.exit_code == 0, r.output
+    assert "2 decided" in r.output
+    person = (tmp_path / "store" / "people" / "zed-shaw.md").read_text()
+    assert "role: Staff engineer" in person and "- Zed" in person
+    assert "state: active" in (tmp_path / "store" / "threads" / "cache-rewrite.md").read_text()
+
+
+def test_reextract_requires_confirmation(fake_cfg):
+    run(fake_cfg, "jot", "-m", "Something happened.")
+    r = run(fake_cfg, "reextract", input="n\n")
+    assert "Re-extract all 1 entries" in r.output
+    r = run(fake_cfg, "reextract", "-y")
+    assert r.exit_code == 0 and "extract" in r.output

@@ -40,6 +40,7 @@ dev = [
 testpaths = ["tests"]
 addopts = "-ra"
 markers = ["live: needs a real model endpoint (BRAIN_LIVE_TESTS=1)"]
+filterwarnings = ["ignore:There is no current event loop:DeprecationWarning"]
 
 [tool.ruff]
 line-length = 120

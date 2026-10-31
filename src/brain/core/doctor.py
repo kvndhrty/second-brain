@@ -337,7 +337,38 @@ class Doctor:
             attempt("embedding", emb)
         else:
             self.add("embedding", "skip", "llm.embed_model is not set")
-        self.add("structured output", "skip", "structured-output modes are tested from milestone 2")
+        if any(r.name in ("chat", "extract") and r.status == "fail" for r in self.results):
+            self.add("structured output", "skip", "skipped because a model call above failed")
+        else:
+            self.check_structured(settings)
+
+    def check_structured(self, settings: Settings) -> None:
+        """Which ways of requesting structured output the gateway accepts, and whether the configured one works."""
+        from brain.core.llm.models import LLM, LLMError
+        from brain.core.llm.schemas import Probe
+
+        llm = LLM(settings, transport=self.llm_transport)
+        works: dict[str, bool] = {}
+        errors: dict[str, str] = {}
+        for mode in ("tool", "native", "prompted"):
+            try:
+                works[mode] = llm.run("probe", "Run the connectivity test.", Probe, mode=mode).output.ok
+            except LLMError as e:
+                works[mode], errors[mode] = False, str(e)
+        configured = settings.llm.structured_output
+        effective = ("tool" if works["tool"] else "prompted") if configured == "auto" else configured
+        summary = ", ".join(f"{m} {'works' if ok else 'fails'}" for m, ok in works.items())
+        detail = f"{summary}; llm.structured_output = {configured!r} uses {effective}"
+        if works[effective]:
+            self.add("structured output", "ok", detail)
+            return
+        working = [m for m, ok in works.items() if ok]
+        fix = (
+            f"Set llm.structured_output = {working[0]!r}."
+            if working
+            else f"No mode works with {llm.model_name('extract')}: {errors.get(effective, '')}"
+        )
+        self.add("structured output", "fail", detail, fix)
 
     # --- index -------------------------------------------------------------------
 
@@ -358,9 +389,19 @@ class Doctor:
                 self.add("index", "info", f"index will be rebuilt: {idx.rebuilt_reason}")
             c = idx.conn
             n_entries = c.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
-            pending = c.execute("SELECT COUNT(*) FROM entries WHERE extraction != 'current'").fetchone()[0]
+            pending = c.execute("SELECT COUNT(*) FROM entries WHERE next_step != 'done'").fetchone()[0]
             review = c.execute("SELECT COUNT(*) FROM review_items").fetchone()[0]
-            self.add("index", "ok", f"{n_entries} entries, {pending} awaiting extraction, {review} review items")
+            self.add("index", "ok", f"{n_entries} entries, {pending} not fully processed, {review} review items")
+            failures = self.state.read_json("pipeline-failures.json")
+            if failures:
+                eid, f = sorted(failures.items(), key=lambda kv: kv[1].get("at", ""))[-1]
+                self.add(
+                    "pipeline",
+                    "warn",
+                    f"{len(failures)} entries failed processing; latest {eid} at "
+                    f"{f['step']}: {f['error'].splitlines()[0]}",
+                    "Fix the cause, then run `brain process`.",
+                )
             gen = read_generation(storage)
             local = index_db.get_meta(c, "generation")
             if gen and gen.token != local:

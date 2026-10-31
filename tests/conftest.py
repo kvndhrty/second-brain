@@ -158,8 +158,25 @@ def storage(request: pytest.FixtureRequest):
     return request.getfixturevalue(f"{request.param}_storage")
 
 
-def make_brain(storage, state: LocalState, tmp_path: Path, *, index_name: str | None = None, **settings_kw) -> Brain:
+def make_brain(
+    storage,
+    state: LocalState,
+    tmp_path: Path,
+    *,
+    index_name: str | None = None,
+    fake_llm: bool = False,
+    responders: dict | None = None,
+    **settings_kw,
+) -> Brain:
     settings = Settings(**settings_kw)
     settings.index.path = str(tmp_path / "index" / f"{index_name or uuid.uuid4().hex[:6]}.db")
     loaded = LoadedSettings(settings=settings, path=None, env_overrides=[])
-    return Brain(loaded, command="pytest", storage=storage, state=state)
+    llm = None
+    if fake_llm:
+        from brain.core.llm.fake import FakeLLM
+
+        llm = FakeLLM(settings, responders=responders)
+    return Brain(loaded, command="pytest", storage=storage, state=state, llm=llm)
+
+
+FAKE_LLM_SETTINGS = {"base_url": "https://fake/v1", "chat_model": "fake-chat", "embed_model": "fake-embed"}

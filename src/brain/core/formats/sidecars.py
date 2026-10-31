@@ -7,6 +7,7 @@ Sidecars are written by the pipeline and can be regenerated with
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import sys
 from array import array
@@ -19,11 +20,17 @@ from brain.core.formats.decisions import OpenState, Status
 from brain.core.formats.entry import Id
 from brain.core.formats.yamlio import FORMAT_VERSION, FormatError, check_format
 
+
+def bytes_hash(data: bytes) -> str:
+    """Hash of a file as stored; used to tell whether a later step saw this exact version."""
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
 FragmentKind = Literal["observation", "decision", "question", "idea", "claim", "action_item"]
 OPEN_KINDS: frozenset[str] = frozenset({"question", "action_item"})
 
 
-class _Sidecar(BaseModel):
+class Sidecar(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     format: int = FORMAT_VERSION
@@ -109,7 +116,7 @@ class ExtractedFragment(BaseModel):
     threads: list[ThreadRef] = Field(default_factory=list)
 
 
-class Extraction(_Sidecar):
+class Extraction(Sidecar):
     entry_id: Id
     entry_hash: str
     model: str
@@ -149,7 +156,7 @@ class AnswerProposal(BaseModel):
     confidence: float = Field(0.0, ge=0, le=1)
 
 
-class ResolutionFile(_Sidecar):
+class ResolutionFile(Sidecar):
     entry_id: Id
     extraction_hash: str  # content hash of the extraction it resolved
     model: str
@@ -181,7 +188,7 @@ def encode_vector(values: list[float]) -> str:
     return base64.b64encode(a.tobytes()).decode()
 
 
-class EmbeddingFile(_Sidecar):
+class EmbeddingFile(Sidecar):
     entry_id: Id
     model: str
     dim: int = Field(gt=0)
@@ -196,7 +203,7 @@ class EmbeddingFile(_Sidecar):
         return self
 
 
-class ThreadSummary(_Sidecar):
+class ThreadSummary(Sidecar):
     thread_id: Id
     model: str
     prompt: PromptStamp
@@ -206,16 +213,16 @@ class ThreadSummary(_Sidecar):
     citations: list[str] = Field(default_factory=list)
 
 
-class BriefState(_Sidecar):
+class BriefState(Sidecar):
     last: dict[str, datetime] = Field(default_factory=dict)  # node id -> last brief time
 
 
-class StoreFormat(_Sidecar):
+class StoreFormat(Sidecar):
     created_at: datetime
     created_by: str
 
 
-class Generation(_Sidecar):
+class Generation(Sidecar):
     token: str
     counter: int = 0
     host: str = ""

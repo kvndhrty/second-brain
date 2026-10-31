@@ -66,6 +66,20 @@ class LocalState:
         return d
 
     @contextmanager
+    def try_lock(self, name: str) -> Iterator[bool]:
+        """Non-blocking exclusive lock; yields False if another process holds it."""
+        with open(self._ensure() / f"{name}.lock", "a") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+    @contextmanager
     def write_lock(self, name: str = "write") -> Iterator[None]:
         """Exclusive lock shared by all brain processes on this machine."""
         with open(self._ensure() / f"{name}.lock", "a") as f:

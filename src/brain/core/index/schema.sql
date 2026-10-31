@@ -38,8 +38,10 @@ CREATE TABLE entries (
   title        TEXT,
   body         TEXT NOT NULL,
   content_hash TEXT NOT NULL,
-  extraction   TEXT NOT NULL            -- current|pending|stale
+  extraction   TEXT NOT NULL,           -- current|pending|stale
+  next_step    TEXT NOT NULL            -- extract|embed|resolve|done (pipeline progress)
 );
+CREATE INDEX entries_next_step ON entries(next_step);
 CREATE INDEX entries_created ON entries(created_at);
 
 CREATE TABLE fragments (
@@ -63,13 +65,16 @@ CREATE INDEX fragments_entry ON fragments(entry_id);
 CREATE INDEX fragments_kind_status ON fragments(kind, status);
 
 CREATE TABLE threads (
-  id            TEXT PRIMARY KEY,
-  name          TEXT NOT NULL,
-  state         TEXT NOT NULL,
-  pinned        INTEGER NOT NULL,
-  merged_into   TEXT,
-  summary       TEXT,
-  last_activity TEXT                    -- max(created_at) of linked fragments
+  id              TEXT PRIMARY KEY,
+  name            TEXT NOT NULL,
+  description     TEXT,
+  state           TEXT NOT NULL,
+  pinned          INTEGER NOT NULL,
+  merged_into     TEXT,
+  summary         TEXT,
+  summary_through TEXT,                 -- last entry the summary covers
+  last_activity   TEXT,                 -- max(created_at) of linked fragments
+  last_entry      TEXT                  -- entry of the newest linked fragment
 );
 
 CREATE TABLE aliases (

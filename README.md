@@ -5,8 +5,10 @@ You write a few paragraphs a day; brain extracts decisions, questions, people,
 themes, and workstreams, and can brief you on any of them when you come back
 after weeks away.
 
-Status: milestone 1 of 5. Storage, config, the index, `jot`, `reindex`,
-`doctor`, and `init` work. Extraction, `ask`, and `brief` arrive in milestone 2.
+Status: milestone 2 of 5. The CLI works end to end: entries are extracted into
+fragments, people, orgs, themes, and threads; you confirm new names in
+`brain review`; `ask`, `brief`, and `active` answer from the graph with
+citations. The MCP server (milestone 3) and web UI (milestone 4) come next.
 See [docs/architecture.md](docs/architecture.md) for the design.
 
 ## Install
@@ -85,15 +87,28 @@ base_url = "https://llm-gateway.internal/v1"
 The `[tls]` settings apply to both the gateway and S3. With `ca_bundle` empty,
 brain uses the OS trust store.
 
-## Commands (milestone 1)
+## Commands
 
 | Command | What it does |
 |---|---|
 | `brain init` | Write a config file interactively |
-| `brain doctor` | Check config, storage, lease, TLS, proxies, model endpoints, and the index |
-| `brain jot` | Save an entry from `-m TEXT`, `--file`, stdin, or `$EDITOR` |
+| `brain doctor` | Check config, storage, lease, TLS, proxies, model endpoints, structured output, and the index |
+| `brain jot` | Save an entry from `-m TEXT`, `--file`, stdin, or `$EDITOR`, then process it |
+| `brain review` | Confirm new people and orgs, proposed themes and threads, and proposed answers |
+| `brain active` | Threads with recent activity, plus pinned ones |
+| `brain brief TARGET` | Re-entry brief on a thread, person, org, theme, or free text |
+| `brain ask "QUESTION"` | Answer from the journal, citing dated entries |
+| `brain show [ENTRY]` | An entry's fragments with ids and status (default: latest) |
+| `brain status FRAGMENT --obe/--speculative/--confirmed/--closed/--open/--dream` | Change a fragment's status |
+| `brain process` | Run any pending extraction and stale thread summaries |
+| `brain reextract [IDS] [--since D] [--stale-prompts]` | Re-run extraction after a model or prompt change; your decisions are kept |
 | `brain sync [--full]` | Bring the local index up to date with the store |
 | `brain reindex` | Delete the local index and rebuild it from the store (no model calls) |
+
+To try brain without a model endpoint, set `BRAIN_FAKE_LLM=1`. Every model
+call then goes to a scripted fake that turns sentences into fragments,
+capitalized names into people, `#tags` into themes, and `[[Name]]` into a
+thread. The output is not useful as a journal, but it exercises every command.
 
 ## Development
 

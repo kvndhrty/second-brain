@@ -8,6 +8,7 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -22,8 +23,9 @@ from brain.core.config import ConfigError, LoadedSettings
 from brain.core.doctor import CheckResult, run_doctor
 from brain.core.formats.yamlio import FormatError
 from brain.core.index.db import IndexError_
+from brain.core.llm.models import LLM, LLMError
 from brain.core.localstate import LocalState
-from brain.core.services import Brain, JotFailed
+from brain.core.services import Brain, Busy, JotFailed
 from brain.core.storage.base import StorageError
 from brain.core.storage.lease import LeaseError
 
@@ -72,15 +74,27 @@ def _load() -> LoadedSettings:
         raise _fail(str(e), 2) from None
 
 
+def _make_llm(settings) -> LLM | None:
+    # BRAIN_FAKE_LLM=1 runs every model call against the scripted fake: for
+    # trying the CLI without a model endpoint, and for front-end development.
+    if os.environ.get("BRAIN_FAKE_LLM") == "1":
+        from brain.core.llm.fake import FakeLLM
+
+        return FakeLLM(settings)
+    return None
+
+
 @contextmanager
-def _brain(command: str, *, force: bool = False) -> Iterator[Brain]:
+def _brain(command: str, *, force: bool = False, sync: bool = False) -> Iterator[Brain]:
     loaded = _load()
     try:
-        with Brain(loaded, command=command, force_lease=force) as b:
+        with Brain(loaded, command=command, force_lease=force, llm=_make_llm(loaded.settings)) as b:
+            if sync:
+                b.sync()
             yield b
     except LeaseError as e:
         raise _fail(str(e), 3) from None
-    except (StorageError, IndexError_, FormatError) as e:
+    except (StorageError, IndexError_, FormatError, LLMError, Busy) as e:
         raise _fail(str(e)) from None
 
 
@@ -113,6 +127,7 @@ def jot(
     force: Annotated[
         bool, typer.Option("--force", help="Take the write lease even if another machine holds it.")
     ] = False,
+    process: Annotated[bool, typer.Option("--process/--no-process", help="Run extraction right after saving.")] = True,
 ) -> None:
     """Write a journal entry: -m TEXT, --file, stdin, or $EDITOR."""
     if message is not None:
@@ -136,6 +151,12 @@ def jot(
         drafts = b.pending_drafts()
         if drafts:
             out.print(f"[yellow]{len(drafts)} unsent draft(s) in {drafts[0].parent}[/yellow]")
+        if process and b.llm.configured:
+            from brain.cli.render import run_processing
+
+            run_processing(out, lambda progress: b.process(result.entry.id, progress=progress), b)
+        elif process:
+            out.print("[dim]no model endpoint configured; extraction is pending (see `brain doctor`)[/dim]")
 
 
 # --- index ------------------------------------------------------------------
@@ -258,6 +279,173 @@ def init() -> None:
     if typer.confirm("Run `brain doctor` now?", default=True):
         _state.config = str(path)
         doctor()
+
+
+# --- pipeline ---------------------------------------------------------------
+
+
+def _parse_date(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).astimezone()
+    except ValueError:
+        raise _fail(f"not a date: {value} (use YYYY-MM-DD)", 2) from None
+
+
+def _entry_progress(status_line):
+    return lambda entry_id, msg: status_line(f"{entry_id}: {msg}" if entry_id else msg)
+
+
+@app.command()
+def process() -> None:
+    """Run extraction for every entry that still needs it, and update stale thread summaries."""
+    from brain.cli.render import run_processing
+
+    with _brain("brain process") as b:
+        run_processing(out, lambda progress: b.process_pending(_entry_progress(progress)), b)
+
+
+@app.command()
+def reextract(
+    entry_ids: Annotated[list[str] | None, typer.Argument(help="Entry ids (default: all, or --since).")] = None,
+    since: Annotated[str | None, typer.Option(help="Only entries on or after this date (YYYY-MM-DD).")] = None,
+    stale_prompts: Annotated[
+        bool, typer.Option("--stale-prompts", help="Only entries extracted with an older prompt version.")
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Do not ask for confirmation.")] = False,
+) -> None:
+    """Re-run extraction after a model or prompt change. Your decisions are kept."""
+    from brain.cli.render import run_processing
+
+    with _brain("brain reextract") as b:
+        b.sync()
+        if not entry_ids and not since and not stale_prompts and not yes:
+            n = b.db.conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+            if not typer.confirm(f"Re-extract all {n} entries? This calls the model for each one.", default=False):
+                raise typer.Exit()
+        run_processing(
+            out,
+            lambda progress: b.reextract(
+                entry_ids, since=_parse_date(since), stale_prompts=stale_prompts, progress=_entry_progress(progress)
+            ),
+            b,
+        )
+
+
+@app.command()
+def review() -> None:
+    """Confirm new people, organizations, themes, threads, and proposed answers."""
+    from brain.cli.review import run_review
+
+    with _brain("brain review", sync=True) as b:
+        run_review(out, b)
+
+
+# --- reading -----------------------------------------------------------------
+
+
+@app.command()
+def active() -> None:
+    """Threads with recent activity, plus pinned ones."""
+    from brain.cli.render import print_active
+
+    with _brain("brain active", sync=True) as b:
+        now = datetime.now().astimezone()
+        print_active(out, b.active_threads(now=now), now)
+
+
+@app.command()
+def brief(
+    target: Annotated[str, typer.Argument(help="A thread, person, org, or theme (name or id), or free text.")],
+    since: Annotated[
+        str | None, typer.Option(help="Report changes since this date (default: your last brief).")
+    ] = None,
+) -> None:
+    """A re-entry brief: where things stand, decisions, open items, people, and what changed."""
+    from brain.cli.render import print_brief
+    from brain.core.answers import AmbiguousTarget
+
+    with _brain("brain brief", sync=True) as b:
+        try:
+            with out.status("writing brief"):
+                result = b.brief(target, since=_parse_date(since))
+        except AmbiguousTarget as e:
+            raise _fail(str(e), 2) from None
+        print_brief(out, result)
+
+
+@app.command()
+def ask(question: Annotated[str, typer.Argument(help="Your question.")]) -> None:
+    """Answer a question from the journal, citing dated entries."""
+    from brain.cli.render import print_answer
+
+    with _brain("brain ask", sync=True) as b, out.status("searching"):
+        answer = b.ask(question)
+    print_answer(out, answer)
+
+
+@app.command()
+def show(entry_id: Annotated[str, typer.Argument(help="Entry id, or 'latest'.")] = "latest") -> None:
+    """Show an entry's fragments with their ids, status, and pipeline state."""
+    from brain.cli.render import print_fragments
+    from brain.core.index import queries
+
+    with _brain("brain show", sync=True) as b:
+        c = b.db.conn
+        row = (
+            c.execute("SELECT id, created_at, title, next_step FROM entries ORDER BY created_at DESC, id DESC LIMIT 1")
+            if entry_id == "latest"
+            else c.execute("SELECT id, created_at, title, next_step FROM entries WHERE id = ?", (entry_id,))
+        ).fetchone()
+        if row is None:
+            raise _fail(f"no entry {entry_id}")
+        eid, created, title, next_step = row
+        state = "processed" if next_step == "done" else f"pending ({next_step})"
+        out.print(f"[bold]{escape(title or eid)}[/bold]  [dim]{created[:16]} · {eid} · {state}[/dim]")
+        frag_ids = [r[0] for r in c.execute("SELECT id FROM fragments WHERE entry_id = ? ORDER BY id", (eid,))]
+        print_fragments(out, list(queries.fragments_by_id(c, frag_ids).values()))
+        failure = b.failures().get(eid)
+        if failure:
+            out.print(f"[red]last error in {failure['step']}: {escape(failure['error'])}[/red]")
+
+
+@app.command()
+def status(
+    fragment_id: Annotated[str, typer.Argument(help="Fragment id (see `brain show`).")],
+    confirmed: Annotated[bool, typer.Option("--confirmed", help="Mark as confirmed.")] = False,
+    speculative: Annotated[bool, typer.Option("--speculative", help="Mark as speculative.")] = False,
+    obe: Annotated[bool, typer.Option("--obe", help="Mark as overcome by events.")] = False,
+    reason: Annotated[str | None, typer.Option(help="Why it was overcome by events.")] = None,
+    on: Annotated[str | None, typer.Option("--date", help="When it was overcome (default today).")] = None,
+    open_: Annotated[bool, typer.Option("--open", help="Reopen a question or action item.")] = False,
+    closed: Annotated[bool, typer.Option("--closed", help="Close a question or action item.")] = False,
+    note: Annotated[str | None, typer.Option(help="Note on closing.")] = None,
+    dream: Annotated[bool | None, typer.Option("--dream/--not-dream", help="Mark or unmark as a dream.")] = None,
+) -> None:
+    """Change a fragment's status. Stored in the entry's decisions file, so it survives re-extraction."""
+    from brain.core.services import FragmentChange
+
+    if sum([confirmed, speculative, obe]) > 1 or (open_ and closed):
+        raise _fail("choose one status and at most one of --open/--closed", 2)
+    status_value = "confirmed" if confirmed else "speculative" if speculative else "overcome_by_events" if obe else None
+    when = _parse_date(on)
+    change = FragmentChange(
+        status=status_value,  # type: ignore[arg-type]
+        obe_reason=reason,
+        obe_date=when.date() if when else None,
+        state="open" if open_ else "closed" if closed else None,
+        closed_note=note,
+        dream=dream,
+    )
+    if change == FragmentChange():
+        raise _fail("nothing to change; see `brain status --help`", 2)
+    with _brain("brain status", sync=True) as b:
+        try:
+            b.set_fragment(fragment_id, change)
+        except KeyError as e:
+            raise _fail(str(e.args[0])) from None
+        out.print(f"updated {fragment_id}")
 
 
 def main() -> None:
