@@ -312,3 +312,32 @@ def test_embedding_model_change_rebuilds_index(local_storage, state, tmp_path):
     db = IndexDB(path, embed_model="other-model")
     assert "embedding model changed" in (db.rebuilt_reason or "")
     db.close()
+
+
+def test_two_processes_sharing_one_index_write_concurrently(local_storage, state, tmp_path):
+    """`brain mcp` and a CLI command on the same machine use the same index file at the same time."""
+    import threading
+
+    brains = [make_brain(local_storage, state, tmp_path, index_name="shared") for _ in range(2)]
+    errors: list[BaseException] = []
+
+    def write(b, n):
+        try:
+            for i in range(8):
+                b.jot(f"writer {n} note {i}")
+                b.sync()
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=write, args=(b, n)) for n, b in enumerate(brains)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    try:
+        assert errors == []
+        brains[0].sync(full=True)
+        assert rows(brains[0], "SELECT COUNT(*) FROM entries") == [(16,)]
+    finally:
+        for b in brains:
+            b.close()

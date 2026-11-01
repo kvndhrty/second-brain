@@ -10,7 +10,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from types import TracebackType
 
-from brain.core import answers, keys, paths
+from brain.core import answers, keys, paths, views
 from brain.core.config import LoadedSettings, Settings
 from brain.core.formats.decisions import FragmentDecision, OpenState, Status
 from brain.core.formats.entity import ObeInfo
@@ -271,8 +271,18 @@ class Brain:
     def ask(self, question: str) -> answers.Answer:
         return answers.ask(self.db.conn, self.llm, question)
 
-    def brief(self, target: str, *, since: datetime | None = None) -> answers.Brief:
-        return answers.brief(self.db.conn, self.llm, self.vault, target, since=since)
+    def brief(self, target: str, *, since: datetime | None = None, record: bool = True) -> answers.Brief:
+        return answers.brief(self.db.conn, self.llm, self.vault, target, since=since, record=record)
+
+    def search(self, query: str, *, limit: int = 10, types: tuple[str, ...] | None = None) -> list[views.Hit]:
+        llm = self.llm if self.llm.configured and self.llm.embed_model else None
+        return views.search_all(self.db.conn, llm, query, limit=limit, types=types)
+
+    def entity(self, text: str) -> views.EntityView:
+        return views.entity_view(self.db.conn, text)
+
+    def entry(self, entry_id: str) -> views.EntryView:
+        return views.entry_view(self.db.conn, entry_id)
 
     def find_targets(self, text: str) -> list[answers.NodeMatch]:
         return answers.find_targets(self.db.conn, text)

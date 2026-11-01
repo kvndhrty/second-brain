@@ -184,22 +184,23 @@ class Review:
                 self._add_alias(mtype, decision.entity_id, surface)
             self._map_mention(item, decision.entity_id, decision.apply_to_all)
         elif isinstance(decision, CreateEntity):
-            new_id = self.vault.allocate_entity_id(mtype, decision.name)
             aliases = [surface] if norm_alias(surface) != norm_alias(decision.name) else []
-            if mtype == "person":
-                entity = Person(
-                    id=new_id,
-                    name=decision.name,
-                    aliases=aliases,
-                    role=decision.role,
-                    memberships=[Membership(org=decision.org)] if decision.org else [],
-                )
-            elif mtype == "org":
-                entity = Org(id=new_id, name=decision.name, aliases=aliases)
-            else:
-                entity = Theme(id=new_id, name=decision.name, aliases=aliases, kind=decision.kind)  # type: ignore[arg-type]
-            self.vault.put_entity(entity)
-            self._map_mention(item, new_id, decision.apply_to_all)
+
+            def build(new_id: str):
+                if mtype == "person":
+                    return Person(
+                        id=new_id,
+                        name=decision.name,
+                        aliases=aliases,
+                        role=decision.role,
+                        memberships=[Membership(org=decision.org)] if decision.org else [],
+                    )
+                if mtype == "org":
+                    return Org(id=new_id, name=decision.name, aliases=aliases)
+                return Theme(id=new_id, name=decision.name, aliases=aliases, kind=decision.kind)  # type: ignore[arg-type]
+
+            entity = self.vault.create_entity(mtype, decision.name, build)
+            self._map_mention(item, entity.id, decision.apply_to_all)
         elif isinstance(decision, IgnoreMention):
             self._map_mention(item, None, decision.apply_to_all)
         else:

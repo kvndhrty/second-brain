@@ -118,9 +118,13 @@ class Resolver:
     # --- themes and threads: created as proposed when nothing matches --------
 
     def _create_theme(self, m: Mention) -> str:
-        tid = self.ctx.vault.allocate_entity_id("theme", m.surface)
-        self.ctx.vault.put_entity(Theme(id=tid, name=m.surface, kind=m.kind or "domain", state="proposed"))  # type: ignore[arg-type]
-        return tid
+        kind = m.kind if m.kind in ("domain", "technique") else "domain"
+        theme = self.ctx.vault.create_entity(
+            "theme",
+            m.surface,
+            lambda tid: Theme(id=tid, name=m.surface, kind=kind, state="proposed"),  # type: ignore[arg-type]
+        )
+        return theme.id
 
     def _thread(self, m: Mention) -> None:
         exact = queries.alias_matches(self.conn, "thread", m.surface)
@@ -137,9 +141,12 @@ class Resolver:
         if best[0] >= THREAD_NAME_SIMILARITY:
             self._record(m, "link", best[1], confidence=best[0])
             return
-        tid = self.ctx.vault.allocate_entity_id("thread", m.surface)
-        self.ctx.vault.put_entity(Thread(id=tid, name=m.surface, description=m.description or None, state="proposed"))
-        self._record(m, "link", tid, proposed={"created": "proposed thread"})
+        thread = self.ctx.vault.create_entity(
+            "thread",
+            m.surface,
+            lambda tid: Thread(id=tid, name=m.surface, description=m.description or None, state="proposed"),
+        )
+        self._record(m, "link", thread.id, proposed={"created": "proposed thread"})
 
     def _theme_vector_candidates(self, m: Mention) -> list[queries.Candidate]:
         if not self.ctx.llm.embed_model:

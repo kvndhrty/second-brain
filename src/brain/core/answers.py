@@ -259,8 +259,16 @@ def _record_brief(vault: Vault, target: str, when: datetime) -> bool:
 
 
 def brief(
-    conn, llm: LLM, vault: Vault, target: str, *, since: datetime | None = None, now: datetime | None = None
+    conn,
+    llm: LLM,
+    vault: Vault,
+    target: str,
+    *,
+    since: datetime | None = None,
+    now: datetime | None = None,
+    record: bool = True,
 ) -> Brief:
+    """record=False leaves "last looked" unchanged (e.g. when an agent reads a brief for its own context)."""
     now = now or datetime.now(UTC)
     matches = find_targets(conn, target)
     if len(matches) > 1:
@@ -307,5 +315,5 @@ def brief(
     result.output = llm.run("brief", "\n".join(lines), BriefOutput, validate=validate).output
     cited = {c for claim in result.output.all_claims() for c in claim.citations} | {f.entry_id for f in open_now}
     result.sources = _sources(conn, cited)
-    result.recorded = _record_brief(vault, key, now)
+    result.recorded = _record_brief(vault, key, now) if record else False
     return result

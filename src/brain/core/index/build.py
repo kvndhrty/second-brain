@@ -460,6 +460,8 @@ class UnitBuilder:
         nid = entity.node_id
         data = entity.model_dump(mode="json", by_alias=True, exclude={"format", "id", "type", "name", "aliases"})
         data["key"] = ekey
+        if entity.notes.strip():
+            data["notes"] = entity.notes.strip()
         self._node(nid, entity.type, entity.name, unit, data=data)
         for alias in {norm_alias(entity.name), *(norm_alias(a) for a in entity.aliases)}:
             if alias:

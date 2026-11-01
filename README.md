@@ -5,10 +5,11 @@ You write a few paragraphs a day; brain extracts decisions, questions, people,
 themes, and workstreams, and can brief you on any of them when you come back
 after weeks away.
 
-Status: milestone 2 of 5. The CLI works end to end: entries are extracted into
+Status: milestone 3 of 5. The CLI works end to end: entries are extracted into
 fragments, people, orgs, themes, and threads; you confirm new names in
 `brain review`; `ask`, `brief`, and `active` answer from the graph with
-citations. The MCP server (milestone 3) and web UI (milestone 4) come next.
+citations. `brain mcp` serves the same to agents such as Claude Code. The web
+UI (milestone 4) comes next.
 See [docs/architecture.md](docs/architecture.md) for the design.
 
 ## Install
@@ -104,11 +105,34 @@ brain uses the OS trust store.
 | `brain reextract [IDS] [--since D] [--stale-prompts]` | Re-run extraction after a model or prompt change; your decisions are kept |
 | `brain sync [--full]` | Bring the local index up to date with the store |
 | `brain reindex` | Delete the local index and rebuild it from the store (no model calls) |
+| `brain mcp` | Serve the journal to agents over MCP (stdio) |
 
 To try brain without a model endpoint, set `BRAIN_FAKE_LLM=1`. Every model
 call then goes to a scripted fake that turns sentences into fragments,
 capitalized names into people, `#tags` into themes, and `[[Name]]` into a
 thread. The output is not useful as a journal, but it exercises every command.
+
+## Use from Claude Code
+
+`brain mcp` is an MCP server on stdio. Register it once:
+
+```sh
+claude mcp add --scope user brain -- brain mcp
+```
+
+Claude Code starts the server with its own environment. If the API key or AWS
+credentials are only set in your interactive shell, pass them explicitly, and
+point at a config file if it is not in the default place:
+
+```sh
+claude mcp add --scope user brain \
+  -e BRAIN_CONFIG=$HOME/.config/brain/config.toml \
+  -e BRAIN_API_KEY="$BRAIN_API_KEY" \
+  -- brain mcp
+```
+
+Tools: `search`, `ask`, `brief`, `get_entity`, `get_entry`, `list_active`, and
+`add_entry` (writes only when you ask the agent to record something).
 
 ## Development
 

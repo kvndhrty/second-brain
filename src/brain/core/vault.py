@@ -87,12 +87,17 @@ class Vault:
             self._prepare = None
         self.lease.ensure()
 
+    def _write_locked(self, key: str, data: bytes, *, if_absent: bool = False) -> tuple[ObjectInfo, str | None, str]:
+        """Write while holding the write lock. Returns (info, previous generation, new generation)."""
+        self._before_write()
+        self._ensure_format_marker()
+        info = self.storage.put(key, data, if_absent=if_absent and bool(self.storage.supports_conditional_writes))
+        prev, new = self._bump_generation()
+        return info, prev, new
+
     def write(self, key: str, data: bytes, *, if_absent: bool = False) -> ObjectInfo:
         with self.state.write_lock():
-            self._before_write()
-            self._ensure_format_marker()
-            info = self.storage.put(key, data, if_absent=if_absent and bool(self.storage.supports_conditional_writes))
-            prev, new = self._bump_generation()
+            info, prev, new = self._write_locked(key, data, if_absent=if_absent)
         if self.on_write:
             self.on_write(key, info, data, prev, new)
         return info
@@ -114,20 +119,24 @@ class Vault:
         if not body.strip():
             raise ValueError("entry is empty")
         now = self.clock().replace(microsecond=0)
-        # Ids are per second; read the ids of any entries from the same second.
-        taken = set()
-        for k in self._entry_candidates(now, keys.basic_timestamp(now)):
-            try:
-                taken.add(Entry.parse(self.storage.get(k).decode(), where=k).id)
-            except (FormatError, NotFound):
-                continue
-        suffix = 0
-        while (entry_id := keys.entry_id_for(now, suffix)) in taken:
-            suffix = 2 if suffix == 0 else suffix + 1
-        entry = Entry(id=entry_id, created=now, updated=now, title=title or None, tags=tags or [], body=body)
-        slug = keys.slugify(title or body)
-        key = keys.entry_key(now, entry_id, slug)
-        self.write(key, entry.to_text().encode(), if_absent=True)
+        # Ids are per second. Choosing the id and writing the file happen under
+        # one lock, so two processes on this machine cannot pick the same id.
+        with self.state.write_lock():
+            taken = set()
+            for k in self._entry_candidates(now, keys.basic_timestamp(now)):
+                try:
+                    taken.add(Entry.parse(self.storage.get(k).decode(), where=k).id)
+                except (FormatError, NotFound):
+                    continue
+            suffix = 0
+            while (entry_id := keys.entry_id_for(now, suffix)) in taken:
+                suffix = 2 if suffix == 0 else suffix + 1
+            entry = Entry(id=entry_id, created=now, updated=now, title=title or None, tags=tags or [], body=body)
+            key = keys.entry_key(now, entry_id, keys.slugify(title or body))
+            data = entry.to_text().encode()
+            info, prev, new = self._write_locked(key, data, if_absent=True)
+        if self.on_write:
+            self.on_write(key, info, data, prev, new)
         return entry, key
 
     def find_entry_key(self, entry_id: str) -> str | None:
@@ -173,6 +182,17 @@ class Vault:
         while self.storage.exists(keys.entity_key(entity_type, candidate)):
             candidate, n = f"{base}-{n}", n + 1
         return candidate
+
+    def create_entity(self, entity_type: keys.EntityType, name: str, build: Callable[[str], Entity]) -> Entity:
+        """Pick a free id for a new entity and write it, under one lock so no other process takes the same id."""
+        with self.state.write_lock():
+            entity = build(self.allocate_entity_id(entity_type, name))
+            key = keys.entity_key(entity_type, entity.id)
+            data = entity.to_text().encode()
+            info, prev, new = self._write_locked(key, data, if_absent=True)
+        if self.on_write:
+            self.on_write(key, info, data, prev, new)
+        return entity
 
     def put_entity(self, entity: Entity) -> str:
         if entity.type not in ENTITY_MODELS:

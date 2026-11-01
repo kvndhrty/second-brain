@@ -724,6 +724,38 @@ fusion, expanded with one hop of graph neighbours, then passed to the chat model
 - `brain mcp`: the same MCP tools over stdio, for when `start` is not running.
   The MCP tool definitions live in one module used by both transports.
 
+### MCP tools
+
+Built on the official `mcp` SDK (2.x, `MCPServer`), in `src/brain/mcp/`. Each
+tool returns a typed result (structured content plus the same data as JSON
+text) and calls one Brain method.
+
+| Tool | Read-only | What it returns |
+|---|---|---|
+| `search(query, limit, types)` | yes | entries, fragments, and entities by keyword and vector similarity |
+| `ask(question)` | yes | cited claims and their sources |
+| `brief(target, since, mark_seen)` | yes | the brief sections, open fragments, and sources |
+| `get_entity(name_or_id)` | yes | details, notes, related nodes, open items, recent fragments |
+| `get_entry(entry_id)` | yes | the entry text and its fragments, for following a citation |
+| `list_active()` | yes | active and pinned threads with counts, people, and summaries |
+| `add_entry(text, title)` | no | the saved entry and, after processing, its fragments |
+
+`get_entry` is an addition to the original list, so an agent can read a cited
+entry in full. `brief` does not move the user's "last looked" date unless the
+agent passes `mark_seen` (an agent often reads a brief for its own context
+without showing it).
+
+Expected failures (model errors, lease held elsewhere, ambiguous names,
+unknown ids) are raised as `ToolError`, so the agent sees the message; other
+exceptions reach it only as "Error executing tool". The Brain is opened on the
+first call, so a storage problem is reported by the tool instead of stopping
+the server. Sync tools run on worker threads, so all calls share one lock.
+
+Several processes on one machine can use the same index file at once (for
+example `brain mcp` and a CLI command). Index write transactions use
+`BEGIN IMMEDIATE`, and entry and entity ids are chosen and written under the
+machine-wide write lock, so concurrent writers cannot pick the same id.
+
 ## 7. Configuration
 
 Load order (later wins): defaults → `$XDG_CONFIG_HOME/brain/config.toml`

@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "boto3>=1.36",
     "httpx2>=2.16.0",
+    "mcp>=2.3.0",
     "openai>=3.41.0",
     "pydantic>=2.14.2",
     "pydantic-ai-slim[openai]>=2.63.0",

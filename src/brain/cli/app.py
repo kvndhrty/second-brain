@@ -448,5 +448,21 @@ def status(
         out.print(f"updated {fragment_id}")
 
 
+# --- agents -----------------------------------------------------------------
+
+
+@app.command()
+def mcp() -> None:
+    """Serve the journal to agents (e.g. Claude Code) over MCP on stdio."""
+    from brain.mcp.server import BrainHandle, build_server
+
+    loaded = _load()  # a config error stops here, before the client connects
+    handle = BrainHandle(lambda: Brain(loaded, command="brain mcp", llm=_make_llm(loaded.settings)))
+    try:
+        build_server(handle).run("stdio")
+    finally:
+        handle.close()
+
+
 def main() -> None:
     app()

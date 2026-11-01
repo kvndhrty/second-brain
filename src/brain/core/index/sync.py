@@ -73,7 +73,7 @@ class Syncer:
         deleted = [k for k in manifest if k not in listing]
 
         report = SyncReport(listed=len(listing), changed=len(changed), deleted=len(deleted))
-        self.conn.execute("BEGIN")
+        self.conn.execute("BEGIN IMMEDIATE")  # take the write lock now; another process may share this index
         try:
             cache: dict[str, bytes] = {}
             affected: set[str] = set()
@@ -160,7 +160,7 @@ class Syncer:
         """
         if not _indexed(key):
             return
-        self.conn.execute("BEGIN")
+        self.conn.execute("BEGIN IMMEDIATE")  # take the write lock now; another process may share this index
         try:
             row = self.conn.execute("SELECT unit FROM objects WHERE key = ?", (key,)).fetchone()
             affected = {row[0]} if row and row[0] else set()
