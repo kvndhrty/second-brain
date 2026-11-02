@@ -1,7 +1,7 @@
-# brain — architecture (draft for milestone-1 review)
+# brain — architecture
 
-Status: proposal, revised after first review. Nothing is implemented yet.
-Section 10 records which decisions are settled and which are still open.
+This describes the design as built (milestones 1 to 5). Section 10 records the
+decisions made along the way and why.
 
 ## 1. Summary
 
@@ -669,13 +669,37 @@ client path, including tool, native, and prompted structured output.
   counter, and a full listing runs every 10 minutes to catch files edited
   outside the tool.
 - `brain jot` saves the entry. If `brain start` is running on this machine
-  (found through a pid/port file in the cache directory), `jot` notifies it and
+  (found through `server.json` in the state directory), `jot` notifies it and
   returns immediately. Otherwise `jot` processes the entry in the foreground;
   Ctrl-C or a failure leaves the entry saved and pending.
 - `brain process` runs all pending work in the foreground, for use when
   `start` is not running.
-- A processing lock in the cache directory stops the worker and a CLI command
+- A processing lock in the state directory stops the worker and a CLI command
   from processing at the same time.
+
+### Thread operations
+
+`core/threads.py`. Rename (the old name becomes an alias, so mentions of it
+still resolve), pin, archive, reactivate, overcome by events, merge, split, and
+move. Thread-level changes are written to the thread file. Merge sets
+`state: merged` and `merged_into`, follows an existing merge chain to its
+root, refuses cycles, and copies names and aliases to the target; everything
+that reads a thread (briefs, timelines, activity, summaries) includes the
+threads merged into it. Split and move write `threads: {add, remove}` to each
+affected entry's decisions file, so the change survives re-extraction.
+Marking a thread overcome by events can also mark its open questions and
+action items overcome by events (`cascade`). Briefs on an archived or OBE
+thread tell the model so, and it describes the thread as history.
+
+### The overcome-by-events sweep
+
+`core/sweep.py` lists items that may no longer hold: open questions and action
+items older than 30 days, speculative fragments older than 30 days, and
+unpinned threads with no activity for 60 days. Items in archived or OBE threads
+are left out, and so are items whose status or open/closed state you set
+yourself (the index records `status_origin` and `state_origin`), so "keep it"
+is remembered. `brain sweep` and the "Tidy up" page offer: overcome by events
+(with a reason), close or confirm, keep, and for threads archive, OBE, or pin.
 
 ### Brain façade
 
@@ -904,11 +928,17 @@ poll_seconds = 60
 | 12 | GitHub only, no PyPI. Both ways of getting the UI to work are supported: release wheel with UI included, or build from a clone with Node | agreed; choose per machine |
 | 13 | FIPS mode must work: SHA-256 only, enforced by a test that rejects MD5/SHA-1 in the source | agreed |
 | 14 | Mentions in the decisions file are grouped by type (`person`, `org`, `theme`) | made during milestone 1 |
+| 15 | `get_entry` MCP tool added; MCP `brief` leaves "last looked" unchanged unless `mark_seen` | made during milestone 3 |
+| 16 | One process for web, MCP over HTTP, and the worker (`brain start`); the worker has its own index connection | made during milestone 4 |
+| 17 | Node 24 for building the UI; the wheel carries the built UI so installs need no Node | made during milestone 4 |
+| 18 | Thread OBE can cascade to open items; the sweep skips items you already decided on | made during milestone 5 |
 
-## 11. Milestone 1 scope
+## 11. Not in v1
 
-Config, `Storage` (local + S3), probe, lease, TLS, `Vault`, file formats with
-round-trip tests, SQLite schema (with sqlite-vec loading), sync, `reindex` with
-the equivalence test, `jot` (saves only; extraction arrives in milestone 2),
-`doctor` (model checks limited to connectivity until milestone 2's client),
-`init`, the fake LLM provider, CI including the UBI9 job.
+- Attaching documents (PDFs and similar) through `llm.doc_model`.
+- Scheduled digests.
+- Merging duplicate people and organizations after they have been created.
+  Review is the guard against duplicates; a merge would rewrite the mention
+  mappings of every affected entry and remove the duplicate file, and needs no
+  file-format change.
+- Authentication for `brain start`, which listens on localhost only.

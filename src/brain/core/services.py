@@ -27,6 +27,8 @@ from brain.core.storage import Storage, open_storage
 from brain.core.storage.base import ObjectInfo
 from brain.core.storage.lease import Lease
 from brain.core.storage.probe import ensure_probed
+from brain.core.sweep import SweepItem, sweep_items
+from brain.core.threads import ThreadOps
 from brain.core.vault import Vault
 
 
@@ -318,6 +320,15 @@ class Brain:
             "llm_configured": self.llm.configured,
             "failures": len(self.failures()),
         }
+
+    # --- threads and the OBE sweep --------------------------------------------
+
+    @property
+    def threads(self) -> ThreadOps:
+        return ThreadOps(self.vault, self.db.conn)
+
+    def sweep(self, *, days: int = 30, quiet_days: int = 60, now: datetime | None = None) -> list[SweepItem]:
+        return sweep_items(self.db.conn, now=now or datetime.now(UTC), days=days, quiet_days=quiet_days)
 
     def find_targets(self, text: str) -> list[answers.NodeMatch]:
         return answers.find_targets(self.db.conn, text)

@@ -8,6 +8,7 @@ import { EditorPage, EntriesPage, EntryPage } from "./pages/Entries";
 import { EntityListPage, EntityPage } from "./pages/Entity";
 import { ReviewPage } from "./pages/Review";
 import { SearchPage } from "./pages/Search";
+import { SweepPage } from "./pages/Sweep";
 
 // The graph explorer pulls in Cytoscape; load it only when the page is opened.
 const GraphPage = lazy(() => import("./pages/Graph").then((m) => ({ default: m.GraphPage })));
@@ -37,6 +38,7 @@ export function App() {
         <NavLink to="/orgs">Orgs</NavLink>
         <NavLink to="/themes">Themes</NavLink>
         <NavLink to="/dreams">Dreams</NavLink>
+        <NavLink to="/tidy">Tidy up</NavLink>
         <NavLink to="/graph">Graph</NavLink>
         <footer className="muted">
           {s && (
@@ -65,6 +67,7 @@ export function App() {
           <Route path="/themes" element={<EntityListPage type="theme" title="Themes" />} />
           <Route path="/e/:nodeId" element={<EntityPage />} />
           <Route path="/dreams" element={<DreamsPage />} />
+          <Route path="/tidy" element={<SweepPage />} />
           <Route
             path="/graph"
             element={

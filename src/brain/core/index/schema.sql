@@ -53,6 +53,7 @@ CREATE TABLE fragments (
   status_origin TEXT NOT NULL,          -- llm|user
   dream         INTEGER NOT NULL DEFAULT 0,
   state         TEXT,                   -- open|closed (questions and action items)
+  state_origin  TEXT NOT NULL DEFAULT 'llm',  -- llm|user: whether you set the state yourself
   closed_note   TEXT,
   obe_date      TEXT,
   obe_reason    TEXT,

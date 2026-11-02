@@ -173,6 +173,25 @@ export interface ReviewDecision {
   apply_to_all?: boolean;
 }
 
+export interface ThreadOp {
+  op: "rename" | "pin" | "unpin" | "archive" | "activate" | "obe" | "merge" | "split" | "move";
+  name?: string;
+  description?: string;
+  reason?: string;
+  cascade?: boolean;
+  into?: string;
+  fragment_ids?: string[];
+}
+
+export interface SweepItem {
+  kind: "stale_open" | "stale_speculative" | "quiet_thread";
+  age_days: number;
+  fragment: Fragment | null;
+  thread_id: string | null;
+  thread_name: string | null;
+  threads: string[] | null;
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -222,6 +241,9 @@ export const api = {
   ask: (question: string) => request<AskResult>("POST", "/api/ask", { question }),
   brief: (target: string, since?: string) =>
     request<BriefResult>("POST", "/api/brief", { target, since: since || null, mark_seen: true }),
+  threadOp: (threadId: string, op: ThreadOp) =>
+    request<{ id: string; cascaded?: number }>("POST", `/api/threads/${q(threadId)}`, op),
+  sweep: (days = 30) => request<SweepItem[]>("GET", `/api/sweep?days=${days}`),
   graph: (center?: string) => request<GraphData>("GET", `/api/graph${center ? `?center=${q(center)}` : ""}`),
 };
 

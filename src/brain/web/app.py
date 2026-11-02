@@ -31,6 +31,7 @@ from brain.core.services import Brain, Busy, FragmentChange, JotFailed
 from brain.core.shared import SharedBrain
 from brain.core.storage.base import StorageError
 from brain.core.storage.lease import LeaseError
+from brain.core.threads import ThreadError
 from brain.core.views import fragment_view
 from brain.core.worker import Worker
 
@@ -60,6 +61,16 @@ class BriefIn(BaseModel):
     target: str
     since: str | None = None
     mark_seen: bool = True
+
+
+class ThreadOpIn(BaseModel):
+    op: Literal["rename", "pin", "unpin", "archive", "activate", "obe", "merge", "split", "move"]
+    name: str | None = None
+    description: str | None = None
+    reason: str | None = None
+    cascade: bool = False
+    into: str | None = None  # merge target, or move destination
+    fragment_ids: list[str] = []
 
 
 class ReviewIn(BaseModel):
@@ -163,7 +174,7 @@ def create_app(
     errors: list[tuple[type[BaseException] | tuple[type[BaseException], ...], int]] = [
         (KeyError, 404),
         (AmbiguousTarget, 409),
-        ((ValueError, rv.ReviewError, FormatError), 400),
+        ((ValueError, rv.ReviewError, ThreadError, FormatError), 400),
         ((LeaseError, Busy), 409),
         (LLMError, 502),
         ((StorageError, JotFailed), 503),
@@ -291,6 +302,39 @@ def create_app(
         decision = _decision(body)
         call(lambda b: b.resolve_review(item_id, decision))
         return {"id": item_id}
+
+    @app.post("/api/threads/{thread_id}")
+    def thread_op(thread_id: str, body: ThreadOpIn) -> Any:
+        def need(value: str | None, field: str) -> str:
+            if not value:
+                raise ValueError(f"'{body.op}' needs '{field}'")
+            return value
+
+        def run(b: Brain) -> Any:
+            t = b.threads
+            match body.op:
+                case "rename":
+                    t.rename(thread_id, need(body.name, "name"))
+                case "pin" | "unpin":
+                    t.pin(thread_id, body.op == "pin")
+                case "archive" | "activate":
+                    t.set_state(thread_id, "archived" if body.op == "archive" else "active")
+                case "obe":
+                    return {"id": thread_id, "cascaded": t.obe(thread_id, reason=body.reason, cascade=body.cascade)}
+                case "merge":
+                    t.merge(thread_id, need(body.into, "into"))
+                    return {"id": need(body.into, "into")}
+                case "split":
+                    return {"id": t.split(thread_id, body.fragment_ids, need(body.name, "name"), body.description).id}
+                case "move":
+                    t.move(body.fragment_ids, thread_id, need(body.into, "into"))
+            return {"id": thread_id}
+
+        return call(run)
+
+    @app.get("/api/sweep")
+    def sweep(days: int = 30, quiet_days: int = 60) -> Any:
+        return _data(call(lambda b: b.sweep(days=max(days, 0), quiet_days=max(quiet_days, 0))))
 
     @app.post("/api/worker/wake")
     def wake_worker() -> Any:

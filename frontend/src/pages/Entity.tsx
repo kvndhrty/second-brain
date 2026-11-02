@@ -11,6 +11,7 @@ import {
   SummaryText,
 } from "../components";
 import { useLoad } from "../hooks";
+import { ThreadActions } from "./ThreadActions";
 
 const TYPE_PATH: Record<string, string> = { thread: "threads", person: "people", org: "orgs", theme: "themes" };
 
@@ -64,6 +65,8 @@ export function EntityPage() {
   const [brief, setBrief] = useState<BriefResult>();
   const [briefing, setBriefing] = useState(false);
   const [briefError, setBriefError] = useState<string>();
+  const [selecting, setSelecting] = useState(false);
+  const [selected, setSelected] = useState<string[]>([]);
 
   const items = useMemo(
     () =>
@@ -131,6 +134,18 @@ export function EntityPage() {
           Graph
         </Link>
       </div>
+      {e.type === "thread" && (
+        <ThreadActions
+          thread={e}
+          selected={selected}
+          selecting={selecting}
+          setSelecting={(v) => {
+            setSelecting(v);
+            if (!v) setSelected([]);
+          }}
+          onChanged={reload}
+        />
+      )}
       {briefError && <p className="error">{briefError}</p>}
       {brief && <BriefPanel brief={brief} />}
 
@@ -182,9 +197,20 @@ export function EntityPage() {
         </label>
       </div>
       <Loading error={timeline.error} loading={timeline.loading && !timeline.data} />
-      {items.map(({ fragment, links }) => (
-        <FragmentCard key={fragment.id} fragment={fragment} links={links} onChanged={reload} />
-      ))}
+      {items.map(({ fragment, links }) =>
+        selecting ? (
+          <label key={fragment.id} className="select-row">
+            <input
+              type="checkbox"
+              checked={selected.includes(fragment.id)}
+              onChange={() => setSelected(toggle(selected, fragment.id))}
+            />
+            <FragmentCard fragment={fragment} links={links} onChanged={reload} />
+          </label>
+        ) : (
+          <FragmentCard key={fragment.id} fragment={fragment} links={links} onChanged={reload} />
+        ),
+      )}
     </section>
   );
 }

@@ -5,12 +5,13 @@ You write a few paragraphs a day; brain extracts decisions, questions, people,
 themes, and workstreams, and can brief you on any of them when you come back
 after weeks away.
 
-Status: milestone 4 of 5. Entries are extracted into fragments, people, orgs,
-themes, and threads; you confirm new names in review; `ask`, `brief`, and
-`active` answer from the graph with citations. Three front-ends share one core:
-the CLI, a web UI (`brain start`), and an MCP server for agents such as Claude
-Code.
-See [docs/architecture.md](docs/architecture.md) for the design.
+Three front-ends share one core: the CLI, a web UI (`brain start`), and an MCP
+server for agents such as Claude Code. Plain files in a local directory or an
+S3 bucket are the source of truth; the search index is rebuilt from them.
+
+- [docs/usage.md](docs/usage.md): daily use (writing, review, briefs, keeping things current)
+- [docs/restricted-network.md](docs/restricted-network.md): setup on a machine with internal mirrors, S3, and a TLS gateway
+- [docs/architecture.md](docs/architecture.md): design, file formats, and decisions
 
 ## Install
 
@@ -117,6 +118,8 @@ brain uses the OS trust store.
 | `brain ask "QUESTION"` | Answer from the journal, citing dated entries |
 | `brain show [ENTRY]` | An entry's fragments with ids and status (default: latest) |
 | `brain status FRAGMENT --obe/--speculative/--confirmed/--closed/--open/--dream` | Change a fragment's status |
+| `brain thread list/rename/pin/archive/obe/merge/split/move/show` | Manage threads |
+| `brain sweep` | Go through stale open items, unconfirmed speculation, and quiet threads |
 | `brain process` | Run any pending extraction and stale thread summaries |
 | `brain reextract [IDS] [--since D] [--stale-prompts]` | Re-run extraction after a model or prompt change; your decisions are kept |
 | `brain sync [--full]` | Bring the local index up to date with the store |
@@ -134,9 +137,11 @@ thread. The output is not useful as a journal, but it exercises every command.
 `brain start` serves the web UI on http://127.0.0.1:8765 (`[server] port`)
 and processes new entries in the background. While it runs, `brain jot` hands
 new entries to it instead of processing them in the foreground. Pages: active
-threads, thread/person/org/theme pages with a filterable timeline and
-"Brief me", review queue, search and ask, entries with an editor, dreams, and
-a graph of how threads, people, orgs, and themes connect.
+threads, thread/person/org/theme pages with a filterable timeline, "Brief me",
+and thread actions (pin, archive, overcome by events, rename, merge, split);
+review queue; search and ask; entries with an editor; dreams; "Tidy up" (the
+overcome-by-events sweep); and a graph of how threads, people, orgs, and
+themes connect.
 
 It listens on localhost only and has no login. It rejects requests whose Host
 header is not localhost and writes that are not JSON, which stops other
@@ -191,3 +196,7 @@ builds the wheel with the UI included and attaches it to a GitHub release.
 - Live model tests: `BRAIN_LIVE_TESTS=1 BRAIN_TEST_LIVE_CONFIG=path uv run pytest tests/live`.
 - CI runs on GitHub Actions through `ci/*.sh`, which GitLab CI can call
   unchanged. One job runs the suite in Red Hat's UBI 9 image.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

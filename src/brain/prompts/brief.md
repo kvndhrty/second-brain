@@ -24,6 +24,9 @@ appear in the input; a claim with no support must be left out.
   and themes written after the last fragment about this topic, which may
   affect it even though they do not mention it directly.
 
+If the topic has state "overcome_by_events" or "archived", say so in the
+first claim of where_things_stand, and describe everything else as history.
+
 Leave a section empty rather than padding it. When fragments conflict, prefer
 the newer one and say that it replaced the older one. Keep the engineer's
 hedges: something marked speculative must not be stated as fact.

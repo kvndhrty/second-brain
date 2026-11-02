@@ -174,3 +174,20 @@ def test_runtime_file_ignores_dead_or_other_servers(state):
     assert runtime.read(state, "local:/store") is None
     runtime.clear(state, 2**22 + 12345)
     assert not (state.root / runtime.FILE).exists()
+
+
+def test_thread_ops_and_sweep(client, brain):
+    processed(client, brain, "Started the [[Cache rewrite]]. Need to benchmark the [[Cache rewrite]].")
+    op = lambda body: post(client, "/api/threads/cache-rewrite", body)  # noqa: E731
+    assert op({"op": "rename", "name": "Cache v2"}).status_code == 200
+    assert op({"op": "pin"}).status_code == 200
+    assert client.get("/api/entity/thread:cache-rewrite").json()["details"]["pinned"] is True
+    frag = client.get("/api/entity/thread:cache-rewrite/timeline").json()[0]["fragment"]["id"]
+    r = op({"op": "split", "name": "Benchmarks", "fragment_ids": [frag]})
+    assert r.json()["id"] == "benchmarks"
+    r = post(client, "/api/threads/benchmarks", {"op": "obe", "reason": "dropped", "cascade": True})
+    assert r.json()["cascaded"] == 1
+    assert op({"op": "merge"}).status_code == 400
+    assert post(client, "/api/threads/nope", {"op": "pin"}).status_code == 400
+    sweep = client.get("/api/sweep", params={"days": 0, "quiet_days": 0}).json()
+    assert {i["kind"] for i in sweep} <= {"stale_open", "stale_speculative", "quiet_thread"}

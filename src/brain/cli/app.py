@@ -469,6 +469,31 @@ def status(
         out.print(f"updated {fragment_id}")
 
 
+# --- threads and the OBE sweep -------------------------------------------------
+
+
+def _register_thread_commands() -> None:
+    from brain.cli.threads import thread_app
+
+    app.add_typer(thread_app, name="thread")
+
+
+_register_thread_commands()
+
+
+@app.command()
+def sweep(
+    days: Annotated[int, typer.Option(help="Open or speculative items older than this many days.")] = 30,
+    quiet_days: Annotated[int, typer.Option(help="Threads with no activity for this many days.")] = 60,
+) -> None:
+    """Go through items that may be overcome by events: old open questions and action items,
+    old speculation, and threads that have gone quiet."""
+    from brain.cli.threads import run_sweep
+
+    with _brain("brain sweep", sync=True) as b:
+        run_sweep(b, days=days, quiet_days=quiet_days)
+
+
 # --- agents -----------------------------------------------------------------
 
 

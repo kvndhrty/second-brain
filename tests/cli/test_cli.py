@@ -212,3 +212,25 @@ def test_reextract_requires_confirmation(fake_cfg):
     assert "Re-extract all 1 entries" in r.output
     r = run(fake_cfg, "reextract", "-y")
     assert r.exit_code == 0 and "extract" in r.output
+
+
+def test_thread_commands_and_sweep(fake_cfg, tmp_path):
+    run(fake_cfg, "jot", "-m", "Started the [[Cache rewrite]]. Need to benchmark the [[Cache rewrite]].")
+    r = run(fake_cfg, "thread", "list")
+    assert "Cache rewrite" in r.output and "cache-rewrite" in r.output
+    assert run(fake_cfg, "thread", "rename", "cache-rewrite", "Cache v2").exit_code == 0
+    assert run(fake_cfg, "thread", "pin", "cache-rewrite").exit_code == 0
+    r = run(fake_cfg, "thread", "show", "cache-rewrite")
+    frag = next(w for w in r.output.split() if w.startswith("f-e-") and w.endswith("-02"))
+    r = run(fake_cfg, "thread", "split", "cache-rewrite", frag, "--name", "Benchmarks")
+    assert r.exit_code == 0 and "created thread benchmarks" in r.output
+    r = run(fake_cfg, "thread", "merge", "benchmarks", "nope")
+    assert r.exit_code == 1 and "no thread nope" in r.output
+    r = run(fake_cfg, "thread", "obe", "benchmarks", "--reason", "dropped", "--cascade")
+    assert "1 open items marked" in r.output
+    assert "state: obe" in (tmp_path / "store" / "threads" / "benchmarks.md").read_text()
+    assert "nothing stale" in run(fake_cfg, "sweep").output
+    run(fake_cfg, "jot", "-m", "Does the cache need warming?")
+    r = run(fake_cfg, "sweep", "--days", "0", "--quiet-days", "0", input="c\n")
+    assert r.exit_code == 0 and "Still open" in r.output and "sweep done: 1 changed" in r.output
+    assert "nothing stale" in run(fake_cfg, "sweep", "--days", "0", "--quiet-days", "0").output

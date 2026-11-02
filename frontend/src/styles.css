@@ -462,3 +462,18 @@ table.list td {
     padding: 16px;
   }
 }
+
+.select-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.select-row .fragment {
+  flex: 1;
+  margin: 4px 0;
+}
+
+.thread-actions {
+  margin: 4px 0 12px;
+}

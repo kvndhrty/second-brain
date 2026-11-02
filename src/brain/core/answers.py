@@ -274,6 +274,7 @@ def brief(
     if len(matches) > 1:
         raise AmbiguousTarget(target, matches)
     summary = None
+    topic_state = ""
     if matches:
         node = matches[0]
         frags = _node_fragments(conn, node)
@@ -281,6 +282,8 @@ def brief(
         if ntype == "thread":
             t = queries.thread(conn, node.node_id.split(":", 1)[1])
             summary = t.summary if t else None
+            if t and t.state in ("archived", "obe"):
+                topic_state = f' state="{"overcome_by_events" if t.state == "obe" else t.state}"'
     else:
         hits = retrieve(conn, llm, target, limit=BRIEF_FRAGMENTS)
         by_id = queries.fragments_by_id(conn, [i for i, t in hits if t == "fragment"])
@@ -288,7 +291,7 @@ def brief(
         key, label, ntype = f"text:{norm_alias(target)}", target, "text"
     since = since if since is not None else _last_brief(vault, key)
     lines = [
-        f'<topic type="{ntype}" name="{attr(label)}"/>',
+        f'<topic type="{ntype}" name="{attr(label)}"{topic_state}/>',
         f"<last_looked>{since.date().isoformat() if since else 'never'}</last_looked>",
     ]
     if summary:

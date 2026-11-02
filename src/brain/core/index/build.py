@@ -376,8 +376,8 @@ class UnitBuilder:
         span = frag.span or (None, None)
         self.conn.execute(
             "INSERT OR REPLACE INTO fragments(id, entry_id, kind, text, status, status_origin, dream, state, "
-            "closed_note, obe_date, obe_reason, span_start, span_end, quote, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "state_origin, closed_note, obe_date, obe_reason, span_start, span_end, quote, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 frag.id,
                 entry.id,
@@ -387,6 +387,7 @@ class UnitBuilder:
                 "user" if d.status else "llm",
                 int(dream),
                 state,
+                "user" if d.state else "llm",
                 d.closed_note,
                 obe_date,
                 obe_reason,
