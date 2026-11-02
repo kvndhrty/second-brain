@@ -284,5 +284,40 @@ class Brain:
     def entry(self, entry_id: str) -> views.EntryView:
         return views.entry_view(self.db.conn, entry_id)
 
+    def entities(self, etype: str) -> list[views.EntitySummary]:
+        return views.entity_list(self.db.conn, etype)
+
+    def recent_entries(self, *, limit: int = 50, before: str | None = None) -> list[views.EntrySummary]:
+        return views.recent_entries(self.db.conn, limit=limit, before=before)
+
+    def dreams(self) -> list[views.FragmentView]:
+        return views.dreams(self.db.conn)
+
+    def timeline(self, node_id: str) -> list[views.TimelineFragment]:
+        return views.node_timeline(self.db.conn, node_id)
+
+    def graph(self, *, center: str | None = None, depth: int = 2, limit: int = 250) -> views.Graph:
+        return views.entity_graph(self.db.conn, center=center, depth=depth, limit=limit)
+
+    def update_entry(self, entry_id: str, text: str, *, title: str | None = None) -> Entry:
+        """Replace an entry's text (your edit). Extraction runs again on the next processing pass."""
+        if not text.strip():
+            raise ValueError("entry is empty")
+        entry, key = self.vault.get_entry(entry_id, queries.entry_key(self.db.conn, entry_id))
+        entry.body = text
+        entry.title = title or None
+        return self.vault.update_entry(entry, key)
+
+    def status(self) -> dict:
+        c = self.db.conn
+        return {
+            "store": self.storage.describe(),
+            "entries": c.execute("SELECT COUNT(*) FROM entries").fetchone()[0],
+            "pending": c.execute("SELECT COUNT(*) FROM entries WHERE next_step != 'done'").fetchone()[0],
+            "review": c.execute("SELECT COUNT(*) FROM review_items").fetchone()[0],
+            "llm_configured": self.llm.configured,
+            "failures": len(self.failures()),
+        }
+
     def find_targets(self, text: str) -> list[answers.NodeMatch]:
         return answers.find_targets(self.db.conn, text)

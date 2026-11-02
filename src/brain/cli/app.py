@@ -151,12 +151,33 @@ def jot(
         drafts = b.pending_drafts()
         if drafts:
             out.print(f"[yellow]{len(drafts)} unsent draft(s) in {drafts[0].parent}[/yellow]")
+        if process and _hand_to_server(b, result.entry.id):
+            return
         if process and b.llm.configured:
             from brain.cli.render import run_processing
 
             run_processing(out, lambda progress: b.process(result.entry.id, progress=progress), b)
         elif process:
             out.print("[dim]no model endpoint configured; extraction is pending (see `brain doctor`)[/dim]")
+
+
+def _hand_to_server(b: Brain, entry_id: str) -> bool:
+    """If `brain start` is running for this store, let its worker process the entry."""
+    import httpx2
+
+    from brain.core import runtime
+
+    info = runtime.read(b.state, b.storage.ident)
+    if info is None:
+        return False
+    try:
+        # trust_env=False: a localhost request must never go through HTTPS_PROXY.
+        r = httpx2.post(f"{info.url}/api/worker/wake", json={"entry": entry_id}, timeout=3, trust_env=False)
+        r.raise_for_status()
+    except httpx2.HTTPError:
+        return False
+    out.print(f"processing in the background by `brain start` ({info.url})")
+    return True
 
 
 # --- index ------------------------------------------------------------------
@@ -454,14 +475,86 @@ def status(
 @app.command()
 def mcp() -> None:
     """Serve the journal to agents (e.g. Claude Code) over MCP on stdio."""
-    from brain.mcp.server import BrainHandle, build_server
+    from brain.core.shared import SharedBrain
+    from brain.mcp.server import build_server
 
     loaded = _load()  # a config error stops here, before the client connects
-    handle = BrainHandle(lambda: Brain(loaded, command="brain mcp", llm=_make_llm(loaded.settings)))
+    shared = SharedBrain(lambda: Brain(loaded, command="brain mcp", llm=_make_llm(loaded.settings)))
     try:
-        build_server(handle).run("stdio")
+        build_server(shared).run("stdio")
     finally:
-        handle.close()
+        shared.close()
+
+
+@app.command()
+def start(
+    port: Annotated[int | None, typer.Option(help="Port on 127.0.0.1 (default: server.port).")] = None,
+    open_browser: Annotated[bool, typer.Option("--open", help="Open the web UI in a browser.")] = False,
+) -> None:
+    """Run the web UI, the HTTP API, MCP over HTTP at /mcp, and background processing."""
+    import webbrowser
+
+    import uvicorn
+
+    from brain.core import runtime
+    from brain.core.shared import SharedBrain
+    from brain.core.worker import Worker
+    from brain.mcp.server import build_server
+    from brain.web.app import STATIC_DIR, create_app
+
+    loaded = _load()
+    settings = loaded.settings
+    port = port or settings.server.port
+    state = LocalState()
+
+    def open_brain(command: str) -> Brain:
+        return Brain(loaded, command=command, llm=_make_llm(settings), state=state)
+
+    shared = SharedBrain(lambda: open_brain("brain start"))
+    try:
+        store = shared.call(lambda b: b.storage.ident)
+    except (StorageError, IndexError_, FormatError) as e:
+        raise _fail(str(e)) from None
+    running = runtime.read(state, store)
+    if running is not None and running.pid != os.getpid():
+        shared.close()
+        raise _fail(f"`brain start` is already running for this store (pid {running.pid}, {running.url})")
+    worker = Worker(lambda: open_brain("brain start (worker)"), poll_seconds=settings.worker.poll_seconds)
+    mcp_server = build_server(shared, process_entry=lambda entry_id: worker.process_now(entry_id, timeout=300))
+    stopped = False
+
+    def shutdown() -> None:
+        nonlocal stopped
+        if stopped:
+            return
+        stopped = True
+        worker.stop()
+        shared.close()  # releases the lease
+        runtime.clear(state, os.getpid())
+
+    web = create_app(shared, worker=worker, mcp_server=mcp_server, port=port, on_shutdown=shutdown)
+    url = f"http://127.0.0.1:{port}"
+    runtime.write(state, runtime.ServerInfo(os.getpid(), port, store))
+    worker.start()
+    out.print(f"brain {__version__} at [bold]{url}[/bold]")
+    out.print(f"MCP: {url}/mcp  [dim](claude mcp add --transport http brain {url}/mcp)[/dim]")
+    if not (STATIC_DIR / "index.html").exists():
+        out.print("[yellow]the web UI is not built; see frontend/README.md[/yellow]")
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        uvicorn.run(web, host="127.0.0.1", port=port, log_level="warning")
+    finally:
+        shutdown()  # if the server never started (e.g. the port is taken)
+
+
+@app.command(hidden=True)
+def serve(
+    port: Annotated[int | None, typer.Option()] = None,
+    open_browser: Annotated[bool, typer.Option("--open")] = False,
+) -> None:
+    """Alias for `brain start`."""
+    start(port=port, open_browser=open_browser)
 
 
 def main() -> None:

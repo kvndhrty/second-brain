@@ -724,6 +724,38 @@ fusion, expanded with one hop of graph neighbours, then passed to the chat model
 - `brain mcp`: the same MCP tools over stdio, for when `start` is not running.
   The MCP tool definitions live in one module used by both transports.
 
+### Web server (`brain start`)
+
+One process runs uvicorn on 127.0.0.1 with a FastAPI app (`src/brain/web/app.py`):
+the JSON API under `/api`, MCP over streamable HTTP at `/mcp`, and the built UI
+(any other path returns `index.html`, so client-side routes work on reload).
+
+- Requests share one Brain through `core/shared.py` (one lock, opened lazily).
+- The background worker (`core/worker.py`) has its own Brain and SQLite
+  connection, so model calls during processing do not block requests. It runs
+  on startup, when woken (an entry was saved through the UI, MCP, or
+  `brain jot`), every `worker.poll_seconds`, and lists the whole store every
+  10 minutes to catch files edited outside brain. MCP `add_entry` hands the
+  entry to the worker and waits for it.
+- `$XDG_STATE_HOME/brain/server.json` records the pid, port, and store. `brain
+  jot` reads it and wakes the server instead of processing in the foreground;
+  a stale file (dead pid) is ignored.
+- Shutdown work (stop the worker, release the lease, remove `server.json`)
+  runs in the app's lifespan, because uvicorn re-raises SIGTERM/SIGINT after
+  its graceful shutdown, which skips code after `uvicorn.run`.
+- No login. The app rejects a Host header other than localhost (DNS
+  rebinding) and any write that is not `application/json` (cross-site forms
+  and simple requests cannot send it without a CORS preflight, which the app
+  never approves). The MCP endpoint uses the SDK's own DNS-rebinding check.
+
+The UI is React + TypeScript + Vite in `frontend/`, with `react-router-dom`
+and Cytoscape.js for the graph (loaded only on the graph page). It is built
+into `src/brain/web/static/`; a hatch build hook (`hatch_build.py`) runs the
+build when a wheel is made from a checkout without it, and `ci/release.sh`
+builds it for release wheels. The graph joins two entities when fragments link
+to both, so a technique theme connected to two threads shows the same approach
+used in both.
+
 ### MCP tools
 
 Built on the official `mcp` SDK (2.x, `MCPServer`), in `src/brain/mcp/`. Each
@@ -869,7 +901,7 @@ poll_seconds = 60
 | 9 | People and orgs wait for review; themes and threads are created as `proposed` and used immediately | agreed |
 | 10 | One `[tls]` section for both endpoints | agreed |
 | 11 | `brain start` processes pending work in the background; `brain process` for manual runs | agreed |
-| 12 | GitHub only, no PyPI; frontend delivery decided at milestone 4 | agreed |
+| 12 | GitHub only, no PyPI. Both ways of getting the UI to work are supported: release wheel with UI included, or build from a clone with Node | agreed; choose per machine |
 | 13 | FIPS mode must work: SHA-256 only, enforced by a test that rejects MD5/SHA-1 in the source | agreed |
 | 14 | Mentions in the decisions file are grouped by type (`person`, `org`, `theme`) | made during milestone 1 |
 

@@ -191,3 +191,176 @@ def entry_view(conn: sqlite3.Connection, entry_id: str) -> EntryView:
         r["next_step"] == "done",
         [fragment_view(frags[i]) for i in ids if i in frags],
     )
+
+
+# --- lists and graph for the web UI --------------------------------------------
+
+
+@dataclass
+class EntitySummary:
+    id: str  # node id
+    type: str
+    name: str
+    state: str | None
+    fragments: int
+    last_seen: str | None
+    detail: str | None  # role for people, kind for themes, description for threads
+
+
+def entity_list(conn: sqlite3.Connection, etype: str) -> list[EntitySummary]:
+    edge = {"thread": "in_thread", "theme": "about"}.get(etype, "mentions")
+    rows = conn.execute(
+        """
+        SELECT n.id, n.label, n.data, COUNT(DISTINCT f.id), MAX(f.created_at)
+        FROM nodes n
+        LEFT JOIN edges e ON e.dst = n.id AND e.type = ?
+        LEFT JOIN fragments f ON e.src = 'frag:' || f.id
+        WHERE n.type = ? GROUP BY n.id ORDER BY MAX(f.created_at) IS NULL, MAX(f.created_at) DESC, n.label
+        """,
+        (edge, etype),
+    ).fetchall()
+    out = []
+    for nid, label, data, count, last in rows:
+        d = json.loads(data)
+        detail = d.get("role") or d.get("kind") or d.get("description")
+        out.append(EntitySummary(nid, etype, label, d.get("state"), count, last[:10] if last else None, detail))
+    return out
+
+
+@dataclass
+class EntrySummary:
+    id: str
+    date: str
+    title: str | None
+    preview: str
+    processed: bool
+    fragments: int
+
+
+def recent_entries(conn: sqlite3.Connection, *, limit: int = 50, before: str | None = None) -> list[EntrySummary]:
+    rows = conn.execute(
+        """
+        SELECT e.id, e.created_at, e.title, e.body, e.next_step,
+               (SELECT COUNT(*) FROM fragments f WHERE f.entry_id = e.id)
+        FROM entries e WHERE e.created_at < ? ORDER BY e.created_at DESC, e.id DESC LIMIT ?
+        """,
+        (before or "9999", limit),
+    ).fetchall()
+    return [EntrySummary(r[0], r[1][:16], r[2], _snippet(r[3]), r[4] == "done", r[5]) for r in rows]
+
+
+def dreams(conn: sqlite3.Connection) -> list[FragmentView]:
+    rows = conn.execute(
+        f"SELECT {queries.FRAGMENT_COLS} FROM fragments f WHERE f.dream = 1 ORDER BY f.created_at DESC, f.id DESC"
+    ).fetchall()
+    return [fragment_view(queries._frag(r)) for r in rows]
+
+
+@dataclass
+class Link:
+    id: str
+    type: str
+    label: str
+
+
+@dataclass
+class TimelineFragment:
+    fragment: FragmentView
+    links: list[Link]
+
+
+def node_timeline(conn: sqlite3.Connection, node_id: str) -> list[TimelineFragment]:
+    """Every fragment linked to a node (and nodes merged into it), newest first, with its other links."""
+    ntype = node_id.split(":", 1)[0]
+    edge = {"thread": ("in_thread",), "theme": ("about",)}.get(ntype, ("mentions",))
+    family = queries.node_family(conn, node_id)
+    frags = queries.fragments_linked_to(conn, family, edge, limit=2000)
+    links: dict[str, list[Link]] = {}
+    if frags:
+        src = [f"frag:{f.id}" for f in frags]
+        for fid, nid, t, label in conn.execute(
+            f"SELECT substr(e.src, 6), n.id, n.type, n.label FROM edges e JOIN nodes n ON n.id = e.dst "
+            f"WHERE e.src IN ({','.join('?' * len(src))}) AND e.type IN ('in_thread', 'mentions', 'about') "
+            "ORDER BY n.type, n.label",
+            src,
+        ):
+            if nid not in family:
+                links.setdefault(fid, []).append(Link(nid, t, label))
+    return [TimelineFragment(fragment_view(f), links.get(f.id, [])) for f in reversed(frags)]
+
+
+@dataclass
+class GraphNode:
+    id: str
+    type: str
+    label: str
+    weight: int  # number of fragments linked to it
+
+
+@dataclass
+class GraphEdge:
+    source: str
+    target: str
+    weight: int  # fragments linking both, or 1 for a membership edge
+    type: str  # co_occurs | member_of | part_of
+
+
+@dataclass
+class Graph:
+    nodes: list[GraphNode]
+    edges: list[GraphEdge]
+    truncated: bool
+
+
+def entity_graph(conn: sqlite3.Connection, *, center: str | None = None, depth: int = 2, limit: int = 250) -> Graph:
+    """People, orgs, themes, and threads; two are joined when fragments link to both.
+
+    This is where cross-thread patterns show up: a technique theme linked to
+    two threads means the same approach was used in both.
+    """
+    weights = dict(
+        conn.execute(
+            "SELECT e.dst, COUNT(DISTINCT e.src) FROM edges e JOIN nodes n ON n.id = e.dst "
+            "WHERE e.type IN ('in_thread', 'mentions', 'about') AND n.type IN ('person', 'org', 'theme', 'thread') "
+            "GROUP BY e.dst"
+        ).fetchall()
+    )
+    labels = {
+        r[0]: (r[1], r[2])
+        for r in conn.execute(
+            "SELECT id, type, label FROM nodes WHERE type IN ('person', 'org', 'theme', 'thread')"
+        ).fetchall()
+    }
+    merged = {r[0] for r in conn.execute("SELECT src FROM edges WHERE type = 'merged_into'")}
+    pairs: dict[tuple[str, str], int] = {}
+    for a, b, n in conn.execute(
+        """
+        SELECT e1.dst, e2.dst, COUNT(DISTINCT e1.src) FROM edges e1
+        JOIN edges e2 ON e2.src = e1.src AND e2.dst > e1.dst
+        WHERE e1.type IN ('in_thread', 'mentions', 'about') AND e2.type IN ('in_thread', 'mentions', 'about')
+        GROUP BY e1.dst, e2.dst
+        """
+    ):
+        if a in labels and b in labels and a not in merged and b not in merged:
+            pairs[(a, b)] = n
+    edges = [GraphEdge(a, b, n, "co_occurs") for (a, b), n in pairs.items()]
+    for src, dst, t in conn.execute("SELECT src, dst, type FROM edges WHERE type IN ('member_of', 'part_of')"):
+        if src in labels and dst in labels:
+            edges.append(GraphEdge(src, dst, 1, t))
+
+    keep = {n for n in labels if n not in merged}
+    if center:
+        adj: dict[str, set[str]] = {}
+        for e in edges:
+            adj.setdefault(e.source, set()).add(e.target)
+            adj.setdefault(e.target, set()).add(e.source)
+        frontier, seen = {center}, {center}
+        for _ in range(depth):
+            frontier = {m for n in frontier for m in adj.get(n, set())} - seen
+            seen |= frontier
+        keep &= seen
+    ranked = sorted(keep, key=lambda n: (n != center, -weights.get(n, 0), labels[n][1]))
+    truncated = len(ranked) > limit
+    keep = set(ranked[:limit])
+    nodes = [GraphNode(n, labels[n][0], labels[n][1], weights.get(n, 0)) for n in ranked[:limit]]
+    return Graph(nodes, [e for e in edges if e.source in keep and e.target in keep], truncated)

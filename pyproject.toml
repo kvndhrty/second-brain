@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "boto3>=1.36",
+    "fastapi>=0.162.0",
     "httpx2>=2.16.0",
     "mcp>=2.3.0",
     "openai>=3.41.0",
@@ -16,6 +17,7 @@ dependencies = [
     "sqlite-vec>=0.1.9",
     "truststore>=0.10.5",
     "typer>=0.27.3",
+    "uvicorn>=0.54.0",
 ]
 
 [project.scripts]
@@ -25,8 +27,18 @@ brain = "brain.cli.app:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+# The built UI is not in git, so list it explicitly or hatch would leave it out.
+artifacts = ["src/brain/web/static/**"]
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/brain"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["frontend/node_modules", ".github", ".venv"]
 
 [dependency-groups]
 dev = [

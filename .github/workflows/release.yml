@@ -1,0 +1,25 @@
+name: release
+
+# Push a tag such as v0.2.0 to publish a GitHub release with the wheel (UI
+# included) attached. Install it without Node:
+#   uv tool install --python 3.12 https://github.com/<owner>/<repo>/releases/download/v0.2.0/brain_journal-0.2.0-py3-none-any.whl
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: frontend/.node-version
+      - uses: astral-sh/setup-uv@v6
+      - run: ci/release.sh
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

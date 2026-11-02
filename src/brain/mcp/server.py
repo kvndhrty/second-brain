@@ -4,14 +4,13 @@ The same tools are served over stdio (`brain mcp`) and, from milestone 4,
 over streamable HTTP inside `brain start`. Tools call the Brain façade; they
 add no behaviour of their own beyond converting results and errors.
 
-Sync tools run on worker threads, so every call takes one lock: the Brain and
-its SQLite connection are used by one call at a time.
+Sync tools run on worker threads; the shared Brain (core/shared.py) lets one
+call use it at a time.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import threading
 from collections.abc import Callable
 from datetime import datetime
 from typing import Literal, TypeVar
@@ -25,8 +24,10 @@ from brain.core.answers import AmbiguousTarget
 from brain.core.formats.yamlio import FormatError
 from brain.core.index.db import IndexError_
 from brain.core.llm.models import LLMError
+from brain.core.pipeline.runner import EntryResult
 from brain.core.review import ReviewError
 from brain.core.services import Brain, Busy, JotFailed
+from brain.core.shared import SharedBrain
 from brain.core.storage.base import StorageError
 from brain.core.storage.lease import LeaseError
 from brain.core.views import fragment_view
@@ -85,37 +86,30 @@ def _claims(claims) -> list[s.Claim]:
     return [s.Claim(text=c.text, citations=c.citations) for c in claims]
 
 
-class BrainHandle:
-    """Opens the Brain on first use, so a storage problem is reported by the tool instead of killing the server."""
+class ToolBrain:
+    """The shared Brain, with expected errors turned into ToolError so the agent sees the message."""
 
-    def __init__(self, open_brain: Callable[[], Brain]) -> None:
-        self._open = open_brain
-        self._brain: Brain | None = None
-        self.lock = threading.Lock()
+    def __init__(self, shared: SharedBrain) -> None:
+        self.shared = shared
 
     def call(self, fn: Callable[[Brain], T], *, sync: bool = True) -> T:
-        with self.lock:
-            try:
-                if self._brain is None:
-                    self._brain = self._open()
-                if sync:
-                    self._brain.sync()
-                return fn(self._brain)
-            except EXPECTED as e:
-                message = e.args[0] if isinstance(e, KeyError) and e.args else str(e)
-                raise ToolError(str(message)) from e
+        try:
+            return self.shared.call(fn, sync=sync)
+        except EXPECTED as e:
+            message = e.args[0] if isinstance(e, KeyError) and e.args else str(e)
+            raise ToolError(str(message)) from e
 
-    def close(self) -> None:
-        with self.lock:
-            if self._brain is not None:
-                self._brain.close()
-                self._brain = None
+
+# Runs the pipeline for a saved entry. In `brain mcp` it runs inline; inside
+# `brain start` it hands the entry to the background worker and waits.
+ProcessEntry = Callable[[str], EntryResult | None]
 
 
 EntityKind = Literal["entry", "fragment", "person", "org", "theme", "thread"]
 
 
-def build_server(handle: BrainHandle) -> MCPServer:
+def build_server(shared: SharedBrain, *, process_entry: ProcessEntry | None = None) -> MCPServer:
+    handle = ToolBrain(shared)
     srv = MCPServer(
         "brain", title="brain work journal", instructions=INSTRUCTIONS, version=__version__, log_level="WARNING"
     )
@@ -210,16 +204,25 @@ def build_server(handle: BrainHandle) -> MCPServer:
     def add_entry(text: str, title: str | None = None) -> s.AddEntryResult:
         """Save a new journal entry and process it. Only when the user asks to record something."""
 
-        def run(b: Brain) -> s.AddEntryResult:
-            saved = b.jot(text, title=title)
-            result = s.AddEntryResult(entry_id=saved.entry.id, key=saved.key, processed=False)
-            if not b.llm.configured:
-                result.error = "no model endpoint configured; the entry is saved and will be processed later"
-                return result
-            report = b.process(saved.entry.id)
-            entry_result = report.entries[0]
-            result.error = entry_result.error
-            result.processed = entry_result.error is None
+        def save(b: Brain):
+            return b.jot(text, title=title), b.llm.configured
+
+        saved, configured = handle.call(save)
+        result = s.AddEntryResult(entry_id=saved.entry.id, key=saved.key, processed=False)
+        if not configured:
+            result.error = "no model endpoint configured; the entry is saved and will be processed later"
+            return result
+        if process_entry is not None:
+            outcome = process_entry(saved.entry.id)
+        else:
+            outcome = handle.call(lambda b: b.process(saved.entry.id).entries[0], sync=False)
+        if outcome is None:
+            result.error = "still processing in the background; check later with get_entry"
+            return result
+        result.error = outcome.error
+        result.processed = outcome.error is None
+
+        def details(b: Brain) -> s.AddEntryResult:
             result.fragments = [_fragment(f) for f in b.entry(saved.entry.id).fragments]
             result.names_to_review = sum(
                 1
@@ -228,6 +231,6 @@ def build_server(handle: BrainHandle) -> MCPServer:
             )
             return result
 
-        return handle.call(run)
+        return handle.call(details)
 
     return srv

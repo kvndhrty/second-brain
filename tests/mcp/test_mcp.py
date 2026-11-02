@@ -14,8 +14,9 @@ from mcp.client.stdio import StdioServerParameters
 from brain.core import keys
 from brain.core.formats.entity import Person, Thread
 from brain.core.llm.models import LLMError
+from brain.core.shared import SharedBrain
 from brain.core.storage.lease import Lease
-from brain.mcp.server import BrainHandle, build_server
+from brain.mcp.server import build_server
 from tests.conftest import FAKE_LLM_SETTINGS, make_brain
 
 pytestmark = pytest.mark.anyio
@@ -40,7 +41,7 @@ def brain(local_storage, state, tmp_path):
 
 @pytest.fixture
 def server(brain):
-    return build_server(BrainHandle(lambda: brain))
+    return build_server(SharedBrain(lambda: brain))
 
 
 async def call(client: Client, tool: str, **args):
