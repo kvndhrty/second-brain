@@ -18,9 +18,14 @@ from brain.core.services import Brain
 from brain.core.storage.local import LocalStorage
 from brain.core.storage.s3 import S3Storage
 
-# MinIO stopped updating its community images in late 2025, so the tag is
-# pinned. Override with BRAIN_TEST_MINIO_IMAGE if this tag is not available.
-MINIO_IMAGE = os.environ.get("BRAIN_TEST_MINIO_IMAGE", "quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z")
+# MinIO no longer publishes public images (quay.io and Docker Hub both refuse
+# anonymous pulls) or binaries, so this uses Chainguard's free build, pinned by
+# digest (MinIO RELEASE.2026-10-23T20-06-51Z). Override with
+# BRAIN_TEST_MINIO_IMAGE if this digest stops being available.
+MINIO_IMAGE = os.environ.get(
+    "BRAIN_TEST_MINIO_IMAGE",
+    "cgr.dev/chainguard/minio@sha256:aea6c163749e1caca37f907976dcf337177ddf5f558808f2aa591618fd3a6eef",
+)
 MINIO_USER = "brainminio"
 MINIO_PASSWORD = "brainminio-secret"
 

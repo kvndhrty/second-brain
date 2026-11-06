@@ -865,10 +865,10 @@ poll_seconds = 60
 ## 8. Distribution and CI
 
 - Not published to PyPI. The repository is public on GitHub; you clone it and
-  run `uv tool install --python 3.12 .`. On a network with internal mirrors,
-  Python comes from the uv mirror (`UV_PYTHON_INSTALL_MIRROR`) and
-  dependencies from the PyPI mirror.
-  `requires-python = ">=3.11"`; development uses 3.12.
+  run `uv tool install --managed-python --python 3.12 .`. On a network with
+  internal mirrors, Python comes from the uv mirror (`UV_PYTHON_INSTALL_MIRROR`)
+  and dependencies from the PyPI mirror. `requires-python = ">=3.11"`;
+  development uses 3.12.
 - The dist name stays `brain-journal` so it can never be confused with the
   unrelated `brain` package on PyPI. The command is `brain`.
 - The built frontend has to reach the installing machine. Options, to decide at
@@ -882,14 +882,15 @@ poll_seconds = 60
   - tests inside a UBI9 container with uv-managed Python, to catch RHEL-specific
     differences (OpenSSL policy, FIPS mode, filesystem). The code uses SHA-256
     only, never MD5, so it works with FIPS enabled.
-  - S3 contract tests against a MinIO service container
+  - S3 contract tests against MinIO, started by the test fixture
   - frontend: `tsc --noEmit`, `vite build`, vitest
 - S3 tests read `BRAIN_TEST_S3_ENDPOINT`; if unset, the fixture tries to start
   MinIO with `podman` or `docker`; if neither works, the tests are skipped with
-  a reason. MinIO's community container images stopped being updated in late
-  2025, so the image tag is pinned. `moto` is a pure-Python fallback that runs
-  without containers, if its conditional-write behaviour is adequate (check
-  when writing the tests).
+  a reason. MinIO stopped publishing public images and binaries in late 2025,
+  and its GitHub repository is archived, so the fixture uses Chainguard's free
+  MinIO image pinned by digest (`BRAIN_TEST_MINIO_IMAGE` overrides it). `moto`
+  is a pure-Python fallback that runs without containers, if its
+  conditional-write behaviour is adequate (check when writing the tests).
 
 ## 9. Doctor
 

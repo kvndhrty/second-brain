@@ -22,7 +22,7 @@ Pythons do not.
 From a release wheel (the web UI is included; no Node needed):
 
 ```sh
-uv tool install --python 3.12 https://github.com/<you>/second-brain/releases/download/v0.1.0/brain_journal-0.1.0-py3-none-any.whl
+uv tool install --managed-python --python 3.12 https://github.com/<you>/second-brain/releases/download/v0.1.0/brain_journal-0.1.0-py3-none-any.whl
 ```
 
 From a clone (the web UI is built during install, which needs Node 22+ and npm;
@@ -31,7 +31,7 @@ set `BRAIN_SKIP_FRONTEND=1` to install without the UI):
 ```sh
 git clone https://github.com/<you>/second-brain.git
 cd second-brain
-uv tool install --python 3.12 .
+uv tool install --managed-python --python 3.12 .
 ```
 
 Then:

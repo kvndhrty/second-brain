@@ -113,7 +113,7 @@ class Doctor:
                 "sqlite",
                 "fail",
                 f"SQLite {caps.sqlite_version} is older than {min_v}",
-                "Install brain with a uv-managed Python: `uv tool install --python 3.12 .`",
+                "Install brain with a uv-managed Python: `uv tool install --managed-python --python 3.12 .`",
             )
         else:
             self.add("sqlite", "ok", f"SQLite {caps.sqlite_version}")
@@ -126,7 +126,7 @@ class Doctor:
                 "sqlite-vec",
                 "fail",
                 f"sqlite-vec does not load: {caps.vec_error}",
-                "Install brain with a uv-managed Python: `uv tool install --python 3.12 .`",
+                "Install brain with a uv-managed Python: `uv tool install --managed-python --python 3.12 .`",
             )
         fips = Path("/proc/sys/crypto/fips_enabled")
         if fips.exists():

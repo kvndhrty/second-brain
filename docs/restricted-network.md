@@ -29,7 +29,7 @@ Python is wrong.
 Either from a release wheel, which already contains the web UI:
 
 ```sh
-uv tool install --python 3.12 \
+uv tool install --managed-python --python 3.12 \
   https://github.com/<owner>/second-brain/releases/download/vX.Y.Z/brain_journal-X.Y.Z-py3-none-any.whl
 ```
 
@@ -39,7 +39,7 @@ and the npm mirror (`npm config set registry https://npm-mirror.internal/`):
 ```sh
 git clone https://github.com/<owner>/second-brain.git
 cd second-brain
-uv tool install --python 3.12 .
+uv tool install --managed-python --python 3.12 .
 ```
 
 Without Node, install from the clone with `BRAIN_SKIP_FRONTEND=1`. Everything
@@ -85,7 +85,7 @@ The common problems on a restricted network:
 
 | Check | Symptom | Fix |
 |---|---|---|
-| sqlite / sqlite-vec | "cannot load extensions" | Reinstall with `uv tool install --python 3.12 ...` (uv's Python) |
+| sqlite / sqlite-vec | "cannot load extensions" | Reinstall with `uv tool install --managed-python --python 3.12 ...` (uv's Python) |
 | index path | "on a network filesystem (nfs4)" | Home is on NFS. Set `[index] path = "/var/tmp/$USER/brain/index.db"` |
 | tls | "TLS file not found" or key mismatch | Check the paths in `[tls]`; the key must belong to the certificate |
 | storage | "no AWS credentials found" | Set `AWS_PROFILE` or the key variables, in the same shell |
@@ -105,7 +105,7 @@ with FIPS enabled.
 
 ```sh
 BRAIN_LIVE_TESTS=1 BRAIN_TEST_LIVE_CONFIG=~/.config/brain/config.toml \
-  uv run --python 3.12 pytest tests/live        # from a clone
+  uv run --managed-python --python 3.12 pytest tests/live        # from a clone
 ```
 
 This extracts one sample entry into a throwaway local store and asks a

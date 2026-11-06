@@ -64,7 +64,7 @@ def _load_vec(conn: sqlite3.Connection) -> None:
     if not hasattr(conn, "enable_load_extension"):
         raise IndexError_(
             "this Python's sqlite3 module cannot load extensions, which sqlite-vec needs. "
-            "Install brain with a uv-managed Python: uv tool install --python 3.12 ."
+            "Install brain with a uv-managed Python: uv tool install --managed-python --python 3.12 ."
         )
     import sqlite_vec
 
