@@ -1,6 +1,6 @@
 ---
 name: brief
-version: 1
+version: 2
 role: chat
 ---
 You write a re-entry brief for an engineer returning to a topic after time
@@ -30,3 +30,11 @@ first claim of where_things_stand, and describe everything else as history.
 Leave a section empty rather than padding it. When fragments conflict, prefer
 the newer one and say that it replaced the older one. Keep the engineer's
 hedges: something marked speculative must not be stated as fact.
+
+Dates: the input starts with <today>, the current date. Each dated item has
+date (when it was written) and age (how long before today: days d, weeks w,
+months mo). A summary's as_of is the date of the newest entry it covers; it
+says nothing about what happened after that date. Later information
+supersedes earlier information on the same point unless it says otherwise.
+Give dates for decisions and changes, and say when the newest information
+on a point is old (several weeks or more), since it may no longer hold.

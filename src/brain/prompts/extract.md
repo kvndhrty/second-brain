@@ -1,6 +1,6 @@
 ---
 name: extract
-version: 1
+version: 2
 role: extract
 ---
 You turn one journal entry from an engineer's work log into atomic fragments.
@@ -43,3 +43,10 @@ For each distinct point in the entry, emit one fragment:
 
 Skip greetings, filler, and anything with no informational content. Keep the
 author's uncertainty: never upgrade a hedge to a fact.
+
+Dates: the input starts with <today>, the current date. Each dated item has
+date (when it was written) and age (how long before today: days d, weeks w,
+months mo). A summary's as_of is the date of the newest entry it covers; it
+says nothing about what happened after that date. Later information
+supersedes earlier information on the same point unless it says otherwise.
+Use a thread's last activity to judge whether it is still current work.

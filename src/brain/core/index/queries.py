@@ -6,9 +6,10 @@ import difflib
 import json
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from brain.core.index.build import norm_alias
+from brain.core.temporal import age, iso_day
 
 
 @dataclass
@@ -22,6 +23,7 @@ class ThreadRow:
     summary_through: str | None
     last_activity: str | None
     last_entry: str | None
+    summary_as_of: str | None = None  # created_at of the entry the summary runs through
     fragments: int = 0
     open_items: int = 0
     people: list[str] = field(default_factory=list)
@@ -42,14 +44,20 @@ def _thread(r: sqlite3.Row) -> ThreadRow:
         summary_through=r["summary_through"],
         last_activity=r["last_activity"],
         last_entry=r["last_entry"],
+        summary_as_of=r["summary_as_of"],
     )
+
+
+THREAD_SELECT = (
+    "SELECT t.*, (SELECT created_at FROM entries WHERE id = t.summary_through) AS summary_as_of FROM threads t"
+)
 
 
 def threads(
     conn: sqlite3.Connection, *, states: tuple[str, ...] = ("active", "proposed"), limit: int | None = None
 ) -> list[ThreadRow]:
     sql = (
-        f"SELECT * FROM threads WHERE state IN ({','.join('?' * len(states))}) "
+        f"{THREAD_SELECT} WHERE t.state IN ({','.join('?' * len(states))}) "
         "ORDER BY pinned DESC, last_activity IS NULL, last_activity DESC, name"
     )
     params: list[object] = list(states)
@@ -60,7 +68,7 @@ def threads(
 
 
 def thread(conn: sqlite3.Connection, thread_id: str) -> ThreadRow | None:
-    r = conn.execute("SELECT * FROM threads WHERE id = ?", (thread_id,)).fetchone()
+    r = conn.execute(f"{THREAD_SELECT} WHERE t.id = ?", (thread_id,)).fetchone()
     return _thread(r) if r else None
 
 
@@ -199,8 +207,18 @@ def fuzzy_candidates(conn: sqlite3.Connection, etype: str, surface: str, *, limi
     return [Candidate(eid, label, round(s, 3)) for s, eid, label in ranked[:limit]]
 
 
-def entity_profile(conn: sqlite3.Connection, node_id: str, *, recent: int = 3) -> str:
-    """One-line description of an entity for prompts: details and recent mentions."""
+def last_mention(conn: sqlite3.Connection, node_id: str) -> str | None:
+    """created_at of the newest fragment that mentions or is about this node."""
+    r = conn.execute(
+        "SELECT MAX(f.created_at) FROM edges e JOIN fragments f ON e.src = 'frag:' || f.id "
+        "WHERE e.dst = ? AND e.type IN ('mentions', 'about')",
+        (node_id,),
+    ).fetchone()
+    return r[0] if r else None
+
+
+def entity_profile(conn: sqlite3.Connection, node_id: str, *, today: date, recent: int = 3) -> str:
+    """One-line description of an entity for prompts: details and recent mentions, newest first, dated."""
     r = conn.execute("SELECT label, data FROM nodes WHERE id = ?", (node_id,)).fetchone()
     if r is None:
         return node_id
@@ -225,9 +243,9 @@ def entity_profile(conn: sqlite3.Connection, node_id: str, *, recent: int = 3) -
     if data.get("works_on"):
         parts.append("works on: " + ", ".join(data["works_on"]))
     mentions = [
-        m[0]
+        f"{iso_day(m[1])} ({age(m[1], today)}): {m[0]}"
         for m in conn.execute(
-            "SELECT f.text FROM edges e JOIN fragments f ON e.src = 'frag:' || f.id WHERE e.dst = ? "
+            "SELECT f.text, f.created_at FROM edges e JOIN fragments f ON e.src = 'frag:' || f.id WHERE e.dst = ? "
             "ORDER BY f.created_at DESC LIMIT ?",
             (node_id, recent),
         )

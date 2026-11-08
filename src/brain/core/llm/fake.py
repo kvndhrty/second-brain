@@ -300,7 +300,7 @@ def heuristic_answers(user: str) -> dict[str, Any]:
 
 
 def heuristic_summary(user: str) -> dict[str, Any]:
-    prev = re.search(r"<previous_summary>\n(.*?)\n</previous_summary>", user, re.S)
+    prev = re.search(r"<previous_summary[^>]*>\n(.*?)\n</previous_summary>", user, re.S)
     frags = re.findall(r'<fragment entry="([^"]+)"[^>]*>(.*?)</fragment>', user)
     lines = [prev.group(1)] if prev else []
     lines += [f"- {text} [{entry}]" for entry, text in frags]

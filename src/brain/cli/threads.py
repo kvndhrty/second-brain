@@ -9,6 +9,7 @@ import typer
 from rich.markup import escape
 
 from brain.core.services import Brain, FragmentChange
+from brain.core.temporal import iso_day
 from brain.core.threads import ThreadError
 
 thread_app = typer.Typer(no_args_is_help=True, help="Rename, pin, archive, merge, split, or retire a thread.")
@@ -38,7 +39,7 @@ def list_threads(
         states = ("active", "proposed", "archived", "obe", "merged") if all_ else ("active", "proposed")
         for t in queries.threads(b.db.conn, states=states):
             flags = ("📌 " if t.pinned else "") + (f"[dim]({t.state})[/dim] " if t.state != "active" else "")
-            last = t.last_activity[:10] if t.last_activity else "—"
+            last = iso_day(t.last_activity) if t.last_activity else "—"
             out.print(f"{flags}{escape(t.name)}  [dim]{t.id} · last {last}[/dim]")
 
 

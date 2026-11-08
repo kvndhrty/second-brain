@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from brain.core.answers import NODE_TYPES, AmbiguousTarget, find_targets, retrieve
 from brain.core.index import queries, search
 from brain.core.llm.models import LLM
+from brain.core.temporal import iso_day
 
 SNIPPET_CHARS = 280
 
@@ -55,6 +56,8 @@ class EntityView:
     open_items: list[FragmentView]
     recent: list[FragmentView]
     fragment_count: int
+    summary_as_of: str | None = None  # date of the newest entry the summary covers
+    notes_as_of: str | None = None  # when the entity file was last changed
 
 
 @dataclass
@@ -69,7 +72,9 @@ class EntryView:
 
 
 def fragment_view(f: queries.FragmentRow) -> FragmentView:
-    return FragmentView(f.id, f.entry_id, f.created_at[:10], f.kind, f.text, f.status, f.state, f.dream, f.obe_reason)
+    return FragmentView(
+        f.id, f.entry_id, iso_day(f.created_at), f.kind, f.text, f.status, f.state, f.dream, f.obe_reason
+    )
 
 
 def _snippet(text: str) -> str:
@@ -108,7 +113,14 @@ def search_all(
                 f = frags[item_id]
                 hits.append(
                     Hit(
-                        f.id, "fragment", f.text[:80], _snippet(f.text), f.created_at[:10], f.entry_id, f.kind, f.status
+                        f.id,
+                        "fragment",
+                        f.text[:80],
+                        _snippet(f.text),
+                        iso_day(f.created_at),
+                        f.entry_id,
+                        f.kind,
+                        f.status,
                     )
                 )
             elif item_type == "entry":
@@ -118,7 +130,7 @@ def search_all(
                     (item_id,),
                 ).fetchone()
                 if r:
-                    hits.append(Hit(item_id, "entry", r[2], _snippet(r[1]), r[0][:10], item_id))
+                    hits.append(Hit(item_id, "entry", r[2], _snippet(r[1]), iso_day(r[0]), item_id))
     return hits[:limit]
 
 
@@ -133,7 +145,7 @@ def entity_view(conn: sqlite3.Connection, text: str, *, recent: int = 20) -> Ent
     row = conn.execute("SELECT label, data FROM nodes WHERE id = ?", (m.node_id,)).fetchone()
     data = json.loads(row["data"])
     notes = data.pop("notes", "") if isinstance(data.get("notes"), str) else ""
-    data.pop("key", None)
+    file_key = data.pop("key", None) or ""
     aliases = [a[0] for a in conn.execute("SELECT alias FROM aliases WHERE node_id = ? ORDER BY alias", (m.node_id,))]
     edge_type = {"thread": ("in_thread",), "theme": ("about",)}.get(m.type, ("mentions",))
     family = queries.node_family(conn, m.node_id)
@@ -155,10 +167,12 @@ def entity_view(conn: sqlite3.Connection, text: str, *, recent: int = 20) -> Ent
         (m.node_id,),
     ):
         related.setdefault({"member_of": "member of", "part_of": "part of"}.get(r[0], "merged into"), []).append(r[1])
-    summary = None
+    summary = summary_as_of = None
     if m.type == "thread":
         t = queries.thread(conn, m.node_id.split(":", 1)[1])
         summary = t.summary if t else None
+        summary_as_of = iso_day(t.summary_as_of) if t and t.summary_as_of else None
+    changed = conn.execute("SELECT mtime FROM objects WHERE key = ?", (file_key,)).fetchone()
     return EntityView(
         id=m.node_id,
         type=m.type,
@@ -171,6 +185,8 @@ def entity_view(conn: sqlite3.Connection, text: str, *, recent: int = 20) -> Ent
         open_items=[fragment_view(f) for f in frags if f.state == "open" and f.status != "overcome_by_events"],
         recent=[fragment_view(f) for f in frags[-recent:]][::-1],
         fragment_count=len(frags),
+        summary_as_of=summary_as_of,
+        notes_as_of=iso_day(changed[0]) if changed and changed[0] else None,
     )
 
 
@@ -223,7 +239,7 @@ def entity_list(conn: sqlite3.Connection, etype: str) -> list[EntitySummary]:
     for nid, label, data, count, last in rows:
         d = json.loads(data)
         detail = d.get("role") or d.get("kind") or d.get("description")
-        out.append(EntitySummary(nid, etype, label, d.get("state"), count, last[:10] if last else None, detail))
+        out.append(EntitySummary(nid, etype, label, d.get("state"), count, iso_day(last) if last else None, detail))
     return out
 
 

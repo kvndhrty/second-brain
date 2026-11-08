@@ -13,6 +13,7 @@ from brain.core.answers import Answer, Brief, Source
 from brain.core.index.queries import FragmentRow, ThreadRow
 from brain.core.llm.schemas import Claim
 from brain.core.pipeline.runner import ProcessReport
+from brain.core.temporal import iso_day
 
 SECTIONS = [
     ("where_things_stand", "Where things stand"),
@@ -112,7 +113,7 @@ def print_brief(out: Console, brief: Brief) -> None:
     if brief.open_items:
         out.print("\n[bold]Open questions and action items[/bold] [dim](close with `brain status ID --closed`)[/dim]")
         for f in brief.open_items:
-            out.print(f"  • {escape(f.text)}  [dim]{f.kind} · {f.created_at[:10]} · {f.id}[/dim]")
+            out.print(f"  • {escape(f.text)}  [dim]{f.kind} · {iso_day(f.created_at)} · {f.id}[/dim]")
     cites.print(out)
     if not brief.recorded:
         out.print("[dim]note: the brief time was not saved (another machine holds the write lease)[/dim]")
@@ -129,7 +130,7 @@ def print_active(out: Console, threads: list[ThreadRow], now: datetime) -> None:
         name = escape(t.name) + (" [dim](proposed)[/dim]" if t.state == "proposed" else "")
         if t.pinned:
             name = "📌 " + name
-        last = t.last_activity[:10] if t.last_activity else "—"
+        last = iso_day(t.last_activity) if t.last_activity else "—"
         if t.last_activity:
             days = (now - datetime.fromisoformat(t.last_activity)).days
             last += f" [dim]({days}d)[/dim]"

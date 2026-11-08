@@ -16,6 +16,7 @@ from brain.core.formats.yamlio import FormatError
 from brain.core.index.build import norm_alias
 from brain.core.index.queries import entry_dates, fragments_by_id
 from brain.core.storage.base import NotFound
+from brain.core.temporal import iso_day
 from brain.core.vault import Vault
 
 MENTION_KINDS = ("new_person", "new_org", "ambiguous_mention")
@@ -108,7 +109,7 @@ class Review:
                 same_name[k] = same_name.get(k, 0) + 1
         for i in items:
             if i.entry_id in dates:
-                i.entry_date, i.entry_label = dates[i.entry_id][0][:10], dates[i.entry_id][1]
+                i.entry_date, i.entry_label = iso_day(dates[i.entry_id][0]), dates[i.entry_id][1]
             if i.kind in MENTION_KINDS:
                 frags = fragments_by_id(self.conn, i.payload.get("fragments", []))
                 i.context = [f.text for f in frags.values()]

@@ -42,7 +42,3 @@ def cosine(a: list[float], b: list[float]) -> float:
     na = math.sqrt(sum(x * x for x in a)) or 1.0
     nb = math.sqrt(sum(y * y for y in b)) or 1.0
     return dot / (na * nb)
-
-
-def short_date(iso: str) -> str:
-    return iso[:10]

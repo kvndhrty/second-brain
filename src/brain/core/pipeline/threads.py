@@ -11,7 +11,8 @@ from brain.core.formats.sidecars import ThreadSummary
 from brain.core.index import queries
 from brain.core.llm.schemas import SummaryOutput
 from brain.core.pipeline.context import PipelineContext
-from brain.core.pipeline.text import attr, short_date
+from brain.core.pipeline.text import attr
+from brain.core.temporal import as_of, dated, local_date, today_el
 
 MAX_FRAGMENTS = 150
 
@@ -31,15 +32,24 @@ def summarize(ctx: PipelineContext, thread_id: str) -> ThreadSummary | None:
     if not frags:
         return None
 
-    lines = [f'<thread id="{attr(t.id)}" name="{attr(t.name)}" description="{attr(t.description or "")}"/>']
+    now = ctx.clock()
+    today = local_date(now)
+    lines = [
+        today_el(now),
+        f'<thread id="{attr(t.id)}" name="{attr(t.name)}" description="{attr(t.description or "")}"/>',
+    ]
     if previous:
-        lines += ["<previous_summary>", previous.summary_md, "</previous_summary>"]
+        lines += [
+            f"<previous_summary {as_of(through[0] if through else None, today)}>",
+            previous.summary_md,
+            "</previous_summary>",
+        ]
     lines.append("<new_fragments>")
     for f in frags:
         extra = f' obe_reason="{attr(f.obe_reason)}"' if f.obe_reason else ""
         state = f' state="{f.state}"' if f.state else ""
         lines.append(
-            f'<fragment entry="{f.entry_id}" date="{short_date(f.created_at)}" kind="{f.kind}" '
+            f'<fragment entry="{f.entry_id}" {dated(f.created_at, today)} kind="{f.kind}" '
             f'status="{f.status}"{state}{extra}>{f.text}</fragment>'
         )
     lines.append("</new_fragments>")

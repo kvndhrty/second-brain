@@ -37,7 +37,8 @@ from brain.core.index import queries, search
 from brain.core.llm.prompts import load_prompt
 from brain.core.llm.schemas import AnswersOutput, ResolveOutput
 from brain.core.pipeline.context import PipelineContext
-from brain.core.pipeline.text import attr, cosine, short_date, similarity
+from brain.core.pipeline.text import attr, cosine, similarity
+from brain.core.temporal import dated, last_mentioned, local_date, today_el
 
 AUTO_LINK_CONFIDENCE = 0.8
 THEME_LINK_CONFIDENCE = 0.7
@@ -199,17 +200,22 @@ class Resolver:
             self._adjudicate(ambiguous)
 
     def _adjudicate(self, items: list[tuple[Mention, list[queries.Candidate]]]) -> None:
-        lines = ["<mentions>"]
+        now = self.ctx.clock()
+        today = local_date(now)
+        written = dated(self.entry.created, today)
+        lines = [today_el(now), "<mentions>"]
         keyed = {}
         for i, (m, cands) in enumerate(items, 1):
             key = f"m{i}"
             keyed[key] = (m, cands)
             lines.append(f'<mention key="{key}" type="{m.type}" name="{attr(m.surface)}">')
             for text in m.contexts[:3]:
-                lines.append(f"<context>{text}</context>")
+                lines.append(f"<context {written}>{text}</context>")
             for c in cands:
-                profile = queries.entity_profile(self.conn, f"{m.type}:{c.entity_id}")
-                lines.append(f'<candidate id="{attr(c.entity_id)}" score="{c.score}">{profile}</candidate>')
+                nid = f"{m.type}:{c.entity_id}"
+                profile = queries.entity_profile(self.conn, nid, today=today)
+                seen = last_mentioned(queries.last_mention(self.conn, nid), today)
+                lines.append(f'<candidate id="{attr(c.entity_id)}" score="{c.score}" {seen}>{profile}</candidate>')
             lines.append("</mention>")
         lines.append("</mentions>")
 
@@ -271,12 +277,15 @@ def propose_answers(
     cands = sorted(scores, key=lambda i: -scores[i])[:MAX_ANSWER_CANDIDATES]
     if not cands:
         return [], None
-    lines = ["<new_fragments>"]
-    lines += [f'<fragment id="{attr(f.id)}" kind="{f.kind}">{f.text}</fragment>' for f in live]
+    now = ctx.clock()
+    today = local_date(now)
+    written = dated(entry.created, today)
+    lines = [today_el(now), "<new_fragments>"]
+    lines += [f'<fragment id="{attr(f.id)}" kind="{f.kind}" {written}>{f.text}</fragment>' for f in live]
     lines += ["</new_fragments>", "<open_items>"]
-    for i in cands:
+    for i in sorted(cands, key=lambda i: open_items[i].created_at):
         o = open_items[i]
-        lines.append(f'<item id="{attr(o.id)}" date="{short_date(o.created_at)}" kind="{o.kind}">{o.text}</item>')
+        lines.append(f'<item id="{attr(o.id)}" {dated(o.created_at, today)} kind="{o.kind}">{o.text}</item>')
     lines.append("</open_items>")
     new_ids = {f.id for f in live}
     result = ctx.llm.run("answers", "\n".join(lines), AnswersOutput)

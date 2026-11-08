@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, date, datetime
 from typing import Literal, TypeVar
 
 from mcp.server.mcpserver import MCPServer
@@ -30,6 +30,7 @@ from brain.core.services import Brain, Busy, JotFailed
 from brain.core.shared import SharedBrain
 from brain.core.storage.base import StorageError
 from brain.core.storage.lease import LeaseError
+from brain.core.temporal import age_days, iso_day, local_date
 from brain.core.views import fragment_view
 from brain.mcp import schemas as s
 
@@ -74,12 +75,22 @@ EXPECTED = (
 )
 
 
-def _fragment(f) -> s.Fragment:
-    return s.Fragment(**dataclasses.asdict(f))
+def _today() -> date:
+    return local_date(datetime.now(UTC))
 
 
-def _sources(sources: dict) -> list[s.Source]:
-    return [s.Source(entry_id=x.entry_id, date=x.date, label=x.label) for x in sources.values()]
+def _age(value: str | None, today: date) -> int | None:
+    return age_days(value, today) if value else None
+
+
+def _fragment(f, today: date) -> s.Fragment:
+    return s.Fragment(**dataclasses.asdict(f), age_days=_age(f.date, today))
+
+
+def _sources(sources: dict, today: date) -> list[s.Source]:
+    """Oldest first, so the newest source is last."""
+    ordered = sorted(sources.values(), key=lambda x: x.date)
+    return [s.Source(entry_id=x.entry_id, date=x.date, age_days=_age(x.date, today), label=x.label) for x in ordered]
 
 
 def _claims(claims) -> list[s.Claim]:
@@ -120,13 +131,23 @@ def build_server(shared: SharedBrain, *, process_entry: ProcessEntry | None = No
         hits = handle.call(
             lambda b: b.search(query, limit=max(1, min(limit, 50)), types=tuple(types) if types else None)
         )
-        return s.SearchResult(hits=[s.SearchHit(**dataclasses.asdict(h)) for h in hits])
+        today = _today()
+        return s.SearchResult(
+            today=today.isoformat(),
+            hits=[s.SearchHit(**dataclasses.asdict(h), age_days=_age(h.date, today)) for h in hits],
+        )
 
     @srv.tool(annotations=READ)
     def ask(question: str) -> s.AskResult:
         """Answer a question from the journal. Every claim cites the entries it comes from."""
         a = handle.call(lambda b: b.ask(question))
-        return s.AskResult(claims=_claims(a.claims), insufficient=a.insufficient, sources=_sources(a.sources))
+        today = _today()
+        return s.AskResult(
+            today=today.isoformat(),
+            claims=_claims(a.claims),
+            insufficient=a.insufficient,
+            sources=_sources(a.sources, today),
+        )
 
     @srv.tool(annotations=READ)
     def brief(target: str, since: str | None = None, mark_seen: bool = False) -> s.BriefResult:
@@ -137,12 +158,15 @@ def build_server(shared: SharedBrain, *, process_entry: ProcessEntry | None = No
         when = datetime.fromisoformat(since).astimezone() if since else None
         r = handle.call(lambda b: b.brief(target, since=when, record=mark_seen))
         o = r.output
+        today = _today()
         return s.BriefResult(
+            today=today.isoformat(),
             target=r.target,
             label=r.label,
             type=r.type,
             last_looked=r.since.date().isoformat() if r.since else None,
             summary=r.summary,
+            summary_as_of=iso_day(r.summary_as_of) if r.summary_as_of else None,
             where_things_stand=_claims(o.where_things_stand),
             recent_decisions=_claims(o.recent_decisions),
             open_items=_claims(o.open_items),
@@ -150,8 +174,8 @@ def build_server(shared: SharedBrain, *, process_entry: ProcessEntry | None = No
             speculative=_claims(o.speculative),
             overcome_by_events=_claims(o.overcome_by_events),
             changed_since=_claims(o.changed_since),
-            open_fragments=[_fragment(fragment_view(f)) for f in r.open_items],
-            sources=_sources(r.sources),
+            open_fragments=[_fragment(fragment_view(f), today) for f in r.open_items],
+            sources=_sources(r.sources, today),
             notes=r.notes,
         )
 
@@ -159,22 +183,26 @@ def build_server(shared: SharedBrain, *, process_entry: ProcessEntry | None = No
     def get_entity(name_or_id: str) -> s.EntityResult:
         """One person, org, theme, or thread: details, notes, related nodes, open items, recent fragments."""
         e = handle.call(lambda b: b.entity(name_or_id))
+        today = _today()
         data = dataclasses.asdict(e)
-        data["open_items"] = [s.Fragment(**f) for f in data["open_items"]]
-        data["recent"] = [s.Fragment(**f) for f in data["recent"]]
-        return s.EntityResult(**data)
+        data["open_items"] = [s.Fragment(**f, age_days=_age(f["date"], today)) for f in data["open_items"]]
+        data["recent"] = [s.Fragment(**f, age_days=_age(f["date"], today)) for f in reversed(data["recent"])]
+        return s.EntityResult(today=today.isoformat(), **data)
 
     @srv.tool(annotations=READ)
     def get_entry(entry_id: str) -> s.EntryResult:
         """The full text of one entry, as the user wrote it, with the fragments extracted from it."""
         e = handle.call(lambda b: b.entry(entry_id))
+        today = _today()
         return s.EntryResult(
+            today=today.isoformat(),
             id=e.id,
             date=e.date,
+            age_days=_age(e.date, today),
             title=e.title,
             text=e.text,
             processed=e.processed,
-            fragments=[_fragment(f) for f in e.fragments],
+            fragments=[_fragment(f, today) for f in e.fragments],
         )
 
     @srv.tool(annotations=READ)
@@ -182,21 +210,26 @@ def build_server(shared: SharedBrain, *, process_entry: ProcessEntry | None = No
         """Threads (workstreams) with recent activity, plus pinned ones, most recent first."""
 
         def run(b: Brain) -> s.ActiveResult:
+            today = _today()
             threads = [
                 s.ActiveThread(
                     id=t.id,
                     name=t.name,
                     state=t.state,
                     pinned=t.pinned,
-                    last_activity=t.last_activity,
+                    last_activity=iso_day(t.last_activity) if t.last_activity else None,
+                    last_activity_age_days=_age(t.last_activity, today),
                     fragments=t.fragments,
                     open_items=t.open_items,
                     people=t.people,
                     summary=t.summary,
+                    summary_as_of=iso_day(t.summary_as_of) if t.summary_as_of else None,
                 )
                 for t in b.active_threads()
             ]
-            return s.ActiveResult(threads=threads, inactivity_days=b.settings.threads.inactivity_days)
+            return s.ActiveResult(
+                today=today.isoformat(), threads=threads, inactivity_days=b.settings.threads.inactivity_days
+            )
 
         return handle.call(run)
 
@@ -208,7 +241,7 @@ def build_server(shared: SharedBrain, *, process_entry: ProcessEntry | None = No
             return b.jot(text, title=title), b.llm.configured
 
         saved, configured = handle.call(save)
-        result = s.AddEntryResult(entry_id=saved.entry.id, key=saved.key, processed=False)
+        result = s.AddEntryResult(today=_today().isoformat(), entry_id=saved.entry.id, key=saved.key, processed=False)
         if not configured:
             result.error = "no model endpoint configured; the entry is saved and will be processed later"
             return result
@@ -223,7 +256,7 @@ def build_server(shared: SharedBrain, *, process_entry: ProcessEntry | None = No
         result.processed = outcome.error is None
 
         def details(b: Brain) -> s.AddEntryResult:
-            result.fragments = [_fragment(f) for f in b.entry(saved.entry.id).fragments]
+            result.fragments = [_fragment(f, _today()) for f in b.entry(saved.entry.id).fragments]
             result.names_to_review = sum(
                 1
                 for i in b.review_items()

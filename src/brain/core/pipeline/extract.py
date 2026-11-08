@@ -16,6 +16,7 @@ from brain.core.llm.schemas import ExtractOutput
 from brain.core.pipeline.context import PipelineContext
 from brain.core.pipeline.match import assign_ids
 from brain.core.pipeline.text import attr, locate_quote
+from brain.core.temporal import age, dated, iso_day, local_date, today_el
 
 THREAD_CONTEXT = 40
 SUMMARY_CHARS = 300
@@ -23,8 +24,11 @@ SUMMARY_CHARS = 300
 
 def build_message(ctx: PipelineContext, entry: Entry) -> tuple[str, set[str]]:
     """The user message for the extract prompt, and the thread ids it offers."""
+    now = ctx.clock()
+    today = local_date(now)
     lines = [
-        f'<entry id="{attr(entry.id)}" date="{entry.created.date().isoformat()}" title="{attr(entry.title or "")}">',
+        today_el(now),
+        f'<entry id="{attr(entry.id)}" {dated(entry.created, today)} title="{attr(entry.title or "")}">',
         entry.body.rstrip("\n"),
         "</entry>",
         "<existing_threads>",
@@ -32,9 +36,13 @@ def build_message(ctx: PipelineContext, entry: Entry) -> tuple[str, set[str]]:
     offered = set()
     for t in queries.threads(ctx.conn, limit=THREAD_CONTEXT):
         offered.add(t.id)
+        activity = f"{iso_day(t.last_activity)} ({age(t.last_activity, today)} ago)" if t.last_activity else "none yet"
         desc = f" | description: {t.description}" if t.description else ""
-        summary = f" | summary: {t.summary[:SUMMARY_CHARS]}" if t.summary else ""
-        lines.append(f"- id: {t.id} | name: {t.name}{desc}{summary}")
+        summary = ""
+        if t.summary:
+            when = f"as of {iso_day(t.summary_as_of)}" if t.summary_as_of else "as of unknown date"
+            summary = f" | summary ({when}): {t.summary[:SUMMARY_CHARS]}"
+        lines.append(f"- id: {t.id} | name: {t.name} | last activity: {activity}{desc}{summary}")
     lines.append("</existing_threads>")
     lines.append("<known_entities>")
     for etype, label in (("person", "people"), ("org", "organizations"), ("theme", "themes")):

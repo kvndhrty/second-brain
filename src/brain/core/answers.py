@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import difflib
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from brain.core import keys
 from brain.core.formats.sidecars import BriefState
@@ -17,9 +17,10 @@ from brain.core.index.build import norm_alias
 from brain.core.index.queries import FragmentRow
 from brain.core.llm.models import LLM
 from brain.core.llm.schemas import AskOutput, BriefOutput, Claim
-from brain.core.pipeline.text import attr, short_date
+from brain.core.pipeline.text import attr
 from brain.core.storage.base import NotFound
 from brain.core.storage.lease import LeaseError
+from brain.core.temporal import as_of, dated, iso_day, last_mentioned, local_date, today_el
 from brain.core.vault import Vault
 
 RRF_K = 60
@@ -68,6 +69,7 @@ class Brief:
     open_items: list[FragmentRow]
     sources: dict[str, Source]
     summary: str | None = None
+    summary_as_of: str | None = None  # created_at of the newest entry the summary covers
     recorded: bool = True  # False if the brief time could not be saved (e.g. lease held elsewhere)
     fragment_count: int = 0
     notes: list[str] = field(default_factory=list)
@@ -75,7 +77,7 @@ class Brief:
 
 def _sources(conn, entry_ids: set[str]) -> dict[str, Source]:
     return {
-        eid: Source(eid, created[:10], label)
+        eid: Source(eid, iso_day(created), label)
         for eid, (created, label) in queries.entry_dates(conn, sorted(entry_ids)).items()
     }
 
@@ -89,8 +91,8 @@ def _check_citations(claims: list[Claim], allowed: set[str]) -> None:
         raise ValueError(f"every claim needs at least one citation; uncited: {uncited}")
 
 
-def _fragment_line(f: FragmentRow, *, since: datetime | None = None) -> str:
-    attrs = [f'entry="{f.entry_id}"', f'date="{short_date(f.created_at)}"', f'kind="{f.kind}"', f'status="{f.status}"']
+def _fragment_line(f: FragmentRow, *, today: date, since: datetime | None = None) -> str:
+    attrs = [f'entry="{f.entry_id}"', dated(f.created_at, today), f'kind="{f.kind}"', f'status="{f.status}"']
     if f.state:
         attrs.append(f'state="{f.state}"')
     if f.dream:
@@ -121,28 +123,41 @@ def retrieve(conn, llm: LLM, text: str, *, limit: int) -> list[tuple[str, str]]:
     return _rrf(kw, vec)[:limit]
 
 
-def ask(conn, llm: LLM, question: str) -> Answer:
+def ask(conn, llm: LLM, question: str, *, now: datetime | None = None) -> Answer:
+    now = now or datetime.now(UTC)
+    today = local_date(now)
     hits = retrieve(conn, llm, question, limit=ASK_EXCERPTS)
     frag_ids = [i for i, t in hits if t == "fragment"]
     frags = queries.fragments_by_id(conn, frag_ids)
-    lines = [f"<question>{question}</question>"]
+    excerpts: list[tuple[str, str, str]] = []  # (created_at, entry id, element): retrieval picks, date orders
     allowed: set[str] = set()
     for item_id, item_type in hits:
         if item_type == "fragment" and item_id in frags:
             f = frags[item_id]
             allowed.add(f.entry_id)
-            lines.append(
-                f'<excerpt entry="{f.entry_id}" date="{short_date(f.created_at)}" kind="{f.kind}" '
-                f'status="{f.status}">{f.text}</excerpt>'
+            excerpts.append(
+                (
+                    f.created_at,
+                    f.entry_id,
+                    f'<excerpt entry="{f.entry_id}" {dated(f.created_at, today)} kind="{f.kind}" '
+                    f'status="{f.status}">{f.text}</excerpt>',
+                )
             )
         elif item_type == "entry":
             row = conn.execute("SELECT created_at, body FROM entries WHERE id = ?", (item_id,)).fetchone()
             if row:
                 allowed.add(item_id)
-                lines.append(
-                    f'<excerpt entry="{item_id}" date="{row[0][:10]}" kind="entry">'
-                    f"{row[1][:ENTRY_EXCERPT_CHARS]}</excerpt>"
+                excerpts.append(
+                    (
+                        row[0],
+                        item_id,
+                        f'<excerpt entry="{item_id}" {dated(row[0], today)} kind="entry">'
+                        f"{row[1][:ENTRY_EXCERPT_CHARS]}</excerpt>",
+                    )
                 )
+    lines = [today_el(now), f"<question>{question}</question>", "<excerpts>"]
+    lines += [el for *_, el in sorted(excerpts, key=lambda x: (x[0], x[1]))]
+    lines.append("</excerpts>")
     if not allowed:
         return Answer(question, [], True, {})
 
@@ -203,7 +218,7 @@ def _node_fragments(conn, node: NodeMatch) -> list[FragmentRow]:
     return queries.fragments_linked_to(conn, targets, ("mentions",), limit=BRIEF_FRAGMENTS)
 
 
-def _people_block(conn, frags: list[FragmentRow], exclude: str) -> list[str]:
+def _people_block(conn, frags: list[FragmentRow], exclude: str, *, today: date) -> list[str]:
     ids = [f"frag:{f.id}" for f in frags]
     if not ids:
         return []
@@ -212,7 +227,12 @@ def _people_block(conn, frags: list[FragmentRow], exclude: str) -> list[str]:
         "AND dst LIKE 'person:%' GROUP BY dst ORDER BY c DESC LIMIT 12",
         ids,
     ).fetchall()
-    return [f"<person>{queries.entity_profile(conn, r[0])}</person>" for r in rows if r[0] != exclude]
+    return [
+        f"<person {last_mentioned(queries.last_mention(conn, r[0]), today)}>"
+        f"{queries.entity_profile(conn, r[0], today=today)}</person>"
+        for r in rows
+        if r[0] != exclude
+    ]
 
 
 def _adjacent_activity(conn, node: NodeMatch, frags: list[FragmentRow], *, limit: int = 20) -> list[FragmentRow]:
@@ -270,10 +290,12 @@ def brief(
 ) -> Brief:
     """record=False leaves "last looked" unchanged (e.g. when an agent reads a brief for its own context)."""
     now = now or datetime.now(UTC)
+    today = local_date(now)
     matches = find_targets(conn, target)
     if len(matches) > 1:
         raise AmbiguousTarget(target, matches)
     summary = None
+    summary_as_of = None
     topic_state = ""
     if matches:
         node = matches[0]
@@ -282,6 +304,7 @@ def brief(
         if ntype == "thread":
             t = queries.thread(conn, node.node_id.split(":", 1)[1])
             summary = t.summary if t else None
+            summary_as_of = t.summary_as_of if t else None
             if t and t.state in ("archived", "obe"):
                 topic_state = f' state="{"overcome_by_events" if t.state == "obe" else t.state}"'
     else:
@@ -291,23 +314,35 @@ def brief(
         key, label, ntype = f"text:{norm_alias(target)}", target, "text"
     since = since if since is not None else _last_brief(vault, key)
     lines = [
+        today_el(now),
         f'<topic type="{ntype}" name="{attr(label)}"{topic_state}/>',
         f"<last_looked>{since.date().isoformat() if since else 'never'}</last_looked>",
     ]
     if summary:
-        lines += ["<thread_summary>", summary, "</thread_summary>"]
-    lines += _people_block(conn, frags, key)
+        lines += [f"<thread_summary {as_of(summary_as_of, today)}>", summary, "</thread_summary>"]
+    lines += _people_block(conn, frags, key, today=today)
     lines.append("<fragments>")
-    lines += [_fragment_line(f, since=since) for f in frags]
+    lines += [_fragment_line(f, today=today, since=since) for f in frags]
     lines.append("</fragments>")
     related = _adjacent_activity(conn, matches[0], frags) if matches else []
     if related:
         lines.append("<related_activity>")
-        lines += [_fragment_line(f, since=since) for f in related]
+        lines += [_fragment_line(f, today=today, since=since) for f in related]
         lines.append("</related_activity>")
     allowed = {f.entry_id for f in frags} | {f.entry_id for f in related}
     open_now = [f for f in frags if f.state == "open" and f.status != "overcome_by_events"]
-    result = Brief(key, label, ntype, since, BriefOutput(), open_now, {}, summary=summary, fragment_count=len(frags))
+    result = Brief(
+        key,
+        label,
+        ntype,
+        since,
+        BriefOutput(),
+        open_now,
+        {},
+        summary=summary,
+        summary_as_of=summary_as_of,
+        fragment_count=len(frags),
+    )
     if not frags:
         result.notes.append("No journal fragments are linked to this yet.")
         return result
