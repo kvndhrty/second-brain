@@ -115,6 +115,31 @@ def test_boto_client_gets_ca_and_client_cert(certs):
     assert client._endpoint.http_session._verify == str(certs.ca_file)
 
 
+@pytest.mark.parametrize("from_env", [False, True], ids=["config", "AWS_ENDPOINT_URL_S3"])
+def test_boto_put_is_not_sent_with_streaming_checksum(monkeypatch, from_env):
+    # Some S3-compatible stores reject aws-chunked bodies with a trailing checksum.
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "x")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "y")
+    if from_env:
+        monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "https://s3.internal")
+    cfg = StorageConfig(
+        backend="s3", bucket="b", region="us-east-1", endpoint_url="" if from_env else "https://s3.internal"
+    )
+    client = _make_client(cfg, TLSConfig())
+    sent = {}
+
+    def capture(request, **_):
+        sent.update({k.lower(): v for k, v in request.headers.items()})
+        raise RuntimeError("captured")
+
+    client.meta.events.register("before-send.s3", capture)
+    with pytest.raises(RuntimeError, match="captured"):
+        client.put_object(Bucket="b", Key="k", Body=b"hello", IfNoneMatch="*")
+    assert "content-encoding" not in sent
+    assert "x-amz-trailer" not in sent
+    assert not any(k.startswith("x-amz-checksum") for k in sent)
+
+
 # --- doctor ------------------------------------------------------------------
 
 

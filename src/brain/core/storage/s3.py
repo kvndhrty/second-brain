@@ -118,14 +118,15 @@ def _make_client(cfg: StorageConfig, tls: TLSConfig) -> Any:
     config_kwargs: dict[str, Any] = {
         "retries": {"mode": "standard", "max_attempts": 5},
         "s3": {"addressing_style": cfg.addressing_style},
+        # Since botocore 1.36, PUTs are sent aws-chunked with a trailing CRC32
+        # checksum by default; several S3-compatible stores reject that. Set it
+        # unconditionally, not only when cfg.endpoint_url is set, because the
+        # endpoint can also come from AWS_ENDPOINT_URL(_S3) or ~/.aws/config.
+        "request_checksum_calculation": "when_required",
+        "response_checksum_validation": "when_required",
     }
     if bt.client_cert:
         config_kwargs["client_cert"] = bt.client_cert
-    if cfg.endpoint_url:
-        # Since botocore 1.36, CRC checksums are sent by default; several
-        # S3-compatible stores reject them. Only send them when an operation requires it.
-        config_kwargs["request_checksum_calculation"] = "when_required"
-        config_kwargs["response_checksum_validation"] = "when_required"
     session = Session(profile_name=cfg.profile or None)
     return session.client(
         "s3",
