@@ -257,3 +257,9 @@ def test_context_and_dream_commands(fake_cfg):
     assert "Has this been overcome by events?" in r.output
     r = run(fake_cfg, "doctor")
     assert "last pass" in r.output
+
+
+def test_dream_unknown_thread_is_reported(fake_cfg):
+    for args in (("dream", "--thread", "nope"), ("dream", "--dry-run", "--thread", "nope")):
+        r = run(fake_cfg, *args)
+        assert r.exit_code == 1 and "no thread nope" in r.output and "Traceback" not in r.output

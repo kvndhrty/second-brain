@@ -236,3 +236,81 @@ def test_is_due(brain):
     jot(brain, "Third [[Billing migration]] note.", days_ago=0)
     assert "nightly" in is_due(ctx, nightly, now=NOW + timedelta(days=1))
     assert is_due(ctx, DreamConfig(enabled=False), now=NOW + timedelta(days=1)) is None
+
+
+# --- regressions found in review ----------------------------------------------------
+
+
+def _tid(b, name):
+    return b.db.conn.execute("SELECT id FROM threads WHERE name = ?", (name,)).fetchone()[0]
+
+
+def test_proposal_survives_a_pass_over_another_thread(brain):
+    jot(brain, "[[Alpha]] kickoff notes about vendors and budgets.", days_ago=12)
+    e1 = jot(brain, "We decided the [[Alpha]] [[Beta]] cutover is in March.", days_ago=10)
+    jot(brain, "The [[Beta]] cutover moved to May instead of March.", days_ago=5)
+    dream(brain)
+    f1 = frag(brain, e1, "March")
+    assert [i.payload["fragment"] for i in brain.review_items() if i.kind == "dream_obe"] == [f1]
+    jot(brain, "[[Alpha]] vendor shortlist is ready for review.", days_ago=1)
+    dream(brain)  # looks at Alpha only; it cannot remake Beta's proposal, so must not drop it
+    assert [i.payload["fragment"] for i in brain.review_items() if i.kind == "dream_obe"] == [f1]
+
+
+def test_merged_threads_are_not_redone_every_pass(brain):
+    jot(brain, "[[Alpha]] note about the first vendor.", days_ago=10)
+    jot(brain, "[[Alpha]] note about the second vendor.", days_ago=9)
+    jot(brain, "[[Gamma]] note about the third vendor.", days_ago=2)
+    brain.threads.merge(_tid(brain, "Gamma"), _tid(brain, "Alpha"))
+    dream(brain)
+    assert not [j for j in brain.dream_plan().jobs if j.thread_id == _tid(brain, "Alpha")]
+
+
+def test_an_unfinished_pass_makes_the_next_one_due(brain):
+    from brain.core.pipeline.context import PipelineContext
+
+    for i in range(4):
+        jot(brain, f"[[T{i}]] some work item number {i} about things.", days_ago=5 - i)
+    cfg = DreamConfig(max_calls=1, after_entries=2, nightly_at="")
+    assert dream(brain, cfg=cfg).budget_exhausted
+    ctx = PipelineContext(brain.settings, brain.vault, brain.db, brain.llm, clock=lambda: NOW)
+    assert "max_calls" in is_due(ctx, cfg, now=NOW)
+    while dream(brain, cfg=cfg).budget_exhausted:
+        pass
+    assert is_due(ctx, cfg, now=NOW) is None
+
+
+def test_a_single_thread_pass_leaves_the_schedule_alone(brain):
+    from brain.core.pipeline.context import PipelineContext
+
+    jot(brain, "First [[Billing migration]] note.", days_ago=2)
+    jot(brain, "Second [[Billing migration]] note.", days_ago=1)
+    cfg = DreamConfig(after_entries=2, nightly_at="")
+    ctx = PipelineContext(brain.settings, brain.vault, brain.db, brain.llm, clock=lambda: NOW)
+    dream(brain, thread="billing-migration")
+    assert is_due(ctx, cfg, now=NOW) is not None  # the scheduled pass is still owed
+    state = DreamState.parse(brain.storage.get(keys.DREAM_STATE), where="s")
+    assert state.last_run_at is None and state.last_run
+
+
+def test_context_leaves_out_archived_someday_and_keeps_one_line_items(brain):
+    eid = jot(brain, "We decided the [[Old work]] plan is final.", days_ago=2)
+    jot(brain, "Who owns the [[Billing migration]] runbook?", days_ago=1)
+    brain.threads.set_state(_tid(brain, "Old work"), "archived")
+    q = frag(brain, jot(brain, "Someday question about [[Billing migration]] robots?", days_ago=1), "robots")
+    brain.set_fragment(q, FragmentChange(someday=True))
+    text = brain.context_text(now=NOW)
+    assert "Old work" not in text and "plan is final" not in text and "robots" not in text
+    assert "(1)" in text  # one open item: the someday question is not counted
+    assert eid
+    doc = brain.context(now=NOW)
+    doc.open_items[0].text = "line one\nline two\nline three"
+    from brain.core.injected import render_markdown
+
+    out = render_markdown(doc, max_lines=60, max_bytes=6000)
+    assert "line one line two line three" in out
+
+
+def test_dream_cli_unknown_thread_is_an_error_not_a_traceback(brain):
+    with pytest.raises(KeyError):
+        brain.dream_plan(thread="no-such-thread")

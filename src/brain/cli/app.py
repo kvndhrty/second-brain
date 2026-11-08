@@ -531,33 +531,35 @@ def dream(
 
     Proposals go to `brain review` and `brain sweep`; nothing you wrote is changed."""
     with _brain("brain dream") as b:
-        if dry_run:
-            plan = b.dream_plan(thread=thread)
-            if not plan.jobs:
-                out.print("nothing to do: no thread has changed since the last pass")
-                return
-            for job in plan.jobs:
-                out.print(f"  • {escape(job.label)}")
-            out.print(
-                rf"{plan.calls} model call(s); a pass stops after {b.settings.dream.max_calls} (\[dream] max_calls)"
-            )
-            return
         try:
-            run = b.dream(thread=thread, progress=lambda msg: err.print(f"[dim]{escape(msg)}[/dim]"))
-        except KeyError as e:
+            _run_dream(b, dry_run=dry_run, thread=thread)
+        except KeyError as e:  # an unknown --thread
             raise _fail(str(e.args[0])) from None
-        for line in run.applied:
-            out.print(f"[green]✓[/green] {escape(line)}")
-        if run.proposed:
-            out.print(f"{len(run.proposed)} proposal(s): run `brain review` and `brain sweep`")
-        for e in run.errors:
-            out.print(f"[red]✗[/red] {escape(e)}")
-        if run.budget_exhausted:
-            out.print(
-                rf"[yellow]stopped after {run.calls} model calls (\[dream] max_calls); run again to continue[/yellow]"
-            )
-        if not (run.applied or run.proposed or run.errors):
+
+
+def _run_dream(b: Brain, *, dry_run: bool, thread: str | None) -> None:
+    if dry_run:
+        plan = b.dream_plan(thread=thread)
+        if not plan.jobs:
             out.print("nothing to do: no thread has changed since the last pass")
+            return
+        for job in plan.jobs:
+            out.print(f"  • {escape(job.label)}")
+        out.print(rf"{plan.calls} model call(s); a pass stops after {b.settings.dream.max_calls} (\[dream] max_calls)")
+        return
+    run = b.dream(thread=thread, progress=lambda msg: err.print(f"[dim]{escape(msg)}[/dim]"))
+    for line in run.applied:
+        out.print(f"[green]✓[/green] {escape(line)}")
+    if run.proposed:
+        out.print(f"{len(run.proposed)} proposal(s): run `brain review` and `brain sweep`")
+    for e in run.errors:
+        out.print(f"[red]✗[/red] {escape(e)}")
+    if run.budget_exhausted:
+        out.print(
+            rf"[yellow]stopped after {run.calls} model calls (\[dream] max_calls); run again to continue[/yellow]"
+        )
+    if not (run.applied or run.proposed or run.errors):
+        out.print("nothing to do: no thread has changed since the last pass")
 
 
 # --- agents -----------------------------------------------------------------

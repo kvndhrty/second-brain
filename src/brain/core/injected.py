@@ -144,7 +144,8 @@ def build(conn: sqlite3.Connection, settings: Settings, *, now: datetime) -> Con
     cutoff = (now - timedelta(days=settings.context.recent_days)).isoformat()
     for r in conn.execute(
         f"SELECT {queries.FRAGMENT_COLS} FROM fragments f WHERE f.kind = 'decision' AND f.created_at >= ? "
-        "AND f.status != 'overcome_by_events' AND f.someday = 0 ORDER BY f.created_at DESC, f.id DESC LIMIT ?",
+        f"AND f.status != 'overcome_by_events' AND f.someday = 0 AND NOT EXISTS ({excluded}) "
+        "ORDER BY f.created_at DESC, f.id DESC LIMIT ?",
         (cutoff, MAX_CHANGES),
     ):
         f = queries._frag(r)
@@ -162,7 +163,7 @@ def build(conn: sqlite3.Connection, settings: Settings, *, now: datetime) -> Con
     obe_cutoff = (today - timedelta(days=settings.context.recent_days)).isoformat()
     for r in conn.execute(
         f"SELECT {queries.FRAGMENT_COLS} FROM fragments f WHERE f.status = 'overcome_by_events' AND f.obe_date >= ? "
-        "ORDER BY f.obe_date DESC, f.id DESC LIMIT ?",
+        f"AND f.someday = 0 AND NOT EXISTS ({excluded}) ORDER BY f.obe_date DESC, f.id DESC LIMIT ?",
         (obe_cutoff, MAX_CHANGES),
     ):
         f = queries._frag(r)
@@ -190,8 +191,15 @@ def build(conn: sqlite3.Connection, settings: Settings, *, now: datetime) -> Con
     return doc
 
 
+def _one_line(text: str | None) -> str:
+    return " ".join((text or "").split())
+
+
 def render_markdown(doc: ContextDoc, *, max_lines: int, max_bytes: int) -> str:
-    """The summary as markdown, filled section by section until a limit is reached."""
+    """The summary as markdown, filled section by section until a limit is reached.
+
+    Every item is one line: text from entries is collapsed onto a single line,
+    so the line limit counts what is shown."""
     through = f" Entries through {doc.entries_through}." if doc.entries_through else " No entries yet."
     head = [f"# brain: {doc.today} ({doc.weekday}).{through}"]
     foot = ["For details: brief <thread-id>, get_entity <id>, get_entry <entry-id>."]
@@ -200,7 +208,7 @@ def render_markdown(doc: ContextDoc, *, max_lines: int, max_bytes: int) -> str:
     threads = []
     for t in doc.threads:
         bits = [
-            f"{t.name} [{t.id}]",
+            f"{_one_line(t.name)} [{t.id}]",
             f"last activity {t.last_activity} ({t.age})" if t.last_activity else "no activity",
         ]
         if t.pinned:
@@ -211,13 +219,13 @@ def render_markdown(doc: ContextDoc, *, max_lines: int, max_bytes: int) -> str:
             bits.append(f"{t.open_items} open")
         threads.append("- " + " · ".join(bits))
         if t.now:
-            threads.append(f"  Now: {t.now} [as of {t.now_as_of or 'unknown'}]")
+            threads.append(f"  Now: {_one_line(t.now)} [as of {t.now_as_of or 'unknown'}]")
     sections.append(("## Active threads, most recent first", threads, len(doc.threads)))
 
     items = [
         f"- {i.date} ({i.age}) {i.kind.replace('_', ' ')}"
         + (f" · {i.thread}" if i.thread else "")
-        + f": {i.text} [{i.id}]"
+        + f": {_one_line(i.text)} [{i.id}]"
         for i in doc.open_items
     ]
     shown = (
@@ -228,8 +236,8 @@ def render_markdown(doc: ContextDoc, *, max_lines: int, max_bytes: int) -> str:
     changes = [
         f"- {c.date} ({c.age}) {c.kind}"
         + (f" · {c.thread}" if c.thread else "")
-        + f": {c.text}"
-        + (f" ({c.note})" if c.note else "")
+        + f": {_one_line(c.text)}"
+        + (f" ({_one_line(c.note)})" if c.note else "")
         + f" [{c.entry_id}]"
         for c in doc.changes
     ]

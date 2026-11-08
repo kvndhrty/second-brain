@@ -27,7 +27,7 @@ import json
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 
 from brain.core import keys
 from brain.core.config import DreamConfig
@@ -76,6 +76,7 @@ class Job:
 class DreamPlan:
     jobs: list[Job]
     threads: list[str]  # thread ids considered, in priority order
+    only: str | None = None  # a single-thread pass (`--thread`), which leaves the schedule alone
 
     @property
     def calls(self) -> int:
@@ -107,14 +108,17 @@ def is_due(ctx: PipelineContext, cfg: DreamConfig, *, now: datetime) -> str | No
     entries = ctx.conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
     if entries == 0:
         return None
+    if state.unfinished:
+        return "the last pass stopped at [dream] max_calls"
     if cfg.after_entries and entries - state.entries_at_last_run >= cfg.after_entries:
         return f"{entries - state.entries_at_last_run} new entries since the last dream"
     nightly = cfg.nightly_time()
     if nightly is not None:
         local = now.astimezone()
-        slot = local.replace(hour=nightly[0], minute=nightly[1], second=0, microsecond=0)
+        # From the local wall time, so the slot keeps its hour across a DST change.
+        slot = datetime.combine(local.date(), time(*nightly)).astimezone()
         if slot > local:
-            slot -= timedelta(days=1)
+            slot = datetime.combine(local.date() - timedelta(days=1), time(*nightly)).astimezone()
         if state.last_run_at is None or state.last_run_at < slot:
             if entries > state.entries_at_last_run or state.last_run_at is None:
                 return f"nightly pass ({cfg.nightly_at})"
@@ -161,7 +165,7 @@ class Dreamer:
             return [t]
         briefed = self._briefed()
         cutoff = now - timedelta(days=BRIEFED_RECENTLY_DAYS)
-        found = [t for t in queries.threads(self.conn, states=("active", "proposed")) if t.last_entry]
+        found = [t for t in queries.threads(self.conn, states=("active", "proposed")) if self._newest(t)]
         found.sort(key=lambda t: t.last_activity or "", reverse=True)  # newest activity first ...
 
         def recently_briefed(t: ThreadRow) -> bool:
@@ -170,6 +174,17 @@ class Dreamer:
 
         found.sort(key=lambda t: (not t.pinned, not recently_briefed(t)))  # ... within pinned, then briefed
         return found
+
+    def _newest(self, t: ThreadRow) -> str | None:
+        """Newest entry in the thread or any thread merged into it: the watermark every step records."""
+        nodes = [f"thread:{x}" for x in queries.thread_family(self.conn, t.id)]
+        r = self.conn.execute(
+            f"SELECT f.entry_id FROM edges e JOIN fragments f ON e.src = 'frag:' || f.id "
+            f"WHERE e.type = 'in_thread' AND e.dst IN ({','.join('?' * len(nodes))}) "
+            "ORDER BY f.created_at DESC, f.entry_id DESC LIMIT 1",
+            nodes,
+        ).fetchone()
+        return r[0] if r else None
 
     def plan(self, *, thread: str | None = None, now: datetime | None = None) -> DreamPlan:
         now = now or self.ctx.clock()
@@ -189,7 +204,7 @@ class Dreamer:
                 jobs.append(Job("supersede", t.id, f"look for superseded fragments in {t.name}"))
             if self._entries_since(family, ts.answers_through) and self._answer_inputs(frags)[0]:
                 jobs.append(Job("answers", t.id, f"look for answers to open items in {t.name}"))
-            if t.now_through != t.last_entry:
+            if t.now_through != self._newest(t):
                 jobs.append(Job("now", t.id, f"write the Now line for {t.name}"))
         if thread is None:
             batch: list[str] = []
@@ -200,7 +215,7 @@ class Dreamer:
                     batch = []
             if batch:
                 jobs.append(Job("sweep", None, f"check {len(batch)} old items for the sweep", batch))
-        return DreamPlan(jobs, [t.id for t in threads])
+        return DreamPlan(jobs, [t.id for t in threads], only=thread)
 
     def _thread_fragments(self, family: list[str]) -> list[FragmentRow]:
         frags = queries.fragments_linked_to(
@@ -259,7 +274,9 @@ class Dreamer:
         run = DreamRun(run_id=keys.basic_timestamp(now), started_at=now, max_calls=self.cfg.max_calls)
         self._run = run
         self._new: dict[str, list[DreamProposal]] = {}  # entry id -> new proposals
-        self._examined: set[tuple[str, str]] = set()  # (kind, fragment or item id) looked at this pass
+        # (kind, fragment or item id, thread) looked at this pass; a proposal is
+        # replaced only by a pass over the same thread, which could have made it again.
+        self._examined: set[tuple[str, str, str | None]] = set()
         self._affected: set[str] = set()  # entries whose proposals file may change
         handlers = {
             "rebuild": self._rebuild,
@@ -290,8 +307,10 @@ class Dreamer:
         entries = self.conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
         run.finished_at = self.ctx.clock()
         self.state.last_run = run.run_id
-        self.state.last_run_at = run.finished_at
-        self.state.entries_at_last_run = entries
+        if plan.only is None:  # a single-thread pass does not count as the scheduled one
+            self.state.last_run_at = run.finished_at
+            self.state.entries_at_last_run = entries
+            self.state.unfinished = run.budget_exhausted
         self.ctx.write_sidecar(keys.dream_run_key(run.run_id), run)
         self.ctx.write_sidecar(keys.DREAM_STATE, self.state)
         return run
@@ -321,7 +340,7 @@ class Dreamer:
             self._run.model = summary.model
             self._run.applied.append(f"rebuilt the summary of thread {t.id}")
         ts = self._thread_state(t.id)
-        ts.rebuilt_through = t.last_entry
+        ts.rebuilt_through = self._newest(t)
         ts.rebuilt_at = now
 
     # 2. supersession
@@ -350,9 +369,10 @@ class Dreamer:
                 raise ValueError(f"newer must be written after older: {backwards[0].older} / {backwards[0].newer}")
 
         out = self._call("dream_supersede", "\n".join(lines), SupersedeOutput, validate).output
+        newest = self._newest(t)
         user_set = _user_decided(self.conn, list(by_id))
         for f in frags:
-            self._examined.add(("supersede", f.id))
+            self._examined.add(("supersede", f.id, t.id))
             self._affected.add(f.entry_id)
         for p in out.pairs:
             old, new = by_id[p.older], by_id[p.newer]
@@ -367,11 +387,12 @@ class Dreamer:
                     reason=p.reason,
                     confidence=round(p.confidence, 3),
                     citations=sorted({old.entry_id, new.entry_id}),
-                    checked_through=t.last_entry,
+                    checked_through=newest,
+                    thread=t.id,
                 ),
             )
             self._run.proposed.append(f"{old.id} superseded by {new.id}")
-        self._thread_state(t.id).supersede_through = t.last_entry
+        self._thread_state(t.id).supersede_through = newest
 
     # 3. answers
 
@@ -406,8 +427,9 @@ class Dreamer:
                     raise ValueError(f"{link.fragment} was not written after {link.answers}")
 
         out = self._call("dream_answers", "\n".join(lines), AnswersOutput, validate).output
+        newest = self._newest(t)
         for f in items:
-            self._examined.add(("answer", f.id))
+            self._examined.add(("answer", f.id, t.id))
         self._affected.update(f.entry_id for f in later)
         for link in out.links:
             if link.confidence < ANSWER_CONFIDENCE:
@@ -424,17 +446,19 @@ class Dreamer:
                     other=link.answers,
                     confidence=round(link.confidence, 3),
                     citations=sorted({f.entry_id, item_ids[link.answers].entry_id}),
-                    checked_through=t.last_entry,
+                    checked_through=newest,
+                    thread=t.id,
                 ),
             )
             self._run.proposed.append(f"{f.id} answers {link.answers}")
-        self._thread_state(t.id).answers_through = t.last_entry
+        self._thread_state(t.id).answers_through = newest
 
     # 4. Now line
 
     def _now(self, job: Job, now: datetime) -> None:
         t = queries.thread(self.conn, job.thread_id or "")
-        if t is None or t.last_entry is None:
+        newest = self._newest(t) if t else None
+        if t is None or newest is None:
             return
         today = local_date(now)
         family = [f"thread:{x}" for x in queries.thread_family(self.conn, t.id)]
@@ -467,7 +491,7 @@ class Dreamer:
                 thread_id=t.id,
                 line=line,
                 citations=sorted(set(result.output.citations)),
-                through_entry=t.last_entry,
+                through_entry=newest,
                 model=result.model,
                 prompt=result.prompt,
                 created_at=self.ctx.clock(),
@@ -518,7 +542,7 @@ class Dreamer:
 
         out = self._call("dream_sweep", "\n".join(lines), SweepOutput, validate).output
         for fid in later_for:
-            self._examined.add(("sweep", fid))
+            self._examined.add(("sweep", fid, None))
             self._affected.add(items[fid].entry_id)
         for c in out.checks:
             later = later_for[c.item]
@@ -548,7 +572,7 @@ class Dreamer:
     def _stale(self, p: DreamProposal) -> bool:
         """True if this pass looked at the same thing again, so its new result replaces p."""
         key = p.other if p.kind == "answer" else p.fragment
-        return (p.kind, key or "") in self._examined
+        return (p.kind, key or "", p.thread) in self._examined
 
     def _write_proposals(self, now: datetime) -> None:
         for entry_id in sorted(self._affected):

@@ -108,7 +108,8 @@ def active_threads(conn: sqlite3.Connection, *, now: datetime, inactivity_days: 
         nodes = [f"thread:{x}" for x in fam]
         t.fragments, t.open_items = conn.execute(
             f"""
-            SELECT COUNT(DISTINCT f.id), COUNT(DISTINCT CASE WHEN f.state = 'open' THEN f.id END)
+            SELECT COUNT(DISTINCT f.id), COUNT(DISTINCT CASE
+              WHEN f.state = 'open' AND f.status != 'overcome_by_events' AND f.someday = 0 THEN f.id END)
             FROM edges e JOIN fragments f ON e.src = 'frag:' || f.id
             WHERE e.type = 'in_thread' AND e.dst IN ({ph})
             """,

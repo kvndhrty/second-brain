@@ -231,3 +231,34 @@ def test_worker_dreams_when_asked(brain, local_storage, state, tmp_path):
             assert c.get("/api/dream").json()["last"]["run_id"] == worker.status.last_dream
     finally:
         worker.stop()
+
+
+def test_a_failing_entry_does_not_stop_dreaming(brain, local_storage, state, tmp_path):
+    bad = make_brain(
+        local_storage,
+        state,
+        tmp_path,
+        fake_llm=True,
+        responders={"extract": {"fragments": "not a list"}},  # extraction always fails validation
+        llm=FAKE_LLM_SETTINGS,
+        index_name=brain.db.path.stem,
+    )
+    bad.settings.dream.enabled = False
+    worker = Worker(lambda: bad, poll_seconds=30)
+    worker.start()
+    try:
+        app = create_app(SharedBrain(lambda: brain), worker=worker, static_dir=tmp_path / "x")
+        with TestClient(app, base_url="http://127.0.0.1") as c:
+            eid = post(c, "/api/entries", {"text": ENTRY}).json()["id"]
+            result = worker.process_now(eid, timeout=30)
+            assert result is not None and result.error  # it stays pending and fails every round
+            c.post("/api/dream", json={})
+            import time
+
+            for _ in range(100):
+                if worker.status.last_dream:
+                    break
+                time.sleep(0.1)
+            assert worker.status.last_dream
+    finally:
+        worker.stop()

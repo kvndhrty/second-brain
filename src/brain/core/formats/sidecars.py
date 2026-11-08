@@ -254,6 +254,7 @@ class DreamProposal(BaseModel):
     confidence: float = Field(ge=0, le=1)
     citations: list[str] = Field(default_factory=list)  # entry ids
     checked_through: str | None = None  # newest entry looked at
+    thread: str | None = None  # thread whose pass made it; None for sweep verdicts
 
 
 class DreamProposals(Sidecar):
@@ -282,6 +283,7 @@ class DreamState(Sidecar):
     last_run: str | None = None
     last_run_at: datetime | None = None
     entries_at_last_run: int = 0
+    unfinished: bool = False  # the last full pass stopped at max_calls; the next one is due at once
 
 
 class DreamRun(Sidecar):

@@ -6,9 +6,10 @@ It processes pending entries on startup, when woken (an entry was saved), and
 every `worker.poll_seconds`. A full listing of the store runs every
 `FULL_LIST_SECONDS` to pick up files edited outside brain.
 
-When a round finds no entries to process and a dream pass is due
+When a round processes no entry successfully and a dream pass is due
 (`[dream] nightly_at` or `after_entries`), it dreams. New entries always come
-first: a round that processed any leaves dreaming to a later round.
+first: a round that processed one leaves dreaming to a later round. Entries
+that keep failing do not hold dreaming back.
 """
 
 from __future__ import annotations
@@ -119,7 +120,7 @@ class Worker:
                         self.status.failed += len(report.failed)
                         self.status.last_error = report.failed[-1].error if report.failed else None
                         self._finish(report.entries, brain)
-                        if not report.entries:
+                        if not any(e.error is None for e in report.entries):
                             self._maybe_dream(brain)
                         self.status.current = "idle"
                     self.status.last_run = datetime.now(UTC).isoformat()
