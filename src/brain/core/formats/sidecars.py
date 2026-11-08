@@ -221,6 +221,85 @@ class ThreadSummary(Sidecar):
     citations: list[str] = Field(default_factory=list)
 
 
+class ThreadNow(Sidecar):
+    """One line on where a thread stands, written by dreaming for the injected context."""
+
+    thread_id: Id
+    line: str
+    citations: list[str] = Field(default_factory=list)
+    through_entry: str  # newest entry the line takes into account
+    model: str
+    prompt: PromptStamp
+    created_at: datetime
+
+
+DreamKind = Literal["supersede", "answer", "sweep"]
+SweepVerdict = Literal["still_open", "probably_resolved", "unclear"]
+
+
+class DreamProposal(BaseModel):
+    """A change dreaming suggests. Nothing applies until you accept it in review or the sweep."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: DreamKind
+    # supersede: the older fragment that may no longer hold; answer: the later
+    # fragment that answers; sweep: the stale open or speculative item.
+    fragment: str
+    # supersede: the newer fragment that replaces it; answer: the open item it
+    # answers; sweep: the later fragment the verdict rests on, if any.
+    other: str | None = None
+    verdict: SweepVerdict | None = None  # sweep only
+    reason: str = ""
+    confidence: float = Field(ge=0, le=1)
+    citations: list[str] = Field(default_factory=list)  # entry ids
+    checked_through: str | None = None  # newest entry looked at
+
+
+class DreamProposals(Sidecar):
+    """Pending dream proposals about the fragments of one entry."""
+
+    entry_id: Id
+    run_id: str
+    model: str
+    created_at: datetime
+    proposals: list[DreamProposal] = Field(default_factory=list)
+
+
+class DreamThreadState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rebuilt_through: str | None = None  # newest entry at the last full summary rebuild
+    rebuilt_at: datetime | None = None
+    supersede_through: str | None = None
+    answers_through: str | None = None
+
+
+class DreamState(Sidecar):
+    """Watermarks, so a pass skips what has not changed since the last one."""
+
+    threads: dict[str, DreamThreadState] = Field(default_factory=dict)
+    last_run: str | None = None
+    last_run_at: datetime | None = None
+    entries_at_last_run: int = 0
+
+
+class DreamRun(Sidecar):
+    """What one dream pass looked at, changed, and proposed."""
+
+    run_id: str
+    started_at: datetime
+    finished_at: datetime | None = None
+    model: str = ""
+    calls: int = 0
+    max_calls: int = 0
+    budget_exhausted: bool = False
+    examined: list[str] = Field(default_factory=list)
+    applied: list[str] = Field(default_factory=list)
+    proposed: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
 class BriefState(Sidecar):
     last: dict[str, datetime] = Field(default_factory=dict)  # node id -> last brief time
 

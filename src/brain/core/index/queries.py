@@ -24,6 +24,9 @@ class ThreadRow:
     last_activity: str | None
     last_entry: str | None
     summary_as_of: str | None = None  # created_at of the entry the summary runs through
+    now_line: str | None = None  # dreaming's one line on where the thread stands
+    now_through: str | None = None
+    now_as_of: str | None = None
     fragments: int = 0
     open_items: int = 0
     people: list[str] = field(default_factory=list)
@@ -45,11 +48,15 @@ def _thread(r: sqlite3.Row) -> ThreadRow:
         last_activity=r["last_activity"],
         last_entry=r["last_entry"],
         summary_as_of=r["summary_as_of"],
+        now_line=r["now_line"],
+        now_through=r["now_through"],
+        now_as_of=r["now_as_of"],
     )
 
 
 THREAD_SELECT = (
-    "SELECT t.*, (SELECT created_at FROM entries WHERE id = t.summary_through) AS summary_as_of FROM threads t"
+    "SELECT t.*, (SELECT created_at FROM entries WHERE id = t.summary_through) AS summary_as_of, "
+    "(SELECT created_at FROM entries WHERE id = t.now_through) AS now_as_of FROM threads t"
 )
 
 

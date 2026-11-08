@@ -30,6 +30,9 @@ export interface ThreadRow {
   state: string;
   pinned: boolean;
   summary: string | null;
+  summary_as_of: string | null;
+  now_line: string | null;
+  now_as_of: string | null;
   last_activity: string | null;
   fragments: number;
   open_items: number;
@@ -190,6 +193,29 @@ export interface SweepItem {
   thread_id: string | null;
   thread_name: string | null;
   threads: string[] | null;
+  suggestion: { verdict: "still_open" | "probably_resolved" | "unclear"; evidence: string | null; reason: string } | null;
+}
+
+export interface ContextResult {
+  text: string;
+  doc: { today: string; entries_through: string | null; waiting: Record<string, number> };
+}
+
+export interface DreamRun {
+  run_id: string;
+  started_at: string;
+  finished_at: string | null;
+  calls: number;
+  budget_exhausted: boolean;
+  applied: string[];
+  proposed: string[];
+  errors: string[];
+}
+
+export interface DreamStatus {
+  last: DreamRun | null;
+  planned: string[];
+  max_calls: number;
 }
 
 export class ApiError extends Error {
@@ -244,6 +270,9 @@ export const api = {
   threadOp: (threadId: string, op: ThreadOp) =>
     request<{ id: string; cascaded?: number }>("POST", `/api/threads/${q(threadId)}`, op),
   sweep: (days = 30) => request<SweepItem[]>("GET", `/api/sweep?days=${days}`),
+  context: () => request<ContextResult>("GET", "/api/context"),
+  dreamStatus: () => request<DreamStatus>("GET", "/api/dream"),
+  dreamNow: () => request<{ requested: boolean }>("POST", "/api/dream", {}),
   graph: (center?: string) => request<GraphData>("GET", `/api/graph${center ? `?center=${q(center)}` : ""}`),
 };
 

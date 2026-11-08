@@ -42,3 +42,17 @@ port = 8765
 
 [worker]
 poll_seconds = 60
+
+[dream]
+enabled = true                    # whether `brain start` dreams on its own; `brain dream` always works
+nightly_at = "03:00"              # local time; "" turns the nightly pass off
+after_entries = 10                # also dream after this many new entries; 0 turns it off
+max_calls = 50                    # model calls per pass
+rebuild_after_updates = 10        # rebuild a thread summary after this many new entries
+rebuild_after_days = 30
+
+[context]
+max_lines = 60                    # the injected context (`brain context`) stays within these
+max_bytes = 6000
+recent_days = 7                   # "changed in the last N days"
+open_items = 5

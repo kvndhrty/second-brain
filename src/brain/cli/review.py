@@ -16,6 +16,7 @@ KIND_LABEL = {
     "proposed_theme": "Proposed theme",
     "proposed_thread": "Proposed thread",
     "proposed_answer": "Does this answer an earlier item?",
+    "dream_obe": "Has this been overcome by events?",
     "orphaned_decision": "A decision no longer matches any fragment",
 }
 
@@ -134,10 +135,30 @@ def run_review(out: Console, brain: Brain) -> None:
             if len(item.context) == 2:
                 out.print(f"  earlier: {escape(item.context[0])}")
                 out.print(f"  new:     {escape(item.context[1])}")
+            if item.payload.get("source") == "dream":
+                out.print("  [dim]found by `brain dream`[/dim]")
             choice = typer.prompt("[y]es (closes the earlier item)  [n]o  [s]kip  [q]uit", default="s").strip().lower()
             if choice == "q":
                 raise typer.Exit()
             decision = rv.AnswerDecision(True) if choice == "y" else rv.AnswerDecision(False) if choice == "n" else None
+        elif item.kind == "dream_obe":
+            if len(item.context) == 2:
+                out.print(f"  earlier: {escape(item.context[0])}")
+                out.print(f"  later:   {escape(item.context[1])}")
+            if item.payload.get("reason"):
+                out.print(f"  [dim]{escape(item.payload['reason'])} (found by `brain dream`)[/dim]")
+            choice = (
+                typer.prompt(
+                    "[y]es (mark the earlier one overcome by events)  [n]o, it still holds  [s]kip  [q]uit", default="s"
+                )
+                .strip()
+                .lower()
+            )
+            if choice == "q":
+                raise typer.Exit()
+            decision = (
+                rv.SupersedeDecision(True) if choice == "y" else rv.SupersedeDecision(False) if choice == "n" else None
+            )
         elif item.kind == "orphaned_decision":
             out.print(f"  fragment {item.payload['fragment']}: {item.payload['decision']}")
             choice = typer.prompt("[d]rop  [s]kip  [q]uit", default="s").strip().lower()

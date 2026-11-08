@@ -10,7 +10,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from types import TracebackType
 
-from brain.core import answers, keys, paths, views
+from brain.core import answers, dream, injected, keys, paths, views
 from brain.core.config import LoadedSettings, Settings
 from brain.core.formats.decisions import FragmentDecision, OpenState, Status
 from brain.core.formats.entity import ObeInfo
@@ -328,7 +328,46 @@ class Brain:
         return ThreadOps(self.vault, self.db.conn)
 
     def sweep(self, *, days: int = 30, quiet_days: int = 60, now: datetime | None = None) -> list[SweepItem]:
-        return sweep_items(self.db.conn, now=now or datetime.now(UTC), days=days, quiet_days=quiet_days)
+        items = sweep_items(self.db.conn, now=now or datetime.now(UTC), days=days, quiet_days=quiet_days)
+        verdicts = dream.suggestions(self.db.conn)
+        for item in items:
+            if item.fragment is not None:
+                item.suggestion = verdicts.get(item.fragment.id)
+        return items
 
     def find_targets(self, text: str) -> list[answers.NodeMatch]:
         return answers.find_targets(self.db.conn, text)
+
+    # --- injected context and dreaming ------------------------------------------
+
+    def context(self, *, now: datetime | None = None) -> injected.ContextDoc:
+        return injected.build(self.db.conn, self.settings, now=now or datetime.now(UTC))
+
+    def context_text(self, *, now: datetime | None = None) -> str:
+        cfg = self.settings.context
+        return injected.render_markdown(self.context(now=now), max_lines=cfg.max_lines, max_bytes=cfg.max_bytes)
+
+    def _dream_ctx(self) -> PipelineContext:
+        return PipelineContext(self.settings, self.vault, self.db, self.llm)
+
+    def dream_plan(self, *, thread: str | None = None) -> dream.DreamPlan:
+        """What a dream pass would do, without calling a model."""
+        self.sync()
+        return dream.Dreamer(self._dream_ctx(), self.settings.dream).plan(thread=thread)
+
+    def dream(self, *, thread: str | None = None, progress: Callable[[str], None] | None = None):
+        """Run one dream pass. Holds the processing lock so it never overlaps the pipeline."""
+        if not self.llm.configured:
+            raise LLMError("no model endpoint is configured; set [llm] base_url (run `brain init`)")
+        self.sync()
+        with self.state.try_lock("process") as got:
+            if not got:
+                raise Busy("another brain process is processing entries or dreaming")
+            dreamer = dream.Dreamer(self._dream_ctx(), self.settings.dream)
+            return dreamer.run(dreamer.plan(thread=thread), progress=progress)
+
+    def dream_due(self, *, now: datetime | None = None) -> str | None:
+        return dream.is_due(self._dream_ctx(), self.settings.dream, now=now or datetime.now(UTC))
+
+    def last_dream(self):
+        return dream.last_run(self._dream_ctx())

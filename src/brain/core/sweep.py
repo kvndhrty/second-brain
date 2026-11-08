@@ -25,6 +25,7 @@ class SweepItem:
     thread_id: str | None = None
     thread_name: str | None = None
     threads: list[str] | None = None  # names of the fragment's threads, for context
+    suggestion: dict | None = None  # dreaming's verdict: verdict, evidence, reason, citations
 
 
 def sweep_items(conn: sqlite3.Connection, *, now: datetime, days: int = 30, quiet_days: int = 60) -> list[SweepItem]:

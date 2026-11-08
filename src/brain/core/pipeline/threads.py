@@ -1,7 +1,9 @@
 """Step 4: keep each thread's running summary current.
 
 A summary records the last entry it covers (`through_entry`). An update sends
-the previous summary plus only the fragments from later entries.
+the previous summary plus only the fragments from later entries. Dreaming
+calls this with full=True to rewrite a summary from all of the thread's
+fragments, since incremental updates carry errors and omissions forward.
 """
 
 from __future__ import annotations
@@ -17,14 +19,15 @@ from brain.core.temporal import as_of, dated, local_date, today_el
 MAX_FRAGMENTS = 150
 
 
-def summarize(ctx: PipelineContext, thread_id: str) -> ThreadSummary | None:
+def summarize(ctx: PipelineContext, thread_id: str, *, full: bool = False) -> ThreadSummary | None:
     t = queries.thread(ctx.conn, thread_id)
     if t is None or t.last_entry is None:
         return None
     prev = ctx.read_sidecar(keys.thread_summary_key(thread_id), ThreadSummary)
-    previous = prev[0] if prev else None
+    previous = None if full or prev is None else prev[0]
     family = [f"thread:{x}" for x in queries.thread_family(ctx.conn, thread_id)]
     frags = queries.fragments_linked_to(ctx.conn, family, ("in_thread",), limit=MAX_FRAGMENTS)
+    through = None
     if previous and previous.through_entry:
         through = queries.entry_dates(ctx.conn, [previous.through_entry]).get(previous.through_entry)
         if through:

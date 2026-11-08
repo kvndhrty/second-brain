@@ -15,7 +15,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 MIN_SQLITE = (3, 41, 0)
 
 
@@ -180,6 +180,7 @@ SNAPSHOT_QUERIES = {
         "SELECT src, dst, type, weight, origin, confirmed, entry_id, fragment_id, valid_from, valid_to, owner FROM edges"
     ),
     "review_items": "SELECT * FROM review_items",
+    "suggestions": "SELECT * FROM suggestions",
     "embeddings": "SELECT owner_id, model, content_hash, owner FROM embeddings",
     "fts": "SELECT item_id, item_type, owner, title, body FROM fts",
 }

@@ -69,6 +69,35 @@ class SummaryOutput(BaseModel):
     citations: list[str] = Field(default_factory=list)
 
 
+class SupersedePair(BaseModel):
+    older: str = Field(description="id of the earlier fragment that may no longer hold")
+    newer: str = Field(description="id of the later fragment that replaces or contradicts it")
+    reason: str = Field(description="one sentence: what changed")
+    confidence: float = Field(ge=0, le=1)
+
+
+class SupersedeOutput(BaseModel):
+    pairs: list[SupersedePair] = Field(default_factory=list)
+
+
+class SweepCheck(BaseModel):
+    item: str = Field(description="id of the open or speculative item")
+    verdict: Literal["still_open", "probably_resolved", "unclear"]
+    evidence: str | None = Field(None, description="id of the later fragment the verdict rests on, if any")
+    reason: str = Field(description="one sentence")
+    confidence: float = Field(0.7, ge=0, le=1)
+    citations: list[str] = Field(default_factory=list, description="entry ids the verdict rests on")
+
+
+class SweepOutput(BaseModel):
+    checks: list[SweepCheck] = Field(default_factory=list)
+
+
+class NowOutput(BaseModel):
+    line: str = Field(description="one sentence, at most about 30 words")
+    citations: list[str] = Field(default_factory=list, description="entry ids the line rests on")
+
+
 class Claim(BaseModel):
     text: str
     citations: list[str] = Field(description="entry ids that support the claim")

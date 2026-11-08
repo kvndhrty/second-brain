@@ -10,6 +10,7 @@ const TITLES: Record<string, string> = {
   proposed_theme: "Proposed theme",
   proposed_thread: "Proposed thread",
   proposed_answer: "Does this answer an earlier item?",
+  dream_obe: "Has this been overcome by events?",
   orphaned_decision: "A decision no longer matches any fragment",
 };
 
@@ -76,12 +77,32 @@ function ReviewCard({ item, onDone }: { item: ReviewItem; onDone: () => void }) 
           <p>
             <strong>New:</strong> {item.context[1]}
           </p>
+          {p.source === "dream" && <p className="muted">Found by dreaming.</p>}
           <div className="toolbar">
             <button className="primary" disabled={busy} onClick={() => void decide({ action: "yes" })}>
               Yes, close the earlier item
             </button>
             <button disabled={busy} onClick={() => void decide({ action: "no" })}>
               No
+            </button>
+          </div>
+        </>
+      )}
+      {item.kind === "dream_obe" && (
+        <>
+          <p>
+            <strong>Earlier:</strong> {item.context[0]}
+          </p>
+          <p>
+            <strong>Later:</strong> {item.context[1]}
+          </p>
+          {p.reason && <p className="muted">{p.reason} (found by dreaming)</p>}
+          <div className="toolbar">
+            <button className="primary" disabled={busy} onClick={() => void decide({ action: "yes" })}>
+              Yes, the earlier one no longer holds
+            </button>
+            <button disabled={busy} onClick={() => void decide({ action: "no" })}>
+              No, it still holds
             </button>
           </div>
         </>

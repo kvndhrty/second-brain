@@ -92,6 +92,11 @@ function SweepCard({ item, onDone }: { item: SweepItem; onDone: () => void }) {
         {item.threads?.length ? ` · ${item.threads.join(", ")}` : ""}
       </p>
       <p>{f.text}</p>
+      {item.suggestion && (
+        <p className="muted" data-testid="sweep-suggestion">
+          Dreaming says: <strong>{item.suggestion.verdict.replace("_", " ")}</strong>. {item.suggestion.reason}
+        </p>
+      )}
       <div className="toolbar">
         <button
           disabled={busy}

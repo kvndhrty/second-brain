@@ -19,10 +19,12 @@ from brain.core.formats.entity import Entity, Org, Person, Theme, Thread, parse_
 from brain.core.formats.entry import Entry, content_hash
 from brain.core.formats.sidecars import (
     OPEN_KINDS,
+    DreamProposals,
     EmbeddingFile,
     ExtractedFragment,
     Extraction,
     ResolutionFile,
+    ThreadNow,
     ThreadSummary,
     bytes_hash,
 )
@@ -76,7 +78,7 @@ class UnitBuilder:
             c.execute("DELETE FROM threads WHERE id = ?", (unit.split(":", 1)[1],))
         if self.db.has_vec():
             c.execute("DELETE FROM vec_items WHERE rowid IN (SELECT rowid FROM embeddings WHERE owner = ?)", (unit,))
-        for table in ("nodes", "aliases", "edges", "review_items", "embeddings", "fts"):
+        for table in ("nodes", "aliases", "edges", "review_items", "suggestions", "embeddings", "fts"):
             c.execute(f"DELETE FROM {table} WHERE owner = ?", (unit,))
 
     # --- helpers -----------------------------------------------------------
@@ -202,6 +204,9 @@ class UnitBuilder:
         fragment_texts: dict[str, str] = {}
         if extraction is not None:
             fragment_texts = self._build_fragments(unit, entry, created, extraction, resolution, decisions)
+            dreams = self._parse(files.one("dream_proposals"), lambda f: DreamProposals.parse(f.data, where=f.key))
+            if dreams is not None:
+                self._build_dream_proposals(unit, entry, created, dreams, decisions, fragment_texts)
         embedded = self._build_embeddings(unit, files, entry, fragment_texts)
 
         # Which pipeline step this entry needs next. Each step records the
@@ -363,6 +368,64 @@ class UnitBuilder:
                 )
         return texts
 
+    def _build_dream_proposals(
+        self,
+        unit: str,
+        entry: Entry,
+        created: str,
+        dreams: DreamProposals,
+        decisions: Decisions,
+        texts: dict[str, str],
+    ) -> None:
+        """Review items and sweep suggestions from dreaming. A proposal you have
+        already decided on is left out, so the file needs no clean-up."""
+        for p in dreams.proposals:
+            if p.fragment not in texts:
+                continue  # the fragment was deleted or re-extracted away
+            d = decisions.fragments.get(p.fragment) or FragmentDecision()
+            if p.kind == "supersede" and p.other:
+                if d.status is not None or d.someday:
+                    continue  # you set this fragment's status yourself
+                self._review(
+                    "dream_obe",
+                    unit,
+                    f"{p.fragment}|{p.other}",
+                    created,
+                    {
+                        "fragment": p.fragment,
+                        "superseded_by": p.other,
+                        "reason": p.reason,
+                        "confidence": p.confidence,
+                        "citations": p.citations,
+                    },
+                    entry.id,
+                )
+            elif p.kind == "answer" and p.other:
+                if p.other in (d.answers or []) or p.other in (d.not_answers or []):
+                    continue
+                self._review(
+                    "proposed_answer",
+                    unit,
+                    f"{p.fragment}|{p.other}",
+                    created,
+                    {
+                        "fragment": p.fragment,
+                        "answers": p.other,
+                        "confidence": p.confidence,
+                        "source": "dream",
+                        "reason": p.reason,
+                    },
+                    entry.id,
+                )
+            elif p.kind == "sweep" and p.verdict:
+                if d.status is not None or d.state is not None:
+                    continue  # already decided in the sweep or elsewhere
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO suggestions(fragment_id, verdict, evidence, reason, citations, "
+                    "checked_through, owner) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (p.fragment, p.verdict, p.other, p.reason, json.dumps(p.citations), p.checked_through, unit),
+                )
+
     def _insert_fragment(
         self, unit: str, entry: Entry, created: str, frag: ExtractedFragment, d: FragmentDecision
     ) -> None:
@@ -496,9 +559,10 @@ class UnitBuilder:
                 self._review("proposed_theme", unit, entity.id, seen, {"theme": entity.id, "name": entity.name})
         elif isinstance(entity, Thread):
             summary = self._parse(files.one("thread_summary"), lambda f: ThreadSummary.parse(f.data, where=f.key))
+            now = self._parse(files.one("thread_now"), lambda f: ThreadNow.parse(f.data, where=f.key))
             self.conn.execute(
-                "INSERT INTO threads(id, name, description, state, pinned, merged_into, summary, summary_through) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO threads(id, name, description, state, pinned, merged_into, summary, summary_through, "
+                "now_line, now_through) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     entity.id,
                     entity.name,
@@ -508,6 +572,8 @@ class UnitBuilder:
                     entity.merged_into,
                     summary.summary_md if summary else None,
                     summary.through_entry if summary else None,
+                    now.line if now else None,
+                    now.through_entry if now else None,
                 ),
             )
             if entity.merged_into:

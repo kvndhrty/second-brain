@@ -99,6 +99,40 @@ class WorkerConfig(_Section):
     poll_seconds: int = Field(default=60, ge=5)
 
 
+class DreamConfig(_Section):
+    """Offline consolidation (`brain dream`, and on a schedule inside `brain start`)."""
+
+    enabled: bool = True  # whether `brain start` dreams on its own; `brain dream` always works
+    nightly_at: str = "03:00"  # local time HH:MM; "" turns the nightly pass off
+    after_entries: int = Field(default=10, ge=0)  # also dream after this many new entries; 0 turns it off
+    max_calls: int = Field(default=50, ge=1)  # model calls per pass
+    rebuild_after_updates: int = Field(default=10, ge=1)  # rebuild a summary after this many new entries
+    rebuild_after_days: int = Field(default=30, ge=1)  # or when it was last rebuilt this long ago
+
+    @model_validator(mode="after")
+    def _check(self) -> DreamConfig:
+        if self.nightly_at:
+            hh, _, mm = self.nightly_at.partition(":")
+            if not (hh.isdigit() and mm.isdigit() and 0 <= int(hh) < 24 and 0 <= int(mm) < 60):
+                raise ValueError('dream.nightly_at must be "HH:MM" (local time) or ""')
+        return self
+
+    def nightly_time(self) -> tuple[int, int] | None:
+        if not self.nightly_at:
+            return None
+        hh, _, mm = self.nightly_at.partition(":")
+        return int(hh), int(mm)
+
+
+class ContextConfig(_Section):
+    """The injected context (`brain context`): a short summary of current state for agent sessions."""
+
+    max_lines: int = Field(default=60, ge=10)
+    max_bytes: int = Field(default=6000, ge=500)
+    recent_days: int = Field(default=7, ge=1)  # "changed in the last N days"
+    open_items: int = Field(default=5, ge=0)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix=ENV_PREFIX,
@@ -114,6 +148,8 @@ class Settings(BaseSettings):
     lease: LeaseConfig = LeaseConfig()
     server: ServerConfig = ServerConfig()
     worker: WorkerConfig = WorkerConfig()
+    dream: DreamConfig = DreamConfig()
+    context: ContextConfig = ContextConfig()
 
     @classmethod
     def settings_customise_sources(

@@ -5,6 +5,10 @@ so long model calls do not hold the lock that web requests and MCP calls use.
 It processes pending entries on startup, when woken (an entry was saved), and
 every `worker.poll_seconds`. A full listing of the store runs every
 `FULL_LIST_SECONDS` to pick up files edited outside brain.
+
+When a round finds no entries to process and a dream pass is due
+(`[dream] nightly_at` or `after_entries`), it dreams. New entries always come
+first: a round that processed any leaves dreaming to a later round.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ class WorkerStatus:
     last_error: str | None = None
     processed: int = 0
     failed: int = 0
+    last_dream: str | None = None  # run id of the last dream pass
 
 
 @dataclass
@@ -51,6 +56,7 @@ class Worker:
         self._thread: threading.Thread | None = None
         self._waiters: dict[str, list[_Waiter]] = {}
         self._waiters_lock = threading.Lock()
+        self._dream_requested = False
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="brain-worker", daemon=True)
@@ -64,6 +70,11 @@ class Worker:
 
     def wake(self) -> None:
         self._wake.set()
+
+    def request_dream(self) -> None:
+        """Dream on the next idle round, whether or not a pass is due."""
+        self._dream_requested = True
+        self.wake()
 
     def process_now(self, entry_id: str, timeout: float = 300.0) -> EntryResult | None:
         """Ask the worker to process an entry and wait for it. None if it did not finish in time."""
@@ -108,6 +119,8 @@ class Worker:
                         self.status.failed += len(report.failed)
                         self.status.last_error = report.failed[-1].error if report.failed else None
                         self._finish(report.entries, brain)
+                        if not report.entries:
+                            self._maybe_dream(brain)
                         self.status.current = "idle"
                     self.status.last_run = datetime.now(UTC).isoformat()
                 except Busy:
@@ -126,6 +139,17 @@ class Worker:
                     for w in waiters:
                         w.event.set()
                 self._waiters.clear()
+
+    def _maybe_dream(self, brain: Brain) -> None:
+        reason = "requested" if self._dream_requested else brain.dream_due()
+        self._dream_requested = False
+        if reason is None:
+            return
+        self.status.current = f"dreaming: {reason}"
+        run = brain.dream(progress=lambda msg: self._progress("", f"dreaming: {msg}"))
+        self.status.last_dream = run.run_id
+        if run.errors:
+            self.status.last_error = run.errors[-1]
 
     def _progress(self, entry_id: str, message: str) -> None:
         self.status.current = f"{entry_id}: {message}" if entry_id else message

@@ -497,6 +497,69 @@ def sweep(
         run_sweep(b, days=days, quiet_days=quiet_days)
 
 
+# --- injected context and dreaming --------------------------------------------
+
+
+@app.command()
+def context(
+    fmt: Annotated[str, typer.Option("--format", help="markdown or json.")] = "markdown",
+) -> None:
+    """A short summary of current state for agent sessions: active threads, open items, recent changes.
+
+    Meant to be loaded at the start of every session, for example by a Claude Code SessionStart hook."""
+    import dataclasses
+    import json
+
+    if fmt not in ("markdown", "json"):
+        raise _fail("--format must be markdown or json", 2)
+    with _brain("brain context", sync=True) as b:
+        if fmt == "json":
+            print(json.dumps(dataclasses.asdict(b.context()), indent=2))
+        else:
+            print(b.context_text(), end="")
+
+
+@app.command()
+def dream(
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Show what a pass would do, without calling a model.")
+    ] = False,
+    thread: Annotated[str | None, typer.Option(help="Only this thread (id).")] = None,
+) -> None:
+    """Offline consolidation: rebuild stale thread summaries, propose items that later entries have
+    overcome or answered, check old items in the sweep, and write each thread's Now line.
+
+    Proposals go to `brain review` and `brain sweep`; nothing you wrote is changed."""
+    with _brain("brain dream") as b:
+        if dry_run:
+            plan = b.dream_plan(thread=thread)
+            if not plan.jobs:
+                out.print("nothing to do: no thread has changed since the last pass")
+                return
+            for job in plan.jobs:
+                out.print(f"  • {escape(job.label)}")
+            out.print(
+                rf"{plan.calls} model call(s); a pass stops after {b.settings.dream.max_calls} (\[dream] max_calls)"
+            )
+            return
+        try:
+            run = b.dream(thread=thread, progress=lambda msg: err.print(f"[dim]{escape(msg)}[/dim]"))
+        except KeyError as e:
+            raise _fail(str(e.args[0])) from None
+        for line in run.applied:
+            out.print(f"[green]✓[/green] {escape(line)}")
+        if run.proposed:
+            out.print(f"{len(run.proposed)} proposal(s): run `brain review` and `brain sweep`")
+        for e in run.errors:
+            out.print(f"[red]✗[/red] {escape(e)}")
+        if run.budget_exhausted:
+            out.print(
+                rf"[yellow]stopped after {run.calls} model calls (\[dream] max_calls); run again to continue[/yellow]"
+            )
+        if not (run.applied or run.proposed or run.errors):
+            out.print("nothing to do: no thread has changed since the last pass")
+
+
 # --- agents -----------------------------------------------------------------
 
 
@@ -509,7 +572,7 @@ def mcp() -> None:
     loaded = _load()  # a config error stops here, before the client connects
     shared = SharedBrain(lambda: Brain(loaded, command="brain mcp", llm=_make_llm(loaded.settings)))
     try:
-        build_server(shared).run("stdio")
+        build_server(shared, context_in_instructions=True).run("stdio")
     finally:
         shared.close()
 

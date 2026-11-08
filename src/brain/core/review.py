@@ -11,7 +11,7 @@ import sqlite3
 from dataclasses import dataclass, field
 
 from brain.core.formats.decisions import FragmentDecision
-from brain.core.formats.entity import Membership, Org, Person, Theme, Thread
+from brain.core.formats.entity import Membership, ObeInfo, Org, Person, Theme, Thread
 from brain.core.formats.yamlio import FormatError
 from brain.core.index.build import norm_alias
 from brain.core.index.queries import entry_dates, fragments_by_id
@@ -71,6 +71,11 @@ class AnswerDecision:
 
 
 @dataclass(frozen=True)
+class SupersedeDecision:
+    accept: bool  # True: mark the older fragment overcome by events; False: keep it as it is
+
+
+@dataclass(frozen=True)
 class DropDecision:
     pass
 
@@ -81,7 +86,15 @@ class Skip:
 
 
 ReviewDecision = (
-    LinkMention | CreateEntity | IgnoreMention | AcceptProposed | MergeProposed | AnswerDecision | DropDecision | Skip
+    LinkMention
+    | CreateEntity
+    | IgnoreMention
+    | AcceptProposed
+    | MergeProposed
+    | AnswerDecision
+    | SupersedeDecision
+    | DropDecision
+    | Skip
 )
 
 
@@ -98,7 +111,7 @@ class Review:
         rows = self.conn.execute(
             "SELECT id, kind, entry_id, payload FROM review_items ORDER BY "
             "CASE kind WHEN 'new_person' THEN 0 WHEN 'new_org' THEN 1 WHEN 'ambiguous_mention' THEN 2 "
-            "WHEN 'proposed_answer' THEN 3 ELSE 4 END, created_at, id"
+            "WHEN 'proposed_answer' THEN 3 WHEN 'dream_obe' THEN 4 ELSE 5 END, created_at, id"
         ).fetchall()
         items = [ReviewItem(r[0], r[1], r[2], json.loads(r[3])) for r in rows]
         dates = entry_dates(self.conn, sorted({i.entry_id for i in items if i.entry_id}))
@@ -117,6 +130,13 @@ class Review:
             elif i.kind == "proposed_answer":
                 frags = fragments_by_id(self.conn, [i.payload["fragment"], i.payload["answers"]])
                 i.context = [frags[x].text for x in (i.payload["answers"], i.payload["fragment"]) if x in frags]
+            elif i.kind == "dream_obe":
+                frags = fragments_by_id(self.conn, [i.payload["fragment"], i.payload["superseded_by"]])
+                i.context = [
+                    f"{iso_day(frags[x].created_at)}: {frags[x].text}"
+                    for x in (i.payload["fragment"], i.payload["superseded_by"])
+                    if x in frags
+                ]
         return items
 
     def get(self, item_id: str) -> ReviewItem:
@@ -137,6 +157,10 @@ class Review:
             self._proposed(item, decision)
         elif item.kind == "proposed_answer":
             self._answer(item, decision)
+        elif item.kind == "dream_obe":
+            if isinstance(decision, AnswerDecision):  # a plain yes/no from a front-end
+                decision = SupersedeDecision(decision.accept)
+            self._supersede(item, decision)
         elif item.kind == "orphaned_decision":
             if not isinstance(decision, DropDecision):
                 raise ReviewError("an orphaned decision can only be dropped or skipped")
@@ -227,6 +251,27 @@ class Review:
             self.vault.put_entity(entity)
         else:
             raise ReviewError(f"a proposed {etype} can be accepted, renamed, merged, or skipped")
+
+    def _supersede(self, item: ReviewItem, decision: ReviewDecision) -> None:
+        if not isinstance(decision, SupersedeDecision):
+            raise ReviewError("a proposed overcome-by-events can be accepted, rejected, or skipped")
+        fid, newer = item.payload["fragment"], item.payload["superseded_by"]
+        frags = fragments_by_id(self.conn, [fid, newer])
+        if fid not in frags:
+            raise ReviewError(f"no fragment {fid}")
+        d = self.vault.get_decisions(item.entry_id or "")
+        fd = d.fragments.setdefault(fid, FragmentDecision())
+        if decision.accept:
+            later = frags.get(newer)
+            reason = item.payload.get("reason") or "replaced by a later entry"
+            if later is not None:
+                reason = f"{reason} (superseded by {newer}, {iso_day(later.created_at)})"
+            fd.status = "overcome_by_events"
+            fd.obe = ObeInfo(date=self.vault.clock().date(), reason=reason)
+        else:
+            # Recording the current status as yours keeps it, and dreaming does not ask again.
+            fd.status = frags[fid].status  # type: ignore[assignment]
+        self.vault.put_decisions(d)
 
     def _answer(self, item: ReviewItem, decision: ReviewDecision) -> None:
         if not isinstance(decision, AnswerDecision):

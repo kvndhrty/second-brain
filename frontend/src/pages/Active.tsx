@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { api, nodePath } from "../api";
 import { Badge, Loading } from "../components";
@@ -28,7 +29,13 @@ export function ActivePage() {
               {t.pinned && "📌 "}
               {t.name} {t.state === "proposed" && <Badge tone="proposed">proposed</Badge>}
             </h3>
-            {t.description && <p className="muted">{t.description}</p>}
+            {t.now_line ? (
+              <p>
+                {t.now_line} <span className="meta">(as of {t.now_as_of?.slice(0, 10) ?? "unknown"})</span>
+              </p>
+            ) : (
+              t.description && <p className="muted">{t.description}</p>
+            )}
             <p className="meta">
               {daysAgo(t.last_activity)} · {t.fragments} fragments
               {t.open_items > 0 && ` · ${t.open_items} open`}
@@ -37,6 +44,58 @@ export function ActivePage() {
           </Link>
         ))}
       </div>
+      <DreamPanel />
+      <ContextPanel />
     </section>
+  );
+}
+
+// What `brain dream` last did, and a button to ask the background worker for a pass.
+function DreamPanel() {
+  const { data, reload } = useLoad(() => api.dreamStatus());
+  const [note, setNote] = useState<string | null>(null);
+  if (!data) return null;
+  const last = data.last;
+  async function dreamNow() {
+    try {
+      await api.dreamNow();
+      setNote("Requested; the background worker dreams when it is idle.");
+      setTimeout(reload, 5000);
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : String(e));
+    }
+  }
+  return (
+    <details className="card" data-testid="dream-panel">
+      <summary>
+        Dreaming:{" "}
+        {last
+          ? `last pass ${(last.finished_at ?? last.started_at).slice(0, 16).replace("T", " ")}, ${last.proposed.length} proposed, ${last.applied.length} applied`
+          : "no pass yet"}
+        {data.planned.length > 0 && ` · ${data.planned.length} step(s) waiting`}
+      </summary>
+      {last && last.errors.length > 0 && <p className="error">{last.errors[last.errors.length - 1]}</p>}
+      {data.planned.length > 0 && (
+        <ul>
+          {data.planned.map((p) => (
+            <li key={p}>{p}</li>
+          ))}
+        </ul>
+      )}
+      <button onClick={() => void dreamNow()}>Dream now</button>
+      {note && <p className="muted">{note}</p>}
+    </details>
+  );
+}
+
+// The injected context: exactly what an agent receives at the start of a session.
+function ContextPanel() {
+  const { data } = useLoad(() => api.context());
+  if (!data) return null;
+  return (
+    <details className="card" data-testid="context-panel">
+      <summary>What an agent sees at the start of a session</summary>
+      <pre>{data.text}</pre>
+    </details>
   );
 }

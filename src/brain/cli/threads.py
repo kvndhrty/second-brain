@@ -165,6 +165,9 @@ def run_sweep(b: Brain, *, days: int, quiet_days: int) -> None:
         what = "Still open" if item.kind == "stale_open" else "Still unconfirmed"
         where = f" · {', '.join(item.threads)}" if item.threads else ""
         out.print(f"{what} after {item.age_days} days[dim]{escape(where)}[/dim]\n  {escape(f.text)}  [dim]{f.id}[/dim]")
+        if item.suggestion:
+            verdict = item.suggestion["verdict"].replace("_", " ")
+            out.print(f"  [cyan]dream: {verdict}[/cyan] [dim]{escape(item.suggestion['reason'])}[/dim]")
         keys = "[o]be  " + ("[c]lose  [k]eep open" if item.kind == "stale_open" else "[c]onfirm  [k]eep speculative")
         choice = typer.prompt(f"{keys}  [s]kip  [q]uit", default="s").lower()
         if choice == "q":

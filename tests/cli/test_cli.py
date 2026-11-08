@@ -234,3 +234,26 @@ def test_thread_commands_and_sweep(fake_cfg, tmp_path):
     r = run(fake_cfg, "sweep", "--days", "0", "--quiet-days", "0", input="c\n")
     assert r.exit_code == 0 and "Still open" in r.output and "sweep done: 1 changed" in r.output
     assert "nothing stale" in run(fake_cfg, "sweep", "--days", "0", "--quiet-days", "0").output
+
+
+def test_context_and_dream_commands(fake_cfg):
+    import json
+
+    run(fake_cfg, "jot", "-m", "We decided the [[Billing migration]] cutover is in March.")
+    run(fake_cfg, "jot", "-m", "The [[Billing migration]] cutover moved to May instead of March.")
+    r = run(fake_cfg, "context")
+    assert r.exit_code == 0, r.output
+    assert r.output.startswith("# brain: ") and "Billing migration [billing-migration]" in r.output
+    r = run(fake_cfg, "context", "--format", "json")
+    assert json.loads(r.output)["threads"][0]["id"] == "billing-migration"
+    r = run(fake_cfg, "dream", "--dry-run")
+    assert r.exit_code == 0 and "look for superseded fragments in Billing migration" in r.output
+    r = run(fake_cfg, "dream")
+    assert r.exit_code == 0, r.output
+    assert "wrote the Now line for thread billing-migration" in r.output and "brain review" in r.output
+    r = run(fake_cfg, "dream")
+    assert "nothing to do" in r.output
+    r = run(fake_cfg, "review", input="y\n")
+    assert "Has this been overcome by events?" in r.output
+    r = run(fake_cfg, "doctor")
+    assert "last pass" in r.output

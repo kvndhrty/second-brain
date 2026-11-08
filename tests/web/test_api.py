@@ -191,3 +191,43 @@ def test_thread_ops_and_sweep(client, brain):
     assert post(client, "/api/threads/nope", {"op": "pin"}).status_code == 400
     sweep = client.get("/api/sweep", params={"days": 0, "quiet_days": 0}).json()
     assert {i["kind"] for i in sweep} <= {"stale_open", "stale_speculative", "quiet_thread"}
+
+
+def test_context_and_dream_endpoints(client, brain):
+    processed(client, brain)
+    ctx = client.get("/api/context").json()
+    assert ctx["text"].startswith("# brain: ") and "GPU quota migration [gpu-quota-migration]" in ctx["text"]
+    assert ctx["doc"]["threads"][0]["now_source"] == "summary"
+    status = client.get("/api/dream").json()
+    assert status["last"] is None and any("Now line" in p for p in status["planned"])
+    assert client.post("/api/dream", json={}).status_code == 409  # no worker in this app
+    brain.dream()
+    status = client.get("/api/dream").json()
+    assert status["last"]["calls"] >= 1 and status["planned"] == []
+    (thread,) = client.get("/api/active").json()
+    assert thread["now_line"] and thread["now_as_of"]
+
+
+def test_worker_dreams_when_asked(brain, local_storage, state, tmp_path):
+    other = make_brain(
+        local_storage, state, tmp_path, fake_llm=True, llm=FAKE_LLM_SETTINGS, index_name=brain.db.path.stem
+    )
+    other.settings.dream.enabled = False  # nothing scheduled; only the request makes it dream
+    worker = Worker(lambda: other, poll_seconds=30)
+    worker.start()
+    try:
+        app = create_app(SharedBrain(lambda: brain), worker=worker, static_dir=tmp_path / "x")
+        with TestClient(app, base_url="http://127.0.0.1") as c:
+            eid = post(c, "/api/entries", {"text": ENTRY}).json()["id"]
+            assert worker.process_now(eid, timeout=30) is not None
+            assert c.post("/api/dream", json={}).json() == {"requested": True}
+            import time
+
+            for _ in range(100):
+                if worker.status.last_dream:
+                    break
+                time.sleep(0.1)
+            assert worker.status.last_dream
+            assert c.get("/api/dream").json()["last"]["run_id"] == worker.status.last_dream
+    finally:
+        worker.stop()

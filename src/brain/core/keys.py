@@ -20,6 +20,11 @@ EXTRACTIONS = "generated/extractions/"
 RESOLUTIONS = "generated/resolutions/"
 EMBEDDINGS = "generated/embeddings/"
 THREAD_SUMMARIES = "generated/summaries/threads/"
+DREAMS = "generated/dreams/"
+DREAM_RUNS = "generated/dreams/runs/"
+DREAM_STATE = "generated/dreams/state.json"
+DREAM_PROPOSALS = "generated/dreams/proposals/"
+DREAM_NOW = "generated/dreams/now/"
 STATE = "state/"
 BRIEF_STATE = "state/briefs.json"
 SYSTEM = "_system/"
@@ -94,7 +99,29 @@ def thread_summary_key(thread_id: str) -> str:
     return f"{THREAD_SUMMARIES}{thread_id}.json"
 
 
-Role = Literal["entry", "decisions", "extraction", "resolution", "embedding", "entity", "thread_summary"]
+def dream_run_key(run_id: str) -> str:
+    return f"{DREAM_RUNS}{run_id}.json"
+
+
+def dream_proposals_key(entry_id: str) -> str:
+    return f"{DREAM_PROPOSALS}{entry_id}.json"
+
+
+def thread_now_key(thread_id: str) -> str:
+    return f"{DREAM_NOW}{thread_id}.json"
+
+
+Role = Literal[
+    "entry",
+    "decisions",
+    "extraction",
+    "resolution",
+    "embedding",
+    "entity",
+    "thread_summary",
+    "dream_proposals",
+    "thread_now",
+]
 
 
 @dataclass(frozen=True)
@@ -143,6 +170,12 @@ def classify(key: str) -> KeyInfo | None:
     if key.startswith(THREAD_SUMMARIES):
         stem = _stem(key, THREAD_SUMMARIES, ".json")
         return KeyInfo("thread_summary", entity_unit("thread", stem)) if stem else None
+    if key.startswith(DREAM_PROPOSALS):
+        stem = _stem(key, DREAM_PROPOSALS, ".json")
+        return KeyInfo("dream_proposals", entry_unit(stem)) if stem else None
+    if key.startswith(DREAM_NOW):
+        stem = _stem(key, DREAM_NOW, ".json")
+        return KeyInfo("thread_now", entity_unit("thread", stem)) if stem else None
     for etype, prefix in ENTITY_DIRS.items():
         if key.startswith(prefix):
             return KeyInfo("entity", None, entity_type=etype) if _stem(key, prefix, ".md") else None

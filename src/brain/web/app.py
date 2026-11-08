@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -331,6 +331,34 @@ def create_app(
             return {"id": thread_id}
 
         return call(run)
+
+    @app.get("/api/context")
+    def context() -> Any:
+        def run(b):
+            return {"doc": _data(b.context()), "text": b.context_text()}
+
+        return call(run)
+
+    @app.get("/api/dream")
+    def dream_status() -> Any:
+        def run(b):
+            last = b.last_dream()
+            plan = b.dream_plan()
+            return {
+                "last": last.model_dump(mode="json") if last else None,
+                "planned": [j.label for j in plan.jobs],
+                "max_calls": b.settings.dream.max_calls,
+            }
+
+        return call(run)
+
+    @app.post("/api/dream")
+    def dream_now() -> Any:
+        """Ask the background worker for a pass; it runs there, not in this request."""
+        if worker is None:
+            raise HTTPException(409, "background processing is not running; use `brain dream`")
+        worker.request_dream()
+        return {"requested": True}
 
     @app.get("/api/sweep")
     def sweep(days: int = 30, quiet_days: int = 60) -> Any:

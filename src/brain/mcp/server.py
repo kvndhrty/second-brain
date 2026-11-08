@@ -51,9 +51,13 @@ techniques used), and threads (workstreams).
 - add_entry: record something in the journal. Only when the user asks you to;
   write it as the user would, in plain text.
 
+- get_context: a short, dated summary of current state.
+
 Results cite entry ids (e-YYYYMMDDTHHMMSSZ). Cite them when you report facts.
 Fragments with status "speculative" are unconfirmed; "overcome_by_events" no
-longer apply. Newer entries supersede older ones.
+longer apply. Every result has today's date and an age for each dated item:
+newer entries supersede older ones, and a summary's as-of date says how
+current it is.
 """
 
 READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
@@ -119,11 +123,43 @@ ProcessEntry = Callable[[str], EntryResult | None]
 EntityKind = Literal["entry", "fragment", "person", "org", "theme", "thread"]
 
 
-def build_server(shared: SharedBrain, *, process_entry: ProcessEntry | None = None) -> MCPServer:
+def _with_context(shared: SharedBrain) -> str:
+    """INSTRUCTIONS plus the injected context, for a server started fresh for each session."""
+    try:
+        text = shared.call(lambda b: b.context_text())
+    except Exception:  # noqa: BLE001 - the tools still work; the agent can call get_context
+        return INSTRUCTIONS
+    return f"{INSTRUCTIONS}\nCurrent state of the journal, as of this session's start:\n\n{text}"
+
+
+def build_server(
+    shared: SharedBrain, *, process_entry: ProcessEntry | None = None, context_in_instructions: bool = False
+) -> MCPServer:
+    """context_in_instructions: put the injected context in the server instructions. Only for
+    `brain mcp`, which starts once per agent session; `brain start` runs for days, so its MCP
+    server leaves it out and agents read get_context or brain://context instead."""
     handle = ToolBrain(shared)
+    instructions = _with_context(shared) if context_in_instructions else INSTRUCTIONS
     srv = MCPServer(
-        "brain", title="brain work journal", instructions=INSTRUCTIONS, version=__version__, log_level="WARNING"
+        "brain", title="brain work journal", instructions=instructions, version=__version__, log_level="WARNING"
     )
+
+    @srv.resource(
+        "brain://context",
+        name="context",
+        title="Current state of the journal",
+        description="Active threads with where each stands, open items, and recent changes, all dated.",
+        mime_type="text/markdown",
+    )
+    def context_resource() -> str:
+        return handle.call(lambda b: b.context_text())
+
+    @srv.tool(annotations=READ)
+    def get_context() -> str:
+        """A short, dated summary of current state: active threads and where each stands, the newest open
+        items, recent decisions and things that no longer hold, and what waits on the user. Read it first
+        in a session if it was not already provided."""
+        return handle.call(lambda b: b.context_text())
 
     @srv.tool(annotations=READ)
     def search(query: str, limit: int = 10, types: list[EntityKind] | None = None) -> s.SearchResult:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 import time
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -15,7 +15,7 @@ from tests.conftest import FAKE_LLM_SETTINGS, make_brain
 
 # Elements that hold a note. Each must say when it was written (date) or what
 # it covers (as_of), and how old that is; entities say when they were last mentioned.
-DATED = ("fragment", "excerpt", "item", "entry", "context")
+DATED = ("fragment", "excerpt", "item", "entry", "context", "later")
 AS_OF = ("thread_summary", "previous_summary")
 ENTITIES = ("candidate", "person")
 
@@ -73,20 +73,30 @@ def _check(prompt: str, user: str) -> list[str]:
 def test_every_model_input_carries_dates(local_storage, state, tmp_path):
     b = make_brain(local_storage, state, tmp_path, fake_llm=True, llm=FAKE_LLM_SETTINGS)
     try:
+        b.settings.dream.rebuild_after_updates = 2
         b.vault.put_entity(Person(id="mike-chen", name="Mike Chen"))
         b.vault.put_entity(Person(id="mike-ross", name="Mike Ross"))
-        for text in (
-            "Met Jane Doe about the [[GPU quota migration]]. Does the vendor support MIG on the new nodes?",
-            "Confirmed the vendor does support MIG on the new nodes. [[GPU quota migration]]",
-            "Paired with Mike on the [[GPU quota migration]] rollout plan.",
+        start = datetime.now(UTC) - timedelta(days=60)
+        for i, text in enumerate(
+            (
+                "Met Jane Doe about the [[GPU quota migration]]. Who owns the [[GPU quota migration]] runbook?",
+                "We decided the [[GPU quota migration]] cutover is in March.",
+                "Confirmed the vendor does support MIG on the new nodes. [[GPU quota migration]]",
+                "The [[GPU quota migration]] cutover moved to May instead of March.",
+                "Paired with Mike on the [[GPU quota migration]] rollout plan.",
+            )
         ):
+            b.vault.clock = lambda i=i: start + timedelta(days=12 * i)
             entry = b.jot(text).entry
             assert not b.process(entry.id).failed
         b.brief("gpu-quota-migration")
         b.brief("Jane Doe")
         b.ask("does the vendor support MIG?")
+        b.dream()
         called = {name for name, _ in b.llm.calls}
-        assert {"extract", "resolve", "answers", "thread_summary", "brief", "ask"} <= called, called
+        expected = {"extract", "resolve", "answers", "thread_summary", "brief", "ask"}
+        expected |= {"dream_supersede", "dream_answers", "dream_now", "dream_sweep"}
+        assert expected <= called, expected - called
         problems = [p for name, user in b.llm.calls for p in _check(name, user)]
         assert not problems, "\n".join(problems)
     finally:

@@ -74,6 +74,8 @@ CREATE TABLE threads (
   merged_into     TEXT,
   summary         TEXT,
   summary_through TEXT,                 -- last entry the summary covers
+  now_line        TEXT,                 -- one line on where it stands (generated/dreams/now)
+  now_through     TEXT,                 -- last entry the now line covers
   last_activity   TEXT,                 -- max(created_at) of linked fragments
   last_entry      TEXT                  -- entry of the newest linked fragment
 );
@@ -107,13 +109,24 @@ CREATE INDEX edges_owner ON edges(owner);
 
 CREATE TABLE review_items (
   id         TEXT PRIMARY KEY,          -- stable hash of (kind, owner, subject)
-  kind       TEXT NOT NULL,             -- new_person|new_org|ambiguous_mention|proposed_theme|proposed_thread|proposed_answer|orphaned_decision
+  kind       TEXT NOT NULL,             -- new_person|new_org|ambiguous_mention|proposed_theme|proposed_thread|proposed_answer|dream_obe|orphaned_decision
   entry_id   TEXT,
   created_at TEXT NOT NULL,
   payload    TEXT NOT NULL,             -- JSON
   owner      TEXT NOT NULL
 );
 CREATE INDEX review_owner ON review_items(owner);
+
+CREATE TABLE suggestions (              -- dream verdicts on items in the OBE sweep
+  fragment_id     TEXT PRIMARY KEY,
+  verdict         TEXT NOT NULL,        -- still_open|probably_resolved|unclear
+  evidence        TEXT,                 -- later fragment the verdict rests on
+  reason          TEXT NOT NULL,
+  citations       TEXT NOT NULL,        -- JSON list of entry ids
+  checked_through TEXT,                 -- newest entry the verdict took into account
+  owner           TEXT NOT NULL
+);
+CREATE INDEX suggestions_owner ON suggestions(owner);
 
 CREATE TABLE embeddings (               -- rowid is shared with vec_items
   rowid        INTEGER PRIMARY KEY,

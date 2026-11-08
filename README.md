@@ -117,9 +117,11 @@ brain uses the OS trust store.
 | `brain brief TARGET` | Re-entry brief on a thread, person, org, theme, or free text |
 | `brain ask "QUESTION"` | Answer from the journal, citing dated entries |
 | `brain show [ENTRY]` | An entry's fragments with ids and status (default: latest) |
-| `brain status FRAGMENT --obe/--speculative/--confirmed/--closed/--open/--dream` | Change a fragment's status |
+| `brain status FRAGMENT --obe/--speculative/--confirmed/--closed/--open/--someday` | Change a fragment's status |
 | `brain thread list/rename/pin/archive/obe/merge/split/move/show` | Manage threads |
 | `brain sweep` | Go through stale open items, unconfirmed speculation, and quiet threads |
+| `brain dream [--dry-run] [--thread ID]` | Offline consolidation: rebuild stale summaries, propose superseded and answered items, check the sweep, write each thread's Now line |
+| `brain context [--format json]` | A short, dated summary of current state for agent sessions |
 | `brain process` | Run any pending extraction and stale thread summaries |
 | `brain reextract [IDS] [--since D] [--stale-prompts]` | Re-run extraction after a model or prompt change; your decisions are kept |
 | `brain sync [--full]` | Bring the local index up to date with the store |
@@ -139,7 +141,7 @@ and processes new entries in the background. While it runs, `brain jot` hands
 new entries to it instead of processing them in the foreground. Pages: active
 threads, thread/person/org/theme pages with a filterable timeline, "Brief me",
 and thread actions (pin, archive, overcome by events, rename, merge, split);
-review queue; search and ask; entries with an editor; dreams; "Tidy up" (the
+review queue; search and ask; entries with an editor; someday ideas; "Tidy up" (the
 overcome-by-events sweep); and a graph of how threads, people, orgs, and
 themes connect.
 
@@ -173,8 +175,15 @@ claude mcp add --scope user brain \
   -- brain mcp
 ```
 
-Tools: `search`, `ask`, `brief`, `get_entity`, `get_entry`, `list_active`, and
-`add_entry` (writes only when you ask the agent to record something).
+Tools: `search`, `ask`, `brief`, `get_entity`, `get_entry`, `list_active`,
+`get_context`, and `add_entry` (writes only when you ask the agent to record
+something). Every result has today's date and an age for each dated item.
+
+`brain mcp` puts a short summary of current state (`brain context`) in its
+instructions, so the agent starts each session knowing the active threads and
+open items; it is also the resource `brain://context`. With the HTTP form, or
+for other agents, a Claude Code `SessionStart` hook that runs `brain context`
+does the same; see [docs/usage.md](docs/usage.md#agents).
 
 ## Development
 

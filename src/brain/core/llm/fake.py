@@ -348,6 +348,70 @@ def heuristic_ask(user: str) -> dict[str, Any]:
     }
 
 
+_CHANGE = re.compile(r"\b(now|instead|moved|changed|no longer|actually|cancel+ed|postponed|pushed)\b", re.I)
+
+
+def _overlap(a: str, b: str) -> float:
+    x, y = _words(a), _words(b)
+    return len(x & y) / len(x | y) if x and y else 0.0
+
+
+def heuristic_supersede(user: str) -> dict[str, Any]:
+    """A later fragment that shares most words with an earlier one and says something changed."""
+    frags = re.findall(r'<fragment id="([^"]+)"[^>]*>(.*?)</fragment>', user)
+    pairs = []
+    for i, (old_id, old) in enumerate(frags):
+        for new_id, new in frags[i + 1 :]:
+            if _CHANGE.search(new) and _overlap(old, new) >= 0.3:
+                pairs.append(
+                    {"older": old_id, "newer": new_id, "reason": "a later fragment changes it", "confidence": 0.8}
+                )
+                break
+    return {"pairs": pairs}
+
+
+def heuristic_sweep(user: str) -> dict[str, Any]:
+    items = [(_attrs(tag), text) for tag, text in re.findall(r"<item ([^>]*)>(.*?)</item>", user)]
+    later = [(_attrs(tag), text) for tag, text in re.findall(r"<later ([^>]*)>(.*?)</later>", user)]
+    checks = []
+    for a, text in items:
+        best = max(
+            ((la, _overlap(text, lt)) for la, lt in later if la.get("item") == a["id"]),
+            key=lambda x: x[1],
+            default=(None, 0.0),
+        )
+        if best[0] is not None and best[1] >= 0.3:
+            ev = best[0]
+            checks.append(
+                {
+                    "item": a["id"],
+                    "verdict": "probably_resolved",
+                    "evidence": ev["id"],
+                    "reason": "a later fragment covers it",
+                    "confidence": 0.8,
+                    "citations": [a["entry"], ev["entry"]],
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "item": a["id"],
+                    "verdict": "still_open",
+                    "reason": "nothing later covers it",
+                    "citations": [a["entry"]],
+                }
+            )
+    return {"checks": checks}
+
+
+def heuristic_now(user: str) -> dict[str, Any]:
+    frags = re.findall(r'<fragment entry="([^"]+)"[^>]*>(.*?)</fragment>', user)
+    if not frags:
+        return {"line": "No recent activity.", "citations": []}
+    entry, text = frags[-1]
+    return {"line": text[:160], "citations": [entry]}
+
+
 DEFAULT_RESPONDERS: dict[str, Responder] = {
     "extract": heuristic_extract,
     "resolve": heuristic_resolve,
@@ -355,6 +419,10 @@ DEFAULT_RESPONDERS: dict[str, Responder] = {
     "thread_summary": heuristic_summary,
     "brief": heuristic_brief,
     "ask": heuristic_ask,
+    "dream_supersede": heuristic_supersede,
+    "dream_answers": heuristic_answers,
+    "dream_sweep": heuristic_sweep,
+    "dream_now": heuristic_now,
 }
 
 

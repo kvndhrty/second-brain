@@ -54,7 +54,16 @@ async def call(client: Client, tool: str, **args):
 async def test_tools_are_listed_with_schemas_and_hints(server):
     async with Client(server) as c:
         tools = {t.name: t for t in (await c.list_tools()).tools}
-        assert set(tools) == {"search", "ask", "brief", "get_entity", "get_entry", "list_active", "add_entry"}
+        assert set(tools) == {
+            "search",
+            "ask",
+            "brief",
+            "get_entity",
+            "get_entry",
+            "list_active",
+            "add_entry",
+            "get_context",
+        }
         for name, t in tools.items():
             assert t.description and t.output_schema, name
             assert t.annotations.read_only_hint is (name != "add_entry"), name
@@ -145,8 +154,24 @@ async def test_stdio_subprocess(tmp_path: Path):
         env=env,
     )
     async with Client(params, read_timeout_seconds=60) as c:
-        assert len((await c.list_tools()).tools) == 7
+        assert len((await c.list_tools()).tools) == 8
+        assert "Current state of the journal" in (c.instructions or "")  # injected at session start
         added, err = await call(c, "add_entry", text=ENTRY)
         assert err is None and added["processed"]
+        assert added["today"] and added["fragments"][0]["age_days"] == 0
         answer, _ = await call(c, "ask", question="when does the eval cluster move?")
         assert answer["claims"]
+
+
+async def test_context_resource_and_tool(server, brain):
+    async with Client(server) as c:
+        added, err = await call(c, "add_entry", text=ENTRY)
+        assert err is None and added["processed"]
+        assert "Current state" not in (c.instructions or "")  # only `brain mcp` puts it in the instructions
+        r = await c.read_resource("brain://context")
+        text = r.contents[0].text
+        assert text.startswith("# brain: ") and "GPU quota migration [gpu-quota-migration]" in text
+        tool = await c.call_tool("get_context", {})
+        assert not tool.is_error and tool.content[0].text == text
+        active, _ = await call(c, "list_active")
+        assert active["today"] and active["threads"][0]["last_activity_age_days"] == 0

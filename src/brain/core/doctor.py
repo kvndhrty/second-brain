@@ -78,6 +78,7 @@ class Doctor:
         self.check_llm(settings)
         if storage is not None:
             self.check_index(settings, storage)
+            self.check_dream(storage)
         return self.results
 
     # --- config and runtime ----------------------------------------------------
@@ -416,6 +417,33 @@ class Doctor:
                 self.add("file", "warn", f"... and {total - len(problems)} more files with problems")
         finally:
             idx.close()
+
+    def check_dream(self, storage: Storage) -> None:
+        from brain.core.formats.sidecars import DreamRun, DreamState
+        from brain.core.formats.yamlio import FormatError
+        from brain.core.storage.base import NotFound
+
+        try:
+            state = DreamState.parse(storage.get(keys.DREAM_STATE), where=keys.DREAM_STATE)
+            if not state.last_run:
+                raise NotFound(keys.DREAM_STATE)
+            run = DreamRun.parse(storage.get(keys.dream_run_key(state.last_run)), where=state.last_run)
+        except NotFound:
+            self.add("dream", "info", "no dream pass yet; `brain dream` runs one (`brain start` does on a schedule)")
+            return
+        except (StorageError, FormatError) as e:
+            self.add("dream", "warn", f"cannot read the last dream pass: {e}")
+            return
+        when = (run.finished_at or run.started_at).astimezone().strftime("%Y-%m-%d %H:%M")
+        detail = f"last pass {when}: {run.calls} model calls, {len(run.applied)} applied, {len(run.proposed)} proposed"
+        if run.errors:
+            self.add(
+                "dream", "warn", f"{detail}; {len(run.errors)} failed: {run.errors[-1]}", "Run `brain dream` again."
+            )
+        elif run.budget_exhausted:
+            self.add("dream", "info", f"{detail}; stopped at [dream] max_calls, the next pass continues")
+        else:
+            self.add("dream", "ok", detail)
 
 
 def _filesystem_type(path: Path, mounts: str | None = None) -> str | None:
