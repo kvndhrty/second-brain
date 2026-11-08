@@ -442,7 +442,10 @@ def status(
     open_: Annotated[bool, typer.Option("--open", help="Reopen a question or action item.")] = False,
     closed: Annotated[bool, typer.Option("--closed", help="Close a question or action item.")] = False,
     note: Annotated[str | None, typer.Option(help="Note on closing.")] = None,
-    dream: Annotated[bool | None, typer.Option("--dream/--not-dream", help="Mark or unmark as a dream.")] = None,
+    someday: Annotated[
+        bool | None,
+        typer.Option("--someday/--not-someday", help="Mark or unmark as someday: a big idea not tied to current work."),
+    ] = None,
 ) -> None:
     """Change a fragment's status. Stored in the entry's decisions file, so it survives re-extraction."""
     from brain.core.services import FragmentChange
@@ -457,7 +460,7 @@ def status(
         obe_date=when.date() if when else None,
         state="open" if open_ else "closed" if closed else None,
         closed_note=note,
-        dream=dream,
+        someday=someday,
     )
     if change == FragmentChange():
         raise _fail("nothing to change; see `brain status --help`", 2)

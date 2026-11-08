@@ -32,6 +32,6 @@ export const question: Fragment = {
   text: "Does the vendor support MIG?",
   status: "confirmed",
   state: "open",
-  dream: false,
+  someday: false,
   obe_reason: null,
 };

@@ -56,7 +56,7 @@ class FragmentChange:
     obe_date: date | None = None
     state: OpenState | None = None
     closed_note: str | None = None
-    dream: bool | None = None
+    someday: bool | None = None
 
 
 def index_path(settings: Settings, storage: Storage) -> Path:
@@ -258,8 +258,8 @@ class Brain:
         if change.state is not None:
             fd.state = change.state
             fd.closed_note = change.closed_note if change.state == "closed" else None
-        if change.dream is not None:
-            fd.dream = change.dream
+        if change.someday is not None:
+            fd.someday = change.someday
         d.fragments[fragment_id] = fd
         self.vault.put_decisions(d)
 
@@ -292,8 +292,8 @@ class Brain:
     def recent_entries(self, *, limit: int = 50, before: str | None = None) -> list[views.EntrySummary]:
         return views.recent_entries(self.db.conn, limit=limit, before=before)
 
-    def dreams(self) -> list[views.FragmentView]:
-        return views.dreams(self.db.conn)
+    def someday(self) -> list[views.FragmentView]:
+        return views.someday(self.db.conn)
 
     def timeline(self, node_id: str) -> list[views.TimelineFragment]:
         return views.node_timeline(self.db.conn, node_id)

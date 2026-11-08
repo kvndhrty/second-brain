@@ -12,7 +12,7 @@ import json
 import sys
 from array import array
 from datetime import datetime
-from typing import Literal, Self
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -109,11 +109,19 @@ class ExtractedFragment(BaseModel):
     span: tuple[int, int] | None = None
     quote: str = ""
     status: Status = "confirmed"
-    dream: bool = False
+    someday: bool = False
     state: OpenState | None = None
     mentions: list[MentionRef] = Field(default_factory=list)
     themes: list[ThemeRef] = Field(default_factory=list)
     threads: list[ThreadRef] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_dream(cls, data: Any) -> Any:
+        # Before 0.1.0 this flag was called `dream`; that word now means offline consolidation.
+        if isinstance(data, dict) and "dream" in data and "someday" not in data:
+            data = {("someday" if k == "dream" else k): v for k, v in data.items()}
+        return data
 
 
 class Extraction(Sidecar):

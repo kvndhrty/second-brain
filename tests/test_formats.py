@@ -7,7 +7,14 @@ import pytest
 from brain.core.formats.decisions import Decisions, FragmentDecision
 from brain.core.formats.entity import Person, Thread, parse_entity
 from brain.core.formats.entry import Entry, content_hash
-from brain.core.formats.sidecars import EmbeddingFile, EmbeddingItem, Extraction, ThreadRef, encode_vector
+from brain.core.formats.sidecars import (
+    EmbeddingFile,
+    EmbeddingItem,
+    ExtractedFragment,
+    Extraction,
+    ThreadRef,
+    encode_vector,
+)
 from brain.core.formats.yamlio import FormatError, UnsupportedFormat
 
 EST = timezone(timedelta(hours=-4))
@@ -122,10 +129,10 @@ def test_decisions_roundtrip_and_typo_rejected():
 
 
 def test_decisions_edit_keeps_comments():
-    d = Decisions.parse("entry: e-1  # the standup\nfragments:\n  f-1:\n    dream: true  # someday\n")
+    d = Decisions.parse("entry: e-1  # the standup\nfragments:\n  f-1:\n    someday: true  # big idea\n")
     d.fragments["f-2"] = FragmentDecision(state="closed")
     out = d.to_text()
-    assert "# the standup" in out and "# someday" in out and "state: closed" in out
+    assert "# the standup" in out and "# big idea" in out and "state: closed" in out
 
 
 def test_thread_ref_requires_exactly_one_target():
@@ -157,3 +164,12 @@ def test_extraction_parse():
     )
     back = Extraction.parse(x.to_bytes(), where="x")
     assert back.fragments[0].threads[0].surface == "T"
+
+
+def test_old_dream_key_is_read_as_someday():
+    # The flag was called `dream` before 0.1.0; files written then must still load.
+    d = Decisions.parse("entry: e-1\nfragments:\n  f-1:\n    dream: true  # big idea\n")
+    assert d.fragments["f-1"].someday is True
+    assert "dream" not in d.to_text() and "someday: true" in d.to_text()
+    frag = ExtractedFragment.model_validate({"id": "f-1", "kind": "idea", "text": "x", "dream": True})
+    assert frag.someday is True

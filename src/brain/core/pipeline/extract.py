@@ -93,7 +93,7 @@ def extract(ctx: PipelineContext, entry: Entry, previous: Extraction | None) -> 
                 span=span,
                 quote=x.quote,
                 status=x.status,
-                dream=x.dream,
+                someday=x.someday,
                 mentions=_dedupe(
                     [MentionRef(surface=m.name.strip(), type=m.type) for m in x.mentions if m.name.strip()]
                 ),

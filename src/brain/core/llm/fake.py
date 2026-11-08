@@ -265,7 +265,7 @@ def heuristic_extract(user: str) -> dict[str, Any]:
                 "text": re.sub(r"\s*#[\w-]+", "", clean).strip(),
                 "quote": s,
                 "status": status,
-                "dream": "someday" in low,
+                "someday": "someday" in low,
                 "mentions": [{"name": p, "type": "person"} for p in people]
                 + [{"name": o, "type": "org"} for o in orgs],
                 "themes": themes,

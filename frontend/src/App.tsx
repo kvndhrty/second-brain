@@ -3,7 +3,7 @@ import { NavLink, Route, Routes } from "react-router-dom";
 import { api } from "./api";
 import { useInterval, useLoad } from "./hooks";
 import { ActivePage } from "./pages/Active";
-import { DreamsPage } from "./pages/Dreams";
+import { SomedayPage } from "./pages/Someday";
 import { EditorPage, EntriesPage, EntryPage } from "./pages/Entries";
 import { EntityListPage, EntityPage } from "./pages/Entity";
 import { ReviewPage } from "./pages/Review";
@@ -37,7 +37,7 @@ export function App() {
         <NavLink to="/people">People</NavLink>
         <NavLink to="/orgs">Orgs</NavLink>
         <NavLink to="/themes">Themes</NavLink>
-        <NavLink to="/dreams">Dreams</NavLink>
+        <NavLink to="/someday">Someday</NavLink>
         <NavLink to="/tidy">Tidy up</NavLink>
         <NavLink to="/graph">Graph</NavLink>
         <footer className="muted">
@@ -66,7 +66,7 @@ export function App() {
           <Route path="/orgs" element={<EntityListPage type="org" title="Organizations" />} />
           <Route path="/themes" element={<EntityListPage type="theme" title="Themes" />} />
           <Route path="/e/:nodeId" element={<EntityPage />} />
-          <Route path="/dreams" element={<DreamsPage />} />
+          <Route path="/someday" element={<SomedayPage />} />
           <Route path="/tidy" element={<SweepPage />} />
           <Route
             path="/graph"

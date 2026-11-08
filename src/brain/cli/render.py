@@ -150,6 +150,6 @@ def print_fragments(out: Console, fragments: list[FragmentRow]) -> None:
         flags = [f.kind, f.status]
         if f.state:
             flags.append(f.state)
-        if f.dream:
-            flags.append("dream")
+        if f.someday:
+            flags.append("someday")
         out.print(f"• {escape(f.text)}\n  [dim]{' · '.join(flags)} · {f.id}[/dim]")

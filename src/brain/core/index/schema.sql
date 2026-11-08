@@ -51,7 +51,7 @@ CREATE TABLE fragments (
   text          TEXT NOT NULL,
   status        TEXT NOT NULL,          -- confirmed|speculative|overcome_by_events
   status_origin TEXT NOT NULL,          -- llm|user
-  dream         INTEGER NOT NULL DEFAULT 0,
+  someday       INTEGER NOT NULL DEFAULT 0,
   state         TEXT,                   -- open|closed (questions and action items)
   state_origin  TEXT NOT NULL DEFAULT 'llm',  -- llm|user: whether you set the state yourself
   closed_note   TEXT,

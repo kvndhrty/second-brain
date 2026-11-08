@@ -33,7 +33,7 @@ class XFragment(BaseModel):
     text: str
     quote: str = Field(description="exact substring of the entry")
     status: Literal["confirmed", "speculative"] = "confirmed"
-    dream: bool = False
+    someday: bool = False
     mentions: list[XMention] = Field(default_factory=list)
     themes: list[XTheme] = Field(default_factory=list)
     threads: list[XThread] = Field(default_factory=list)

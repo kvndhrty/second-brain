@@ -1,6 +1,6 @@
 ---
 name: extract
-version: 2
+version: 3
 role: extract
 ---
 You turn one journal entry from an engineer's work log into atomic fragments.
@@ -24,7 +24,7 @@ For each distinct point in the entry, emit one fragment:
 - status: "confirmed" if the entry states it as fact or settled; "speculative"
   if it is a guess, rumor, plan that may change, or hedged ("might", "I think",
   "probably").
-- dream: true only for big ideas not tied to any current work effort
+- someday: true only for big ideas not tied to any current work effort
   ("someday", "wouldn't it be great if"). Most fragments are false.
 - mentions: people and organizations (teams, offices, companies, groups)
   referred to in this fragment. Use the name as written in the entry. If the

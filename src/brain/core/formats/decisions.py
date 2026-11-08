@@ -7,9 +7,9 @@ shows up in `brain doctor` instead of being silently ignored.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, model_validator
 from ruamel.yaml.comments import CommentedMap
 
 from brain.core.formats.entity import ObeInfo
@@ -33,13 +33,21 @@ class FragmentDecision(BaseModel):
 
     status: Status | None = None
     obe: ObeInfo | None = None
-    dream: bool | None = None
+    someday: bool | None = None
     state: OpenState | None = None
     closed_note: str | None = None
     threads: ThreadChange | None = None
     answers: list[str] | None = None  # question/action fragments this one answers (accepted)
     not_answers: list[str] | None = None  # proposed answer links you rejected
     deleted: bool | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_dream(cls, data: Any) -> Any:
+        # Before 0.1.0 this flag was called `dream`; that word now means offline consolidation.
+        if isinstance(data, dict) and "dream" in data and "someday" not in data:
+            data = {("someday" if k == "dream" else k): v for k, v in data.items()}
+        return data
 
 
 class Decisions(BaseModel):

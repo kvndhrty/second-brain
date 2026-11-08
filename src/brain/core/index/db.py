@@ -15,7 +15,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 MIN_SQLITE = (3, 41, 0)
 
 

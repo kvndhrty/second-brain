@@ -50,7 +50,7 @@ class FragmentPatch(BaseModel):
     obe_reason: str | None = None
     state: Literal["open", "closed"] | None = None
     closed_note: str | None = None
-    dream: bool | None = None
+    someday: bool | None = None
 
 
 class AskIn(BaseModel):
@@ -231,9 +231,9 @@ def create_app(
     def entry(entry_id: str) -> Any:
         return _data(call(lambda b: b.entry(entry_id)))
 
-    @app.get("/api/dreams")
-    def dreams() -> Any:
-        return _data(call(lambda b: b.dreams()))
+    @app.get("/api/someday")
+    def someday() -> Any:
+        return _data(call(lambda b: b.someday()))
 
     @app.get("/api/review")
     def review_items() -> Any:

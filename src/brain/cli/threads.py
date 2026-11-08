@@ -130,7 +130,7 @@ def show(thread_id: str) -> None:
 def _row(f):
     from brain.core.index.queries import FragmentRow
 
-    return FragmentRow(f.id, f.entry_id, f.kind, f.text, f.status, f.state, f.dream, None, f.obe_reason, f.date)
+    return FragmentRow(f.id, f.entry_id, f.kind, f.text, f.status, f.state, f.someday, None, f.obe_reason, f.date)
 
 
 def run_sweep(b: Brain, *, days: int, quiet_days: int) -> None:

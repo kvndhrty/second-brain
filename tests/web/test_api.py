@@ -70,11 +70,11 @@ def test_edit_entry_marks_it_for_processing(client, brain):
     assert client.get("/api/status").json()["pending"] == 1
 
 
-def test_fragment_patch_dreams_and_review(client, brain):
+def test_fragment_patch_someday_and_review(client, brain):
     eid = processed(client, brain, "Someday we could build a self-serve portal. Met with Zed about it.")
     frag = client.get(f"/api/entries/{eid}").json()["fragments"][0]["id"]
-    assert client.patch(f"/api/fragments/{frag}", json={"dream": True}).status_code == 200
-    assert [f["id"] for f in client.get("/api/dreams").json()] == [frag]
+    assert client.patch(f"/api/fragments/{frag}", json={"someday": True}).status_code == 200
+    assert [f["id"] for f in client.get("/api/someday").json()] == [frag]
     item = next(i for i in client.get("/api/review").json() if i["payload"].get("surface") == "Zed")
     r = post(client, f"/api/review/{item['id']}", {"action": "create", "name": "Zed Shaw", "role": "SRE"})
     assert r.status_code == 200

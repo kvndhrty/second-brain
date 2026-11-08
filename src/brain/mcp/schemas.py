@@ -14,7 +14,7 @@ class Fragment(BaseModel):
     text: str
     status: str = Field(description="confirmed, speculative, or overcome_by_events")
     state: str | None = Field(default=None, description="open or closed, for questions and action items")
-    dream: bool = False
+    someday: bool = False
     obe_reason: str | None = None
 
 

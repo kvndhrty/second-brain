@@ -8,7 +8,7 @@ export interface Fragment {
   text: string;
   status: "confirmed" | "speculative" | "overcome_by_events";
   state: "open" | "closed" | null;
-  dream: boolean;
+  someday: boolean;
   obe_reason: string | null;
 }
 
@@ -160,7 +160,7 @@ export interface FragmentPatch {
   obe_reason?: string | null;
   state?: "open" | "closed";
   closed_note?: string | null;
-  dream?: boolean;
+  someday?: boolean;
 }
 
 export interface ReviewDecision {
@@ -232,7 +232,7 @@ export const api = {
     request<{ id: string }>("POST", "/api/entries", { text, title: title || null }),
   updateEntry: (id: string, text: string, title?: string | null) =>
     request<{ id: string }>("PUT", `/api/entries/${q(id)}`, { text, title: title || null }),
-  dreams: () => request<Fragment[]>("GET", "/api/dreams"),
+  someday: () => request<Fragment[]>("GET", "/api/someday"),
   review: () => request<ReviewItem[]>("GET", "/api/review"),
   resolve: (id: string, decision: ReviewDecision) => request<unknown>("POST", `/api/review/${q(id)}`, decision),
   choices: (type: string, text: string) => request<Candidate[]>("GET", `/api/choices/${type}?q=${q(text)}`),

@@ -80,7 +80,7 @@ export function FragmentCard({
         <Badge tone={f.kind}>{KIND_LABEL[f.kind] ?? f.kind}</Badge>
         {f.status !== "confirmed" && <Badge tone={f.status}>{STATUS_LABEL[f.status]}</Badge>}
         {f.state && <Badge tone={f.state}>{f.state}</Badge>}
-        {f.dream && <Badge tone="dream">dream</Badge>}
+        {f.someday && <Badge tone="someday">someday</Badge>}
         {f.obe_reason && <span className="muted">({f.obe_reason})</span>}
         <EntryLink id={f.entry_id}>{f.date}</EntryLink>
         {links.map((l) => (
@@ -112,8 +112,8 @@ export function FragmentCard({
             Reopen
           </button>
         )}
-        <button disabled={busy} onClick={() => void change({ dream: !f.dream })}>
-          {f.dream ? "Not a dream" : "Dream"}
+        <button disabled={busy} onClick={() => void change({ someday: !f.someday })}>
+          {f.someday ? "Not someday" : "Someday"}
         </button>
         {error && <span className="error">{error}</span>}
       </div>

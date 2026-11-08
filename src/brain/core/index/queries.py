@@ -263,7 +263,7 @@ class FragmentRow:
     text: str
     status: str
     state: str | None
-    dream: bool
+    someday: bool
     obe_date: str | None
     obe_reason: str | None
     created_at: str
@@ -277,14 +277,14 @@ def _frag(r: sqlite3.Row) -> FragmentRow:
         r["text"],
         r["status"],
         r["state"],
-        bool(r["dream"]),
+        bool(r["someday"]),
         r["obe_date"],
         r["obe_reason"],
         r["created_at"],
     )
 
 
-FRAGMENT_COLS = "f.id, f.entry_id, f.kind, f.text, f.status, f.state, f.dream, f.obe_date, f.obe_reason, f.created_at"
+FRAGMENT_COLS = "f.id, f.entry_id, f.kind, f.text, f.status, f.state, f.someday, f.obe_date, f.obe_reason, f.created_at"
 
 
 def fragments_linked_to(

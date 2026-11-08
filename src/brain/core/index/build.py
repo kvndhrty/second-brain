@@ -372,10 +372,10 @@ class UnitBuilder:
         if status == "overcome_by_events" and d.obe:
             obe_date = d.obe.date.isoformat() if d.obe.date else None
             obe_reason = d.obe.reason
-        dream = frag.dream if d.dream is None else d.dream
+        someday = frag.someday if d.someday is None else d.someday
         span = frag.span or (None, None)
         self.conn.execute(
-            "INSERT OR REPLACE INTO fragments(id, entry_id, kind, text, status, status_origin, dream, state, "
+            "INSERT OR REPLACE INTO fragments(id, entry_id, kind, text, status, status_origin, someday, state, "
             "state_origin, closed_note, obe_date, obe_reason, span_start, span_end, quote, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
@@ -385,7 +385,7 @@ class UnitBuilder:
                 frag.text,
                 status,
                 "user" if d.status else "llm",
-                int(dream),
+                int(someday),
                 state,
                 "user" if d.state else "llm",
                 d.closed_note,

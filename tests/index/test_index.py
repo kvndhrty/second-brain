@@ -56,7 +56,7 @@ def fragments(entry_id: str) -> list[dict]:
             "kind": "idea",
             "text": "A self-serve quota portal.",
             "status": "speculative",
-            "dream": True,
+            "someday": True,
         },
     ]
 
@@ -144,7 +144,7 @@ def rows(brain, sql, *args):
 def test_index_reflects_files(brain):
     eid, other = seed(brain)
     assert rows(brain, "SELECT id, extraction FROM entries ORDER BY id") == [(eid, "current"), (other, "pending")]
-    frags = {r[0]: r[1:] for r in rows(brain, "SELECT id, kind, status, dream, state FROM fragments")}
+    frags = {r[0]: r[1:] for r in rows(brain, "SELECT id, kind, status, someday, state FROM fragments")}
     assert frags[f"f-{eid}-01"] == ("decision", "confirmed", 0, None)
     assert frags[f"f-{eid}-02"] == ("question", "confirmed", 0, "open")
     assert frags[f"f-{eid}-03"] == ("idea", "speculative", 1, None)

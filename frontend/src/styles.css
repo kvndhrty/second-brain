@@ -9,7 +9,7 @@
   --error: #c0392b;
   --speculative: #a66a00;
   --obe: #8a8a8a;
-  --dream: #7a5af5;
+  --someday: #7a5af5;
   --open: #1f7a4d;
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 15px;
@@ -29,7 +29,7 @@
     --error: #ff6b5e;
     --speculative: #e0a640;
     --obe: #7c7c84;
-    --dream: #a38cff;
+    --someday: #a38cff;
     --open: #4cc38a;
   }
 }
@@ -231,9 +231,9 @@ a.card:hover {
   color: var(--obe);
 }
 
-.badge.dream {
-  color: var(--dream);
-  border-color: var(--dream);
+.badge.someday {
+  color: var(--someday);
+  border-color: var(--someday);
 }
 
 .badge.proposed,

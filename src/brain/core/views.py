@@ -39,7 +39,7 @@ class FragmentView:
     text: str
     status: str
     state: str | None
-    dream: bool
+    someday: bool
     obe_reason: str | None
 
 
@@ -73,7 +73,7 @@ class EntryView:
 
 def fragment_view(f: queries.FragmentRow) -> FragmentView:
     return FragmentView(
-        f.id, f.entry_id, iso_day(f.created_at), f.kind, f.text, f.status, f.state, f.dream, f.obe_reason
+        f.id, f.entry_id, iso_day(f.created_at), f.kind, f.text, f.status, f.state, f.someday, f.obe_reason
     )
 
 
@@ -265,9 +265,9 @@ def recent_entries(conn: sqlite3.Connection, *, limit: int = 50, before: str | N
     return [EntrySummary(r[0], r[1][:16], r[2], _snippet(r[3]), r[4] == "done", r[5]) for r in rows]
 
 
-def dreams(conn: sqlite3.Connection) -> list[FragmentView]:
+def someday(conn: sqlite3.Connection) -> list[FragmentView]:
     rows = conn.execute(
-        f"SELECT {queries.FRAGMENT_COLS} FROM fragments f WHERE f.dream = 1 ORDER BY f.created_at DESC, f.id DESC"
+        f"SELECT {queries.FRAGMENT_COLS} FROM fragments f WHERE f.someday = 1 ORDER BY f.created_at DESC, f.id DESC"
     ).fetchall()
     return [fragment_view(queries._frag(r)) for r in rows]
 

@@ -119,11 +119,11 @@ def test_edit_keeps_fragment_ids_and_decisions(brain):
 
 def test_reextract_reuses_ids_and_reports_orphans(brain):
     eid = jot(brain, FIRST)
-    brain.set_fragment(f"f-{eid}-02", FragmentChange(dream=True))
+    brain.set_fragment(f"f-{eid}-02", FragmentChange(someday=True))
     before = sorted(r[0] for r in rows(brain, "SELECT id FROM fragments"))
     brain.reextract([eid])
     assert sorted(r[0] for r in rows(brain, "SELECT id FROM fragments")) == before
-    assert rows(brain, "SELECT dream FROM fragments WHERE id = ?", f"f-{eid}-02") == [(1,)]
+    assert rows(brain, "SELECT someday FROM fragments WHERE id = ?", f"f-{eid}-02") == [(1,)]
     # A model that now finds nothing: the decision has no fragment to apply to.
     brain.llm.responders["extract"] = {"fragments": []}
     brain.reextract([eid])

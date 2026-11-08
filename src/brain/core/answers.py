@@ -95,8 +95,8 @@ def _fragment_line(f: FragmentRow, *, today: date, since: datetime | None = None
     attrs = [f'entry="{f.entry_id}"', dated(f.created_at, today), f'kind="{f.kind}"', f'status="{f.status}"']
     if f.state:
         attrs.append(f'state="{f.state}"')
-    if f.dream:
-        attrs.append('dream="yes"')
+    if f.someday:
+        attrs.append('someday="yes"')
     if f.obe_reason:
         attrs.append(f'obe_reason="{attr(f.obe_reason)}"')
     if since is not None:
