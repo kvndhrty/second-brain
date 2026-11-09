@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 from brain.core import keys
 from brain.core.formats.decisions import Decisions, FragmentDecision
-from brain.core.formats.entity import Entity, Org, Person, Theme, Thread, parse_entity
+from brain.core.formats.entity import Entity, Org, Person, Theme, Thread, norm_alias, parse_entity
 from brain.core.formats.entry import Entry, content_hash
 from brain.core.formats.sidecars import (
     OPEN_KINDS,
@@ -46,10 +46,6 @@ class UnitFiles:
     def one(self, role: str) -> UnitFile | None:
         files = self.by_role.get(role, [])
         return files[0] if files else None
-
-
-def norm_alias(text: str) -> str:
-    return " ".join(text.casefold().split())
 
 
 def node_id(kind: str, ident: str) -> str:
@@ -345,7 +341,7 @@ class UnitBuilder:
                     self._review(kind, unit, f"{mtype}|{surface}", created, payload, entry.id)
             for p in resolution.answers:
                 d = decisions.fragments.get(p.fragment) or FragmentDecision()
-                if p.answers in (d.answers or []) or p.answers in (d.not_answers or []):
+                if d.decided_answer(p.answers):
                     continue
                 if p.fragment in texts:
                     self._review(
@@ -401,7 +397,7 @@ class UnitBuilder:
                     entry.id,
                 )
             elif p.kind == "answer" and p.other:
-                if p.other in (d.answers or []) or p.other in (d.not_answers or []):
+                if d.decided_answer(p.other):
                     continue
                 self._review(
                     "proposed_answer",

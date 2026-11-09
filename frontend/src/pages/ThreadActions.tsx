@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { api, nodePath, type Candidate, type EntityView, type ThreadOp } from "../api";
+import { api, nodePath, type EntityView, type ThreadOp } from "../api";
+import { EntitySearch } from "../components";
+import { useAction } from "../hooks";
 
 // Pin, archive, retire, rename, merge, and split a thread. Splitting moves the
 // fragments selected in the timeline into a new thread.
@@ -21,33 +23,23 @@ export function ThreadActions({
   const id = thread.id.slice("thread:".length);
   const state = String(thread.details.state ?? "active");
   const pinned = thread.details.pinned === true;
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string>();
+  const { busy, error, run: act } = useAction();
   const [panel, setPanel] = useState<"" | "obe" | "rename" | "merge" | "split">("");
   const [text, setText] = useState("");
   const [cascade, setCascade] = useState(true);
-  const [found, setFound] = useState<Candidate[]>();
 
-  async function run(op: ThreadOp, after?: (result: { id: string }) => void) {
-    setBusy(true);
-    setError(undefined);
-    try {
+  const run = (op: ThreadOp, after?: (result: { id: string }) => void) =>
+    act(async () => {
       const result = await api.threadOp(id, op);
       setPanel("");
       setText("");
       if (after) after(result);
       else onChanged();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
+    });
 
   const open = (p: typeof panel, initial = "") => {
     setPanel(panel === p ? "" : p);
     setText(initial);
-    setFound(undefined);
     setSelecting(p === "split");
   };
 
@@ -114,23 +106,13 @@ export function ThreadActions({
         </div>
       )}
       {panel === "merge" && (
-        <div className="toolbar">
-          <input placeholder="Search threads" value={text} onChange={(e) => setText(e.target.value)} />
-          <button disabled={!text.trim()} onClick={() => void api.choices("thread", text).then(setFound)}>
-            Search
-          </button>
-          {found
-            ?.filter((c) => c.entity_id !== id)
-            .map((c) => (
-              <button
-                key={c.entity_id}
-                disabled={busy}
-                onClick={() => void run({ op: "merge", into: c.entity_id }, (r) => navigate(nodePath(`thread:${r.id}`)))}
-              >
-                Merge into {c.name ?? c.entity_id}
-              </button>
-            ))}
-        </div>
+        <EntitySearch
+          type="thread"
+          label="Merge into"
+          exclude={id}
+          busy={busy}
+          onPick={(into) => void run({ op: "merge", into }, (r) => navigate(nodePath(`thread:${r.id}`)))}
+        />
       )}
       {panel === "split" && (
         <div className="toolbar">

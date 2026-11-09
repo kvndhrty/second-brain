@@ -53,3 +53,32 @@ export function useInterval(fn: () => void, ms: number, active: boolean): void {
     return () => clearInterval(id);
   }, [ms, active]);
 }
+
+export interface Action {
+  busy: boolean;
+  error: string | undefined;
+  run: (fn: () => Promise<unknown>) => Promise<void>;
+}
+
+// Run async actions with a busy flag and an error message. With stayBusy, the
+// flag stays set after success, for actions after which the component goes away
+// (a reloaded list or a new page), so its buttons cannot be pressed twice.
+export function useAction(stayBusy = false): Action {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const run = useCallback(
+    async (fn: () => Promise<unknown>) => {
+      setBusy(true);
+      setError(undefined);
+      try {
+        await fn();
+        if (!stayBusy) setBusy(false);
+      } catch (e) {
+        setError((e as Error).message);
+        setBusy(false);
+      }
+    },
+    [stayBusy],
+  );
+  return { busy, error, run };
+}

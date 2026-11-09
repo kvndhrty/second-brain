@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -155,26 +156,35 @@ class Brain:
             self._llm = LLM(self.settings)
         return self._llm
 
-    def _pipeline(self) -> Pipeline:
+    def _ctx(self) -> PipelineContext:
+        return PipelineContext(self.settings, self.vault, self.db, self.llm)
+
+    def _require_llm(self) -> None:
         if not self.llm.configured:
             raise LLMError("no model endpoint is configured; set [llm] base_url (run `brain init`)")
-        ctx = PipelineContext(self.settings, self.vault, self.db, self.llm)
-        return Pipeline(ctx, self.state)
+
+    @contextmanager
+    def _processing(self, busy: str) -> Iterator[None]:
+        """Hold the processing lock, which keeps the pipeline and dreaming from overlapping across processes."""
+        with self.state.try_lock("process") as got:
+            if not got:
+                raise Busy(busy)
+            yield
+
+    def _pipeline(self) -> Pipeline:
+        self._require_llm()
+        return Pipeline(self._ctx(), self.state)
 
     def process(
         self, entry_id: str, *, force: bool = False, progress: Callable[[str], None] | None = None
     ) -> ProcessReport:
         """Run the pipeline for one entry, then update the summaries of its threads."""
-        with self.state.try_lock("process") as got:
-            if not got:
-                raise Busy("another brain process is processing entries; it will pick this one up")
+        with self._processing("another brain process is processing entries; it will pick this one up"):
             return self._pipeline().process(entry_id, force=force, progress=progress)
 
     def process_pending(self, progress: Callable[[str, str], None] | None = None) -> ProcessReport:
         self.sync()
-        with self.state.try_lock("process") as got:
-            if not got:
-                raise Busy("another brain process is already processing entries")
+        with self._processing("another brain process is already processing entries"):
             return self._pipeline().process_pending(progress)
 
     def reextract(
@@ -188,9 +198,7 @@ class Brain:
         """Re-run extraction even for entries that are current (after a model or prompt change)."""
         self.sync()
         ids = entry_ids or self._select_entries(since=since, stale_prompts=stale_prompts)
-        with self.state.try_lock("process") as got:
-            if not got:
-                raise Busy("another brain process is already processing entries")
+        with self._processing("another brain process is already processing entries"):
             pipeline = self._pipeline()
             report = ProcessReport()
             for eid in ids:
@@ -215,13 +223,9 @@ class Brain:
         current = load_prompt("extract").stamp
         stale = []
         for eid in ids:
-            try:
-                x = Extraction.parse(self.storage.get(keys.extraction_key(eid)), where=eid)
-            except Exception:  # noqa: BLE001 - missing or unreadable: re-extract
-                stale.append(eid)
-                continue
-            if x.prompt != current:
-                stale.append(eid)
+            found = self.vault.read_sidecar(keys.extraction_key(eid), Extraction)
+            if found is None or found[0].prompt != current:
+                stale.append(eid)  # missing, unreadable, or from another prompt version
         return stale
 
     def failures(self) -> dict[str, dict]:
@@ -347,27 +351,21 @@ class Brain:
         cfg = self.settings.context
         return injected.render_markdown(self.context(now=now), max_lines=cfg.max_lines, max_bytes=cfg.max_bytes)
 
-    def _dream_ctx(self) -> PipelineContext:
-        return PipelineContext(self.settings, self.vault, self.db, self.llm)
-
     def dream_plan(self, *, thread: str | None = None) -> dream.DreamPlan:
         """What a dream pass would do, without calling a model."""
         self.sync()
-        return dream.Dreamer(self._dream_ctx(), self.settings.dream).plan(thread=thread)
+        return dream.Dreamer(self._ctx(), self.settings.dream).plan(thread=thread)
 
     def dream(self, *, thread: str | None = None, progress: Callable[[str], None] | None = None):
         """Run one dream pass. Holds the processing lock so it never overlaps the pipeline."""
-        if not self.llm.configured:
-            raise LLMError("no model endpoint is configured; set [llm] base_url (run `brain init`)")
+        self._require_llm()
         self.sync()
-        with self.state.try_lock("process") as got:
-            if not got:
-                raise Busy("another brain process is processing entries or dreaming")
-            dreamer = dream.Dreamer(self._dream_ctx(), self.settings.dream)
+        with self._processing("another brain process is processing entries or dreaming"):
+            dreamer = dream.Dreamer(self._ctx(), self.settings.dream)
             return dreamer.run(dreamer.plan(thread=thread), progress=progress)
 
     def dream_due(self, *, now: datetime | None = None) -> str | None:
-        return dream.is_due(self._dream_ctx(), self.settings.dream, now=now or datetime.now(UTC))
+        return dream.is_due(self._ctx(), self.settings.dream, now=now or datetime.now(UTC))
 
     def last_dream(self):
-        return dream.last_run(self._dream_ctx())
+        return dream.last_run(self._ctx())

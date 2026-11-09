@@ -11,12 +11,13 @@ import socket
 import uuid
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
+from typing import TypeVar
 
 from brain.core import keys
 from brain.core.formats.decisions import Decisions
 from brain.core.formats.entity import ENTITY_MODELS, Entity, parse_entity
 from brain.core.formats.entry import Entry
-from brain.core.formats.sidecars import Generation, StoreFormat
+from brain.core.formats.sidecars import Generation, Sidecar, StoreFormat
 from brain.core.formats.yamlio import FORMAT_VERSION, FormatError, check_format
 from brain.core.index.sync import read_generation
 from brain.core.localstate import LocalState
@@ -25,6 +26,9 @@ from brain.core.storage.lease import Lease
 
 # (key, info, data or None for a delete, previous generation token, new token)
 WriteHook = Callable[[str, ObjectInfo, bytes | None, str | None, str], None]
+
+
+S = TypeVar("S", bound=Sidecar)
 
 
 class Vault:
@@ -215,3 +219,14 @@ class Vault:
 
     def put_bytes(self, key: str, data: bytes) -> None:
         self.write(key, data)
+
+    def read_sidecar(self, key: str, model: type[S]) -> tuple[S, bytes] | None:
+        """The parsed sidecar and its exact bytes, or None if missing or unreadable."""
+        try:
+            data = self.storage.get(key)
+        except NotFound:
+            return None
+        try:
+            return model.parse(data, where=key), data
+        except FormatError:
+            return None  # regenerate rather than fail; `brain doctor` reports the bad file

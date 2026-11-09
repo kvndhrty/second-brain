@@ -30,23 +30,19 @@ class SweepItem:
 
 def sweep_items(conn: sqlite3.Connection, *, now: datetime, days: int = 30, quiet_days: int = 60) -> list[SweepItem]:
     cutoff = (now - timedelta(days=days)).isoformat()
-    rows = conn.execute(
+    frags = queries.select_fragments(
+        conn,
         f"""
-        SELECT {queries.FRAGMENT_COLS} FROM fragments f
-        WHERE f.created_at < ? AND f.status != 'overcome_by_events'
+        f.created_at < ? AND f.status != 'overcome_by_events'
           AND ((f.state = 'open' AND f.state_origin = 'llm')
                OR (f.status = 'speculative' AND f.status_origin = 'llm' AND COALESCE(f.state, '') != 'closed'))
-          AND NOT EXISTS (
-            SELECT 1 FROM edges e JOIN threads t ON e.dst = 'thread:' || t.id
-            WHERE e.src = 'frag:' || f.id AND e.type = 'in_thread' AND t.state IN ('archived', 'obe')
-          )
+          AND NOT {queries.IN_RETIRED_THREAD}
         ORDER BY f.created_at, f.id
         """,
         (cutoff,),
-    ).fetchall()
+    )
     items = []
-    for r in rows:
-        f = queries._frag(r)
+    for f in frags:
         names = [
             x[0]
             for x in conn.execute(

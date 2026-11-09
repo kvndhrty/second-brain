@@ -46,10 +46,10 @@ from brain.core.llm.models import LLMError
 from brain.core.llm.schemas import AnswersOutput, NowOutput, SupersedeOutput, SweepOutput
 from brain.core.pipeline import threads as threads_step
 from brain.core.pipeline.context import PipelineContext
-from brain.core.pipeline.text import attr
-from brain.core.storage.base import NotFound, StorageError
+from brain.core.pipeline.text import attr, check_citations, fragment_el, thread_el
+from brain.core.storage.base import StorageError
 from brain.core.sweep import sweep_items
-from brain.core.temporal import as_of, dated, local_date, today_el
+from brain.core.temporal import as_of, local_date, today_el
 
 SUPERSEDE_FRAGMENTS = 80
 SUPERSEDE_CONFIDENCE = 0.7
@@ -134,9 +134,8 @@ class Dreamer:
 
     # --- planning ------------------------------------------------------------
 
-    def _entries_since(self, family: list[str], through: str | None) -> int:
-        """Distinct entries with fragments in these threads after the watermark entry."""
-        nodes = [f"thread:{x}" for x in family]
+    def _entries_since(self, nodes: list[str], through: str | None) -> int:
+        """Distinct entries with fragments in these thread nodes after the watermark entry."""
         ph = ",".join("?" * len(nodes))
         after = ("", "")
         if through:
@@ -152,10 +151,8 @@ class Dreamer:
         return row[0]
 
     def _briefed(self) -> dict[str, datetime]:
-        try:
-            return BriefState.parse(self.ctx.vault.storage.get(keys.BRIEF_STATE), where=keys.BRIEF_STATE).last
-        except (NotFound, StorageError, ValueError):
-            return {}
+        found = self.ctx.read_sidecar(keys.BRIEF_STATE, BriefState)
+        return found[0].last if found else {}
 
     def _ordered_threads(self, now: datetime, only: str | None) -> list[ThreadRow]:
         if only:
@@ -177,7 +174,7 @@ class Dreamer:
 
     def _newest(self, t: ThreadRow) -> str | None:
         """Newest entry in the thread or any thread merged into it: the watermark every step records."""
-        nodes = [f"thread:{x}" for x in queries.thread_family(self.conn, t.id)]
+        nodes = queries.thread_nodes(self.conn, t.id)
         r = self.conn.execute(
             f"SELECT f.entry_id FROM edges e JOIN fragments f ON e.src = 'frag:' || f.id "
             f"WHERE e.type = 'in_thread' AND e.dst IN ({','.join('?' * len(nodes))}) "
@@ -191,41 +188,34 @@ class Dreamer:
         jobs: list[Job] = []
         threads = self._ordered_threads(now, thread)
         for t in threads:
-            family = queries.thread_family(self.conn, t.id)
+            nodes = queries.thread_nodes(self.conn, t.id)
             ts = self.state.threads.get(t.id, DreamThreadState())
-            since_rebuild = self._entries_since(family, ts.rebuilt_through)
+            since_rebuild = self._entries_since(nodes, ts.rebuilt_through)
             stale_rebuild = ts.rebuilt_at is not None and now - ts.rebuilt_at > timedelta(
                 days=self.cfg.rebuild_after_days
             )
             if t.summary and (since_rebuild >= self.cfg.rebuild_after_updates or (stale_rebuild and since_rebuild)):
                 jobs.append(Job("rebuild", t.id, f"rebuild the summary of {t.name}"))
-            frags = self._thread_fragments(family)
-            if len(frags) >= 2 and self._entries_since(family, ts.supersede_through):
+            frags = self._thread_fragments(t.id)
+            if len(frags) >= 2 and self._entries_since(nodes, ts.supersede_through):
                 jobs.append(Job("supersede", t.id, f"look for superseded fragments in {t.name}"))
-            if self._entries_since(family, ts.answers_through) and self._answer_inputs(frags)[0]:
+            if self._entries_since(nodes, ts.answers_through) and self._answer_inputs(frags)[0]:
                 jobs.append(Job("answers", t.id, f"look for answers to open items in {t.name}"))
             if t.now_through != self._newest(t):
                 jobs.append(Job("now", t.id, f"write the Now line for {t.name}"))
         if thread is None:
-            batch: list[str] = []
-            for fid in self._sweep_candidates(now):
-                batch.append(fid)
-                if len(batch) == SWEEP_BATCH:
-                    jobs.append(Job("sweep", None, f"check {len(batch)} old items for the sweep", batch))
-                    batch = []
-            if batch:
+            cands = self._sweep_candidates(now)
+            for i in range(0, len(cands), SWEEP_BATCH):
+                batch = cands[i : i + SWEEP_BATCH]
                 jobs.append(Job("sweep", None, f"check {len(batch)} old items for the sweep", batch))
         return DreamPlan(jobs, [t.id for t in threads], only=thread)
 
-    def _thread_fragments(self, family: list[str]) -> list[FragmentRow]:
-        frags = queries.fragments_linked_to(
-            self.conn, [f"thread:{x}" for x in family], ("in_thread",), limit=SUPERSEDE_FRAGMENTS
-        )
-        return [f for f in frags if not f.someday]
+    def _thread_fragments(self, thread_id: str) -> list[FragmentRow]:
+        return [f for f in queries.thread_fragments(self.conn, thread_id, limit=SUPERSEDE_FRAGMENTS) if not f.someday]
 
     def _answer_inputs(self, frags: list[FragmentRow]) -> tuple[list[FragmentRow], list[FragmentRow]]:
         """(open items, fragments written after the oldest of them) within one thread."""
-        items = [f for f in frags if f.state == "open" and f.status != "overcome_by_events"]
+        items = [f for f in frags if f.is_open]
         if not items:
             return [], []
         first = min((f.created_at, f.entry_id) for f in items)
@@ -241,7 +231,7 @@ class Dreamer:
                 "SELECT dst FROM edges WHERE src = ? AND type = 'in_thread'", (f"frag:{item.id}",)
             )
         ]
-        family = sorted({f"thread:{x}" for t in threads for x in queries.thread_family(self.conn, t.split(":", 1)[1])})
+        family = sorted({n for t in threads for n in queries.node_family(self.conn, t)})
         found = {f.id: f for f in queries.fragments_linked_to(self.conn, family, ("in_thread",), limit=200)}
         hits = [h.item_id for h in search.keyword(self.conn, item.text, limit=20, types=("fragment",))]
         found.update(queries.fragments_by_id(self.conn, hits))
@@ -350,14 +340,10 @@ class Dreamer:
         if t is None:
             return
         today = local_date(now)
-        frags = [
-            f
-            for f in self._thread_fragments(queries.thread_family(self.conn, t.id))
-            if f.status != "overcome_by_events"
-        ]
+        frags = [f for f in self._thread_fragments(t.id) if f.status != "overcome_by_events"]
         by_id = {f.id: f for f in frags}
-        lines = [today_el(now), _thread_el(t), "<fragments>"]
-        lines += [_fragment_el(f, today) for f in frags]
+        lines = [today_el(now), thread_el(t), "<fragments>"]
+        lines += [fragment_el(f, today) for f in frags]
         lines.append("</fragments>")
 
         def validate(out: SupersedeOutput) -> None:
@@ -404,22 +390,15 @@ class Dreamer:
         if t is None:
             return
         today = local_date(now)
-        items, later = self._answer_inputs(self._thread_fragments(queries.thread_family(self.conn, t.id)))
+        items, later = self._answer_inputs(self._thread_fragments(t.id))
         if not items:
             return
         item_ids = {f.id: f for f in items}
         later_ids = {f.id: f for f in later}
-        lines = [today_el(now), _thread_el(t), "<open_items>"]
-        lines += [
-            f'<item id="{attr(f.id)}" entry="{f.entry_id}" {dated(f.created_at, today)} kind="{f.kind}">{f.text}</item>'
-            for f in items
-        ]
+        lines = [today_el(now), thread_el(t), "<open_items>"]
+        lines += [fragment_el(f, today, tag="item", status=False) for f in items]
         lines += ["</open_items>", "<later_fragments>"]
-        lines += [
-            f'<fragment id="{attr(f.id)}" entry="{f.entry_id}" {dated(f.created_at, today)} kind="{f.kind}">'
-            f"{f.text}</fragment>"
-            for f in later
-        ]
+        lines += [fragment_el(f, today, status=False) for f in later]
         lines.append("</later_fragments>")
 
         def validate(out: AnswersOutput) -> None:
@@ -439,7 +418,7 @@ class Dreamer:
                 continue
             f = later_ids[link.fragment]
             fd = self.ctx.vault.get_decisions(f.entry_id).fragments.get(f.id)
-            if fd and link.answers in (fd.answers or []) + (fd.not_answers or []):
+            if fd and fd.decided_answer(link.answers):
                 continue  # you already accepted or rejected this link
             self._propose(
                 f.entry_id,
@@ -465,25 +444,17 @@ class Dreamer:
         if t is None or newest is None:
             return
         today = local_date(now)
-        family = [f"thread:{x}" for x in queries.thread_family(self.conn, t.id)]
-        frags = queries.fragments_linked_to(self.conn, family, ("in_thread",), limit=NOW_FRAGMENTS)
+        frags = queries.thread_fragments(self.conn, t.id, limit=NOW_FRAGMENTS)
         allowed = {f.entry_id for f in frags}
-        lines = [today_el(now), _thread_el(t)]
+        lines = [today_el(now), thread_el(t)]
         if t.summary:
             lines += [f"<thread_summary {as_of(t.summary_as_of, today)}>", t.summary, "</thread_summary>"]
         lines.append("<recent_fragments>")
-        for f in frags:
-            state = f' state="{f.state}"' if f.state else ""
-            lines.append(
-                f'<fragment entry="{f.entry_id}" {dated(f.created_at, today)} kind="{f.kind}" '
-                f'status="{f.status}"{state}>{f.text}</fragment>'
-            )
+        lines += [fragment_el(f, today, with_id=False) for f in frags]
         lines.append("</recent_fragments>")
 
         def validate(out: NowOutput) -> None:
-            bad = sorted(set(out.citations) - allowed)
-            if bad:
-                raise ValueError(f"citations must be entry ids from the fragments; not allowed: {', '.join(bad)}")
+            check_citations(out.citations, allowed, where="the fragments")
             if not out.line.strip():
                 raise ValueError("the line is empty")
 
@@ -520,16 +491,8 @@ class Dreamer:
                 continue
             later_for[fid] = {f.id: f for f in later}
             allowed[fid] = {item.entry_id} | {f.entry_id for f in later}
-            state = f' state="{item.state}"' if item.state else ""
-            lines.append(
-                f'<item id="{attr(item.id)}" entry="{item.entry_id}" {dated(item.created_at, today)} '
-                f'kind="{item.kind}" status="{item.status}"{state}>{item.text}</item>'
-            )
-            lines += [
-                f'<later item="{attr(item.id)}" id="{attr(f.id)}" entry="{f.entry_id}" '
-                f'{dated(f.created_at, today)} kind="{f.kind}">{f.text}</later>'
-                for f in later
-            ]
+            lines.append(fragment_el(item, today, tag="item"))
+            lines += [fragment_el(f, today, tag="later", status=False, extra=f' item="{attr(item.id)}"') for f in later]
         lines.append("</items>")
         if not later_for:
             return
@@ -540,9 +503,7 @@ class Dreamer:
                     raise ValueError(f"unknown item {c.item}; use the ids of the items")
                 if c.evidence and c.evidence not in later_for[c.item]:
                     raise ValueError(f"evidence {c.evidence} is not one of the later fragments for {c.item}")
-                bad = sorted(set(c.citations) - allowed[c.item])
-                if bad:
-                    raise ValueError(f"citations for {c.item} must be entry ids from its input: {', '.join(bad)}")
+                check_citations(c.citations, allowed[c.item], where=f"the input for {c.item}")
 
         out = self._call("dream_sweep", "\n".join(lines), SweepOutput, validate).output
         for fid in later_for:
@@ -613,18 +574,6 @@ class Dreamer:
 
 def _order(f: FragmentRow) -> tuple[str, str]:
     return (f.created_at, f.entry_id)
-
-
-def _thread_el(t: ThreadRow) -> str:
-    return f'<thread id="{attr(t.id)}" name="{attr(t.name)}" description="{attr(t.description or "")}"/>'
-
-
-def _fragment_el(f: FragmentRow, today) -> str:
-    state = f' state="{f.state}"' if f.state else ""
-    return (
-        f'<fragment id="{attr(f.id)}" entry="{f.entry_id}" {dated(f.created_at, today)} kind="{f.kind}" '
-        f'status="{f.status}"{state}>{f.text}</fragment>'
-    )
 
 
 def _user_decided(conn: sqlite3.Connection, ids: list[str]) -> set[str]:

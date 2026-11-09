@@ -9,10 +9,8 @@ from typing import TypeVar
 
 from brain.core.config import Settings
 from brain.core.formats.sidecars import Sidecar
-from brain.core.formats.yamlio import FormatError
 from brain.core.index.db import IndexDB
 from brain.core.llm.models import LLM
-from brain.core.storage.base import NotFound
 from brain.core.vault import Vault
 
 S = TypeVar("S", bound=Sidecar)
@@ -33,15 +31,7 @@ class PipelineContext:
         return self.db.conn
 
     def read_sidecar(self, key: str, model: type[S]) -> tuple[S, bytes] | None:
-        """The parsed sidecar and its exact bytes, or None if missing or unreadable."""
-        try:
-            data = self.vault.storage.get(key)
-        except NotFound:
-            return None
-        try:
-            return model.parse(data, where=key), data
-        except FormatError:
-            return None  # regenerate rather than fail; `brain doctor` reports the bad file
+        return self.vault.read_sidecar(key, model)
 
     def write_sidecar(self, key: str, sidecar: Sidecar) -> bytes:
         data = sidecar.to_bytes()

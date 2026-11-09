@@ -10,19 +10,11 @@ from brain.core.formats.entity import Thread
 from brain.core.index.db import snapshot
 from brain.core.services import FragmentChange
 from brain.core.threads import ThreadError
-from tests.conftest import FAKE_LLM_SETTINGS, make_brain
 
 QUOTA = (
     "Kicked off the [[GPU quota migration]] with Priya. Does the vendor support MIG on the nodes? "
     "Maybe the new pool is faster. Need to file the [[GPU quota migration]] budget request."
 )
-
-
-@pytest.fixture
-def brain(local_storage, state, tmp_path):
-    b = make_brain(local_storage, state, tmp_path, fake_llm=True, llm=FAKE_LLM_SETTINGS)
-    yield b
-    b.close()
 
 
 def jot(b, text):

@@ -17,7 +17,6 @@ from brain.core.llm.models import LLMError
 from brain.core.shared import SharedBrain
 from brain.core.storage.lease import Lease
 from brain.mcp.server import build_server
-from tests.conftest import FAKE_LLM_SETTINGS, make_brain
 
 pytestmark = pytest.mark.anyio
 
@@ -30,13 +29,6 @@ ENTRY = (
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
-
-
-@pytest.fixture
-def brain(local_storage, state, tmp_path):
-    b = make_brain(local_storage, state, tmp_path, fake_llm=True, llm=FAKE_LLM_SETTINGS)
-    yield b
-    b.close()
 
 
 @pytest.fixture

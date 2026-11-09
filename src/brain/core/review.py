@@ -107,13 +107,17 @@ class Review:
         self.vault = vault
         self.conn = conn
 
-    def items(self) -> list[ReviewItem]:
+    def _rows(self) -> list[ReviewItem]:
+        """The queue in review order, without the context that `items` adds."""
         rows = self.conn.execute(
             "SELECT id, kind, entry_id, payload FROM review_items ORDER BY "
             "CASE kind WHEN 'new_person' THEN 0 WHEN 'new_org' THEN 1 WHEN 'ambiguous_mention' THEN 2 "
             "WHEN 'proposed_answer' THEN 3 WHEN 'dream_obe' THEN 4 ELSE 5 END, created_at, id"
         ).fetchall()
-        items = [ReviewItem(r[0], r[1], r[2], json.loads(r[3])) for r in rows]
+        return [ReviewItem(r[0], r[1], r[2], json.loads(r[3])) for r in rows]
+
+    def items(self) -> list[ReviewItem]:
+        items = self._rows()
         dates = entry_dates(self.conn, sorted({i.entry_id for i in items if i.entry_id}))
         same_name: dict[tuple, int] = {}
         for i in items:
@@ -146,7 +150,7 @@ class Review:
         return items
 
     def get(self, item_id: str) -> ReviewItem:
-        for i in self.items():
+        for i in self._rows():
             if i.id == item_id:
                 return i
         raise ReviewError(f"no review item {item_id}")
@@ -180,7 +184,7 @@ class Review:
         entries: list[str] = [item.entry_id] if item.entry_id else []
         if apply_to_all:
             mtype, surface = item.payload["type"], item.payload["surface"]
-            for other in self.items():
+            for other in self._rows():
                 if (
                     other.kind in MENTION_KINDS
                     and other.entry_id
@@ -199,9 +203,7 @@ class Review:
 
     def _add_alias(self, etype: str, entity_id: str, alias: str) -> None:
         entity = self.vault.get_entity(etype, entity_id)  # type: ignore[arg-type]
-        known = {norm_alias(entity.name), *(norm_alias(a) for a in entity.aliases)}
-        if norm_alias(alias) not in known:
-            entity.aliases.append(alias)
+        if entity.add_alias(alias):
             self.vault.put_entity(entity)
 
     def _mention(self, item: ReviewItem, decision: ReviewDecision) -> None:
@@ -244,8 +246,8 @@ class Review:
         assert isinstance(entity, Theme | Thread)
         if isinstance(decision, AcceptProposed):
             if decision.rename and decision.rename != entity.name:
-                entity.aliases.append(entity.name)
-                entity.name = decision.rename
+                old, entity.name = entity.name, decision.rename
+                entity.add_alias(old)
             entity.state = "active"
             self.vault.put_entity(entity)
         elif isinstance(decision, MergeProposed):

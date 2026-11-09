@@ -10,7 +10,7 @@ import {
   SourceList,
   SummaryText,
 } from "../components";
-import { useLoad } from "../hooks";
+import { useAction, useLoad } from "../hooks";
 import { ThreadActions } from "./ThreadActions";
 
 const TYPE_PATH: Record<string, string> = { thread: "threads", person: "people", org: "orgs", theme: "themes" };
@@ -63,8 +63,7 @@ export function EntityPage() {
   const [statuses, setStatuses] = useState<string[]>(["confirmed", "speculative"]);
   const [openOnly, setOpenOnly] = useState(false);
   const [brief, setBrief] = useState<BriefResult>();
-  const [briefing, setBriefing] = useState(false);
-  const [briefError, setBriefError] = useState<string>();
+  const { busy: briefing, error: briefError, run } = useAction();
   const [selecting, setSelecting] = useState(false);
   const [selected, setSelected] = useState<string[]>([]);
 
@@ -84,17 +83,7 @@ export function EntityPage() {
     timeline.reload();
   };
 
-  async function runBrief() {
-    setBriefing(true);
-    setBriefError(undefined);
-    try {
-      setBrief(await api.brief(nodeId));
-    } catch (e) {
-      setBriefError((e as Error).message);
-    } finally {
-      setBriefing(false);
-    }
-  }
+  const runBrief = () => run(async () => setBrief(await api.brief(nodeId)));
 
   const e = entity.data;
   if (!e) return <Loading error={entity.error} loading={entity.loading} />;

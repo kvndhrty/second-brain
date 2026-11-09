@@ -26,13 +26,6 @@ FIRST = (
 SECOND = "Confirmed the vendor does support MIG on the new nodes. Talked with Mike about the [[GPU quota migration]]."
 
 
-@pytest.fixture
-def brain(local_storage, state, tmp_path):
-    b = make_brain(local_storage, state, tmp_path, fake_llm=True, llm=FAKE_LLM_SETTINGS)
-    yield b
-    b.close()
-
-
 def jot(b, text):
     entry = b.jot(text).entry
     report = b.process(entry.id)

@@ -13,7 +13,9 @@ from brain.core.answers import Answer, Brief, Source
 from brain.core.index.queries import FragmentRow, ThreadRow
 from brain.core.llm.schemas import Claim
 from brain.core.pipeline.runner import ProcessReport
+from brain.core.review import MENTION_KINDS
 from brain.core.temporal import iso_day
+from brain.core.views import FragmentView
 
 SECTIONS = [
     ("where_things_stand", "Where things stand"),
@@ -35,7 +37,7 @@ def run_processing(out: Console, run: Callable[[Callable[[str], None]], ProcessR
         out.print("[yellow]stopped; the entry is saved and will be processed by `brain process`[/yellow]")
         return None
     print_report(out, report)
-    pending = [i for i in brain.review_items() if i.kind in ("new_person", "new_org", "ambiguous_mention")]
+    pending = [i for i in brain.review_items() if i.kind in MENTION_KINDS]
     if pending:
         out.print(f"[yellow]{len(pending)} name(s) need review: run `brain review`[/yellow]")
     return report
@@ -145,7 +147,7 @@ def print_active(out: Console, threads: list[ThreadRow], now: datetime) -> None:
     out.print(table)
 
 
-def print_fragments(out: Console, fragments: list[FragmentRow]) -> None:
+def print_fragments(out: Console, fragments: list[FragmentRow] | list[FragmentView]) -> None:
     for f in fragments:
         flags = [f.kind, f.status]
         if f.state:

@@ -92,9 +92,44 @@ def node_family(conn: sqlite3.Connection, node_id: str) -> list[str]:
     return [r[0] for r in rows]
 
 
+LINK_EDGES = ("in_thread", "mentions", "about")  # fragment -> thread, person or org, theme
+LINK_EDGES_SQL = "(" + ", ".join(f"'{e}'" for e in LINK_EDGES) + ")"  # for IN clauses
+
+
+def edge_for(node_type: str) -> str:
+    """The edge type that links a fragment to a node of this type."""
+    return {"thread": "in_thread", "theme": "about"}.get(node_type, "mentions")
+
+
+def thread_nodes(conn: sqlite3.Connection, thread_id: str) -> list[str]:
+    """Node ids of the thread plus every thread merged into it."""
+    return node_family(conn, f"thread:{thread_id}")
+
+
 def thread_family(conn: sqlite3.Connection, thread_id: str) -> list[str]:
     """Thread ids: the thread plus every thread merged into it."""
-    return [n.split(":", 1)[1] for n in node_family(conn, f"thread:{thread_id}")]
+    return [n.split(":", 1)[1] for n in thread_nodes(conn, thread_id)]
+
+
+def thread_fragments(conn: sqlite3.Connection, thread_id: str, *, limit: int = 150) -> list[FragmentRow]:
+    """Fragments in the thread or any thread merged into it, newest `limit`, oldest first."""
+    return fragments_linked_to(conn, thread_nodes(conn, thread_id), ("in_thread",), limit=limit)
+
+
+def node_fragments(conn: sqlite3.Connection, node_id: str, *, limit: int = 150) -> list[FragmentRow]:
+    """Fragments linked to a node or any node merged into it, newest `limit`, oldest first."""
+    return fragments_linked_to(conn, node_family(conn, node_id), (edge_for(node_id.split(":", 1)[0]),), limit=limit)
+
+
+def linked_nodes(conn: sqlite3.Connection, fragment_ids: list[str]) -> list[str]:
+    """Node ids these fragments link to, once per link (a node linked from three fragments appears three times)."""
+    if not fragment_ids:
+        return []
+    src = [f"frag:{i}" for i in fragment_ids]
+    rows = conn.execute(
+        f"SELECT dst FROM edges WHERE src IN ({','.join('?' * len(src))}) AND type IN {LINK_EDGES_SQL}", src
+    )
+    return [r[0] for r in rows]
 
 
 def active_threads(conn: sqlite3.Connection, *, now: datetime, inactivity_days: int) -> list[ThreadRow]:
@@ -103,9 +138,8 @@ def active_threads(conn: sqlite3.Connection, *, now: datetime, inactivity_days: 
     for t in threads(conn, states=("active", "proposed")):
         if not (t.pinned or (t.last_activity and t.last_activity >= cutoff)):
             continue
-        fam = thread_family(conn, t.id)
-        ph = ",".join("?" * len(fam))
-        nodes = [f"thread:{x}" for x in fam]
+        nodes = thread_nodes(conn, t.id)
+        ph = ",".join("?" * len(nodes))
         t.fragments, t.open_items = conn.execute(
             f"""
             SELECT COUNT(DISTINCT f.id), COUNT(DISTINCT CASE
@@ -290,6 +324,11 @@ class FragmentRow:
     obe_reason: str | None
     created_at: str
 
+    @property
+    def is_open(self) -> bool:
+        """An open question or action item that has not been overcome by events."""
+        return self.state == "open" and self.status != "overcome_by_events"
+
 
 def _frag(r: sqlite3.Row) -> FragmentRow:
     return FragmentRow(
@@ -324,6 +363,18 @@ def fragments_linked_to(
         [*node_ids, *edge_types, limit],
     ).fetchall()
     return list(reversed([_frag(r) for r in rows]))
+
+
+# SQL condition, for fragments aliased `f`: the fragment is in an archived or OBE thread.
+IN_RETIRED_THREAD = (
+    "EXISTS (SELECT 1 FROM edges e JOIN threads t ON e.dst = 'thread:' || t.id "
+    "WHERE e.src = 'frag:' || f.id AND e.type = 'in_thread' AND t.state IN ('archived', 'obe'))"
+)
+
+
+def select_fragments(conn: sqlite3.Connection, where: str, params: tuple | list = ()) -> list[FragmentRow]:
+    """Fragments matching a WHERE clause (and any ORDER BY or LIMIT after it), with the table aliased `f`."""
+    return [_frag(r) for r in conn.execute(f"SELECT {FRAGMENT_COLS} FROM fragments f WHERE {where}", params)]
 
 
 def fragments_by_id(conn: sqlite3.Connection, ids: list[str]) -> dict[str, FragmentRow]:

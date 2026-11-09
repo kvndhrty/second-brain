@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import { Badge, FragmentCard, Loading } from "../components";
-import { useInterval, useLoad } from "../hooks";
+import { useAction, useInterval, useLoad } from "../hooks";
 
 export function EntriesPage() {
   const { data, error, loading } = useLoad(() => api.entries());
@@ -92,19 +92,8 @@ function EntryForm({
 }) {
   const [text, setText] = useState(initialText);
   const [title, setTitle] = useState(initialTitle);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string>();
-
-  async function submit() {
-    setBusy(true);
-    setError(undefined);
-    try {
-      await onSubmit(text, title);
-    } catch (e) {
-      setError((e as Error).message);
-      setBusy(false);
-    }
-  }
+  const { busy, error, run } = useAction(true);
+  const submit = () => run(() => onSubmit(text, title));
 
   return (
     <section className="editor">

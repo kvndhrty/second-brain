@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { api, type Candidate, type ReviewDecision, type ReviewItem } from "../api";
-import { EntryLink, Loading } from "../components";
-import { useLoad } from "../hooks";
+import { EntitySearch, EntryLink, Loading } from "../components";
+import { useAction, useLoad } from "../hooks";
 
 const TITLES: Record<string, string> = {
   new_person: "New person",
@@ -37,21 +37,14 @@ export function ReviewPage({ onChange }: { onChange?: () => void }) {
 }
 
 function ReviewCard({ item, onDone }: { item: ReviewItem; onDone: () => void }) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string>();
+  const { busy, error, run } = useAction(true);
   const [applyAll, setApplyAll] = useState(true);
 
-  async function decide(decision: ReviewDecision) {
-    setBusy(true);
-    setError(undefined);
-    try {
+  const decide = (decision: ReviewDecision) =>
+    run(async () => {
       await api.resolve(item.id, { apply_to_all: applyAll, ...decision });
       onDone();
-    } catch (e) {
-      setError((e as Error).message);
-      setBusy(false);
-    }
-  }
+    });
 
   const p = item.payload;
   return (
@@ -203,36 +196,5 @@ function ProposedReview({
       </div>
       <EntitySearch type={type} label="Merge into" exclude={self} busy={busy} onPick={(id) => void decide({ action: "merge", into: id })} />
     </>
-  );
-}
-
-function EntitySearch({
-  type,
-  label,
-  busy,
-  exclude,
-  onPick,
-}: {
-  type: string;
-  label: string;
-  busy: boolean;
-  exclude?: string;
-  onPick: (id: string) => void;
-}) {
-  const [text, setText] = useState("");
-  const [found, setFound] = useState<Candidate[]>();
-  return (
-    <div className="toolbar">
-      <input placeholder={`${label}: search ${type}s`} value={text} onChange={(e) => setText(e.target.value)} />
-      <button disabled={busy || !text.trim()} onClick={() => void api.choices(type, text).then(setFound)}>
-        Search
-      </button>
-      {found?.filter((c) => c.entity_id !== exclude).map((c) => (
-        <button key={c.entity_id} disabled={busy} onClick={() => onPick(c.entity_id)}>
-          {label} {c.name ?? c.entity_id}
-        </button>
-      ))}
-      {found && found.length === 0 && <span className="muted">no match</span>}
-    </div>
   );
 }

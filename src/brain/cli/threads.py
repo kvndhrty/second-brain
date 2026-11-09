@@ -124,13 +124,7 @@ def show(thread_id: str) -> None:
     with _brain("brain thread", sync=True) as b:
         items = b.timeline(f"thread:{thread_id}")
         out.print(f"[bold]{escape(thread_id)}[/bold]  [dim]{len(items)} fragments[/dim]")
-        print_fragments(out, [_row(i.fragment) for i in reversed(items)])
-
-
-def _row(f):
-    from brain.core.index.queries import FragmentRow
-
-    return FragmentRow(f.id, f.entry_id, f.kind, f.text, f.status, f.state, f.someday, None, f.obe_reason, f.date)
+        print_fragments(out, [i.fragment for i in reversed(items)])
 
 
 def run_sweep(b: Brain, *, days: int, quiet_days: int) -> None:

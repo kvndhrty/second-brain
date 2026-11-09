@@ -120,66 +120,34 @@ def build(conn: sqlite3.Connection, settings: Settings, *, now: datetime) -> Con
             )
         )
 
-    excluded = "SELECT 1 FROM edges e JOIN threads t ON e.dst = 'thread:' || t.id WHERE e.src = 'frag:' || f.id "
-    excluded += "AND e.type = 'in_thread' AND t.state IN ('archived', 'obe')"
-    open_rows = conn.execute(
-        f"SELECT {queries.FRAGMENT_COLS} FROM fragments f WHERE f.state = 'open' AND f.status != 'overcome_by_events' "
-        f"AND f.someday = 0 AND NOT EXISTS ({excluded}) ORDER BY f.created_at DESC, f.id DESC"
-    ).fetchall()
-    doc.open_total = len(open_rows)
-    for r in open_rows[: settings.context.open_items]:
-        f = queries._frag(r)
-        doc.open_items.append(
-            ContextItem(
-                f.id,
-                f.entry_id,
-                iso_day(f.created_at),
-                age(f.created_at, today),
-                f.kind,
-                f.text,
-                _thread_of(conn, f.id),
-            )
+    def item(f: queries.FragmentRow, kind: str, when: str, note: str | None = None) -> ContextItem:
+        return ContextItem(
+            f.id, f.entry_id, iso_day(when), age(when, today), kind, f.text, _thread_of(conn, f.id), note=note
         )
 
+    live = f"f.someday = 0 AND NOT {queries.IN_RETIRED_THREAD}"
+    open_frags = queries.select_fragments(
+        conn,
+        f"f.state = 'open' AND f.status != 'overcome_by_events' AND {live} ORDER BY f.created_at DESC, f.id DESC",
+    )
+    doc.open_total = len(open_frags)
+    doc.open_items = [item(f, f.kind, f.created_at) for f in open_frags[: settings.context.open_items]]
+
     cutoff = (now - timedelta(days=settings.context.recent_days)).isoformat()
-    for r in conn.execute(
-        f"SELECT {queries.FRAGMENT_COLS} FROM fragments f WHERE f.kind = 'decision' AND f.created_at >= ? "
-        f"AND f.status != 'overcome_by_events' AND f.someday = 0 AND NOT EXISTS ({excluded}) "
+    decided = queries.select_fragments(
+        conn,
+        f"f.kind = 'decision' AND f.created_at >= ? AND f.status != 'overcome_by_events' AND {live} "
         "ORDER BY f.created_at DESC, f.id DESC LIMIT ?",
         (cutoff, MAX_CHANGES),
-    ):
-        f = queries._frag(r)
-        doc.changes.append(
-            ContextItem(
-                f.id,
-                f.entry_id,
-                iso_day(f.created_at),
-                age(f.created_at, today),
-                "decision",
-                f.text,
-                _thread_of(conn, f.id),
-            )
-        )
+    )
     obe_cutoff = (today - timedelta(days=settings.context.recent_days)).isoformat()
-    for r in conn.execute(
-        f"SELECT {queries.FRAGMENT_COLS} FROM fragments f WHERE f.status = 'overcome_by_events' AND f.obe_date >= ? "
-        f"AND f.someday = 0 AND NOT EXISTS ({excluded}) ORDER BY f.obe_date DESC, f.id DESC LIMIT ?",
+    retired = queries.select_fragments(
+        conn,
+        f"f.status = 'overcome_by_events' AND f.obe_date >= ? AND {live} ORDER BY f.obe_date DESC, f.id DESC LIMIT ?",
         (obe_cutoff, MAX_CHANGES),
-    ):
-        f = queries._frag(r)
-        assert f.obe_date is not None
-        doc.changes.append(
-            ContextItem(
-                f.id,
-                f.entry_id,
-                f.obe_date,
-                age(f.obe_date, today),
-                "no longer holds",
-                f.text,
-                _thread_of(conn, f.id),
-                note=f.obe_reason,
-            )
-        )
+    )
+    doc.changes = [item(f, "decision", f.created_at) for f in decided]
+    doc.changes += [item(f, "no longer holds", f.obe_date or f.created_at, note=f.obe_reason) for f in retired]
     doc.changes.sort(key=lambda c: c.date, reverse=True)
 
     counts = dict(conn.execute("SELECT kind, COUNT(*) FROM review_items GROUP BY kind").fetchall())

@@ -25,7 +25,7 @@ from brain.core.formats.yamlio import FormatError
 from brain.core.index.db import IndexError_
 from brain.core.llm.models import LLMError
 from brain.core.pipeline.runner import EntryResult
-from brain.core.review import ReviewError
+from brain.core.review import MENTION_KINDS, ReviewError
 from brain.core.services import Brain, Busy, JotFailed
 from brain.core.shared import SharedBrain
 from brain.core.storage.base import StorageError
@@ -295,9 +295,7 @@ def build_server(
         def details(b: Brain) -> s.AddEntryResult:
             result.fragments = [_fragment(f, _today()) for f in b.entry(saved.entry.id).fragments]
             result.names_to_review = sum(
-                1
-                for i in b.review_items()
-                if i.entry_id == saved.entry.id and i.kind in ("new_person", "new_org", "ambiguous_mention")
+                1 for i in b.review_items() if i.entry_id == saved.entry.id and i.kind in MENTION_KINDS
             )
             return result
 

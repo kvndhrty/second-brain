@@ -37,6 +37,11 @@ def _none_to_list(v: Any) -> Any:
     return [] if v is None else v
 
 
+def norm_alias(text: str) -> str:
+    """A name as compared for matching: case-folded, with whitespace collapsed."""
+    return " ".join(text.casefold().split())
+
+
 class _Base(BaseModel):
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
@@ -48,6 +53,14 @@ class _Base(BaseModel):
     notes: str = Field(default="", exclude=True)
 
     _fm: CommentedMap | None = PrivateAttr(default=None)
+
+    def add_alias(self, alias: str) -> bool:
+        """Add an alias unless it matches the name or an alias already. True if added."""
+        if norm_alias(alias) in {norm_alias(self.name), *(norm_alias(a) for a in self.aliases)}:
+            return False
+        self.aliases.append(alias)
+        return True
+
     _list_fields = field_validator("aliases", mode="before")(_none_to_list)
 
     @property

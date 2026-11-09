@@ -64,13 +64,10 @@ class Mention:
     description: str = ""  # new thread description
 
 
-def collect_mentions(
-    extraction: Extraction, decisions: Decisions, thread_names: dict[str, str] | None = None
-) -> list[Mention]:
+def collect_mentions(extraction: Extraction, decisions: Decisions, thread_names: dict[str, str]) -> list[Mention]:
     """thread_names maps existing thread ids to names. A theme that only repeats the
     name of its own fragment's thread is dropped: it would duplicate the thread."""
     found: dict[tuple[MentionType, str], Mention] = {}
-    thread_names = thread_names or {}
 
     def add(mtype: MentionType, surface: str, text: str, **extra) -> None:
         m = found.setdefault((mtype, surface), Mention(mtype, surface, **extra))
@@ -78,8 +75,7 @@ def collect_mentions(
             m.contexts.append(text)
 
     for f in extraction.fragments:
-        d = decisions.fragments.get(f.id)
-        if d and d.deleted:
+        if decisions.is_deleted(f.id):
             continue
         for m in f.mentions:
             add(m.type, m.surface, f.text)
@@ -94,11 +90,14 @@ def collect_mentions(
 
 
 class Resolver:
-    def __init__(self, ctx: PipelineContext, entry: Entry, decisions: Decisions) -> None:
+    def __init__(
+        self, ctx: PipelineContext, entry: Entry, decisions: Decisions, threads: list[queries.ThreadRow]
+    ) -> None:
         self.ctx = ctx
         self.conn = ctx.conn
         self.entry = entry
         self.decisions = decisions
+        self.threads = threads  # existing threads, for matching proposed thread names
         self.records: list[Resolution] = []
         self.model_used: str | None = None
 
@@ -141,10 +140,7 @@ class Resolver:
             self._record(m, "link", exact[0])
             return
         best = max(
-            (
-                (similarity(m.surface, t.name), t.id)
-                for t in queries.threads(self.conn, states=("active", "proposed", "archived"))
-            ),
+            ((similarity(m.surface, t.name), t.id) for t in self.threads),
             default=(0.0, ""),
         )
         if best[0] >= THREAD_NAME_SIMILARITY:
@@ -272,9 +268,7 @@ def propose_answers(
     if not open_items or not ctx.db.has_vec():
         return [], None
     vectors = {i.id: i.vector() for i in embedding.items}
-    live = [
-        f for f in extraction.fragments if not (decisions.fragments.get(f.id) and decisions.fragments[f.id].deleted)
-    ]
+    live = [f for f in extraction.fragments if not decisions.is_deleted(f.id)]
     scores: dict[str, float] = {}
     for f in live:
         if f.id not in vectors:
@@ -313,9 +307,9 @@ def resolve(
     decisions: Decisions,
     embedding: EmbeddingFile | None,
 ) -> ResolutionFile:
-    resolver = Resolver(ctx, entry, decisions)
-    names = {t.id: t.name for t in queries.threads(ctx.conn, states=("active", "proposed", "archived"))}
-    resolver.run(collect_mentions(extraction, decisions, names))
+    threads = queries.threads(ctx.conn, states=("active", "proposed", "archived"))
+    resolver = Resolver(ctx, entry, decisions, threads)
+    resolver.run(collect_mentions(extraction, decisions, {t.id: t.name for t in threads}))
     answers, answers_model = propose_answers(ctx, entry, extraction, decisions, embedding)
     return ResolutionFile(
         entry_id=entry.id,

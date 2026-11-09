@@ -14,7 +14,6 @@ from collections import defaultdict
 from brain.core.formats.decisions import FragmentDecision, ThreadChange
 from brain.core.formats.entity import ObeInfo, Thread
 from brain.core.index import queries
-from brain.core.index.build import norm_alias
 from brain.core.storage.base import NotFound
 from brain.core.vault import Vault
 
@@ -45,9 +44,8 @@ class ThreadOps:
         name = name.strip()
         if not name:
             raise ThreadError("a thread needs a name")
-        if norm_alias(name) != norm_alias(t.name) and norm_alias(t.name) not in {norm_alias(a) for a in t.aliases}:
-            t.aliases.append(t.name)  # keep the old name, so mentions of it still resolve
-        t.name = name
+        old, t.name = t.name, name
+        t.add_alias(old)  # keep the old name, so mentions of it still resolve
         return self._save(t)
 
     def pin(self, thread_id: str, pinned: bool = True) -> Thread:
@@ -81,12 +79,7 @@ class ThreadOps:
         self._save(t)
         if not cascade:
             return 0
-        family = [f"thread:{x}" for x in queries.thread_family(self.conn, thread_id)]
-        open_items = [
-            f
-            for f in queries.fragments_linked_to(self.conn, family, ("in_thread",), limit=100_000)
-            if f.state == "open" and f.status != "overcome_by_events"
-        ]
+        open_items = [f for f in queries.thread_fragments(self.conn, thread_id, limit=100_000) if f.is_open]
         note = f"thread '{t.name}' overcome by events" + (f": {reason}" if reason else "")
         by_entry: dict[str, list[str]] = defaultdict(list)
         for f in open_items:
@@ -119,11 +112,8 @@ class ThreadOps:
         if target_id == thread_id or thread_id in queries.thread_family(self.conn, target_id):
             raise ThreadError("cannot merge a thread into itself or into a thread merged into it")
         t, target = self.get(thread_id), self.get(target_id)
-        known = {norm_alias(target.name), *(norm_alias(a) for a in target.aliases)}
         for name in [t.name, *t.aliases]:
-            if norm_alias(name) not in known:
-                target.aliases.append(name)
-                known.add(norm_alias(name))
+            target.add_alias(name)
         if t.pinned and not target.pinned:
             target.pinned = True
         self._save(target)

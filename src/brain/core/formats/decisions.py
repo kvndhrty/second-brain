@@ -41,6 +41,10 @@ class FragmentDecision(BaseModel):
     not_answers: list[str] | None = None  # proposed answer links you rejected
     deleted: bool | None = None
 
+    def decided_answer(self, item_id: str) -> bool:
+        """True if you accepted or rejected the link from this fragment to that item."""
+        return item_id in (self.answers or []) or item_id in (self.not_answers or [])
+
     @model_validator(mode="before")
     @classmethod
     def _legacy_dream(cls, data: Any) -> Any:
@@ -61,6 +65,10 @@ class Decisions(BaseModel):
     mentions: dict[MentionType, dict[str, Id | None]] = Field(default_factory=dict)
 
     _doc: CommentedMap | None = PrivateAttr(default=None)
+
+    def is_deleted(self, fragment_id: str) -> bool:
+        d = self.fragments.get(fragment_id)
+        return bool(d and d.deleted)
 
     @classmethod
     def parse(cls, text: str, *, where: str = "decisions") -> Decisions:

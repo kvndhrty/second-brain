@@ -13,8 +13,8 @@ from brain.core.formats.sidecars import ThreadSummary
 from brain.core.index import queries
 from brain.core.llm.schemas import SummaryOutput
 from brain.core.pipeline.context import PipelineContext
-from brain.core.pipeline.text import attr
-from brain.core.temporal import as_of, dated, local_date, today_el
+from brain.core.pipeline.text import attr, check_citations, fragment_el, thread_el
+from brain.core.temporal import as_of, local_date, today_el
 
 MAX_FRAGMENTS = 150
 
@@ -25,8 +25,7 @@ def summarize(ctx: PipelineContext, thread_id: str, *, full: bool = False) -> Th
         return None
     prev = ctx.read_sidecar(keys.thread_summary_key(thread_id), ThreadSummary)
     previous = None if full or prev is None else prev[0]
-    family = [f"thread:{x}" for x in queries.thread_family(ctx.conn, thread_id)]
-    frags = queries.fragments_linked_to(ctx.conn, family, ("in_thread",), limit=MAX_FRAGMENTS)
+    frags = queries.thread_fragments(ctx.conn, thread_id, limit=MAX_FRAGMENTS)
     through = None
     if previous and previous.through_entry:
         through = queries.entry_dates(ctx.conn, [previous.through_entry]).get(previous.through_entry)
@@ -39,7 +38,7 @@ def summarize(ctx: PipelineContext, thread_id: str, *, full: bool = False) -> Th
     today = local_date(now)
     lines = [
         today_el(now),
-        f'<thread id="{attr(t.id)}" name="{attr(t.name)}" description="{attr(t.description or "")}"/>',
+        thread_el(t),
     ]
     if previous:
         lines += [
@@ -50,18 +49,12 @@ def summarize(ctx: PipelineContext, thread_id: str, *, full: bool = False) -> Th
     lines.append("<new_fragments>")
     for f in frags:
         extra = f' obe_reason="{attr(f.obe_reason)}"' if f.obe_reason else ""
-        state = f' state="{f.state}"' if f.state else ""
-        lines.append(
-            f'<fragment entry="{f.entry_id}" {dated(f.created_at, today)} kind="{f.kind}" '
-            f'status="{f.status}"{state}{extra}>{f.text}</fragment>'
-        )
+        lines.append(fragment_el(f, today, with_id=False, extra=extra))
     lines.append("</new_fragments>")
     allowed = {f.entry_id for f in frags} | set(previous.citations if previous else [])
 
     def validate(out: SummaryOutput) -> None:
-        bad = sorted(set(out.citations) - allowed)
-        if bad:
-            raise ValueError(f"citations must be entry ids from the input; not allowed: {', '.join(bad)}")
+        check_citations(out.citations, allowed)
 
     result = ctx.llm.run("thread_summary", "\n".join(lines), SummaryOutput, validate=validate)
     newest = max(frags, key=lambda f: (f.created_at, f.entry_id))

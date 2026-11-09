@@ -29,6 +29,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from brain.core.config import Settings
 from brain.core.llm.models import LLM
 from brain.core.llm.prompts import Prompt, load_prompt
+from brain.core.llm.schemas import BriefOutput
 
 _WORD = re.compile(r"[a-z0-9]{3,}")
 
@@ -293,8 +294,7 @@ def heuristic_answers(user: str) -> dict[str, Any]:
     links = []
     for fid, ftext in new:
         for iid, itext in items:
-            a, b = _words(ftext), _words(itext)
-            if a and b and len(a & b) / len(a | b) >= 0.3:
+            if _overlap(ftext, itext) >= 0.3:
                 links.append({"fragment": fid, "answers": iid, "confidence": 0.8})
     return {"links": links}
 
@@ -308,18 +308,7 @@ def heuristic_summary(user: str) -> dict[str, Any]:
 
 
 def heuristic_brief(user: str) -> dict[str, Any]:
-    out: dict[str, list] = {
-        k: []
-        for k in (
-            "where_things_stand",
-            "recent_decisions",
-            "open_items",
-            "people",
-            "speculative",
-            "overcome_by_events",
-            "changed_since",
-        )
-    }
+    out: dict[str, list] = {k: [] for k in BriefOutput.model_fields}
     frags = [(_attrs(tag), text) for tag, text in re.findall(r"<fragment ([^>]*)>(.*?)</fragment>", user)]
     for a, text in frags:
         claim = {"text": text, "citations": [a["entry"]]}

@@ -19,13 +19,6 @@ ENTRY = (
 
 
 @pytest.fixture
-def brain(local_storage, state, tmp_path):
-    b = make_brain(local_storage, state, tmp_path, fake_llm=True, llm=FAKE_LLM_SETTINGS)
-    yield b
-    b.close()
-
-
-@pytest.fixture
 def client(brain, tmp_path):
     app = create_app(SharedBrain(lambda: brain), static_dir=tmp_path / "no-static")
     with TestClient(app, base_url="http://127.0.0.1") as c:

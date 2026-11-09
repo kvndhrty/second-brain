@@ -147,15 +147,14 @@ def entity_view(conn: sqlite3.Connection, text: str, *, recent: int = 20) -> Ent
     notes = data.pop("notes", "") if isinstance(data.get("notes"), str) else ""
     file_key = data.pop("key", None) or ""
     aliases = [a[0] for a in conn.execute("SELECT alias FROM aliases WHERE node_id = ? ORDER BY alias", (m.node_id,))]
-    edge_type = {"thread": ("in_thread",), "theme": ("about",)}.get(m.type, ("mentions",))
     family = queries.node_family(conn, m.node_id)
-    frags = queries.fragments_linked_to(conn, family, edge_type, limit=500)
+    frags = queries.node_fragments(conn, m.node_id, limit=500)
     related: dict[str, list[str]] = {}
     if frags:
         src = [f"frag:{f.id}" for f in frags]
         rows = conn.execute(
             f"SELECT n.type, n.label, COUNT(*) c FROM edges e JOIN nodes n ON n.id = e.dst "
-            f"WHERE e.src IN ({','.join('?' * len(src))}) AND e.type IN ('in_thread', 'mentions', 'about') "
+            f"WHERE e.src IN ({','.join('?' * len(src))}) AND e.type IN {queries.LINK_EDGES_SQL} "
             f"AND n.id NOT IN ({','.join('?' * len(family))}) GROUP BY n.id ORDER BY c DESC, n.label",
             [*src, *family],
         ).fetchall()
@@ -182,7 +181,7 @@ def entity_view(conn: sqlite3.Connection, text: str, *, recent: int = 20) -> Ent
         notes=notes,
         summary=summary,
         related=related,
-        open_items=[fragment_view(f) for f in frags if f.state == "open" and f.status != "overcome_by_events"],
+        open_items=[fragment_view(f) for f in frags if f.is_open],
         recent=[fragment_view(f) for f in frags[-recent:]][::-1],
         fragment_count=len(frags),
         summary_as_of=summary_as_of,
@@ -224,7 +223,7 @@ class EntitySummary:
 
 
 def entity_list(conn: sqlite3.Connection, etype: str) -> list[EntitySummary]:
-    edge = {"thread": "in_thread", "theme": "about"}.get(etype, "mentions")
+    edge = queries.edge_for(etype)
     rows = conn.execute(
         """
         SELECT n.id, n.label, n.data, COUNT(DISTINCT f.id), MAX(f.created_at)
@@ -266,10 +265,8 @@ def recent_entries(conn: sqlite3.Connection, *, limit: int = 50, before: str | N
 
 
 def someday(conn: sqlite3.Connection) -> list[FragmentView]:
-    rows = conn.execute(
-        f"SELECT {queries.FRAGMENT_COLS} FROM fragments f WHERE f.someday = 1 ORDER BY f.created_at DESC, f.id DESC"
-    ).fetchall()
-    return [fragment_view(queries._frag(r)) for r in rows]
+    frags = queries.select_fragments(conn, "f.someday = 1 ORDER BY f.created_at DESC, f.id DESC")
+    return [fragment_view(f) for f in frags]
 
 
 @dataclass
@@ -287,16 +284,14 @@ class TimelineFragment:
 
 def node_timeline(conn: sqlite3.Connection, node_id: str) -> list[TimelineFragment]:
     """Every fragment linked to a node (and nodes merged into it), newest first, with its other links."""
-    ntype = node_id.split(":", 1)[0]
-    edge = {"thread": ("in_thread",), "theme": ("about",)}.get(ntype, ("mentions",))
     family = queries.node_family(conn, node_id)
-    frags = queries.fragments_linked_to(conn, family, edge, limit=2000)
+    frags = queries.node_fragments(conn, node_id, limit=2000)
     links: dict[str, list[Link]] = {}
     if frags:
         src = [f"frag:{f.id}" for f in frags]
         for fid, nid, t, label in conn.execute(
             f"SELECT substr(e.src, 6), n.id, n.type, n.label FROM edges e JOIN nodes n ON n.id = e.dst "
-            f"WHERE e.src IN ({','.join('?' * len(src))}) AND e.type IN ('in_thread', 'mentions', 'about') "
+            f"WHERE e.src IN ({','.join('?' * len(src))}) AND e.type IN {queries.LINK_EDGES_SQL} "
             "ORDER BY n.type, n.label",
             src,
         ):
@@ -337,7 +332,7 @@ def entity_graph(conn: sqlite3.Connection, *, center: str | None = None, depth: 
     weights = dict(
         conn.execute(
             "SELECT e.dst, COUNT(DISTINCT e.src) FROM edges e JOIN nodes n ON n.id = e.dst "
-            "WHERE e.type IN ('in_thread', 'mentions', 'about') AND n.type IN ('person', 'org', 'theme', 'thread') "
+            f"WHERE e.type IN {queries.LINK_EDGES_SQL} AND n.type IN ('person', 'org', 'theme', 'thread') "
             "GROUP BY e.dst"
         ).fetchall()
     )
@@ -350,10 +345,10 @@ def entity_graph(conn: sqlite3.Connection, *, center: str | None = None, depth: 
     merged = {r[0] for r in conn.execute("SELECT src FROM edges WHERE type = 'merged_into'")}
     pairs: dict[tuple[str, str], int] = {}
     for a, b, n in conn.execute(
-        """
+        f"""
         SELECT e1.dst, e2.dst, COUNT(DISTINCT e1.src) FROM edges e1
         JOIN edges e2 ON e2.src = e1.src AND e2.dst > e1.dst
-        WHERE e1.type IN ('in_thread', 'mentions', 'about') AND e2.type IN ('in_thread', 'mentions', 'about')
+        WHERE e1.type IN {queries.LINK_EDGES_SQL} AND e2.type IN {queries.LINK_EDGES_SQL}
         GROUP BY e1.dst, e2.dst
         """
     ):

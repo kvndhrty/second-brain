@@ -1,6 +1,16 @@
 import { useState, type ReactNode } from "react";
 import { Link as RouterLink } from "react-router-dom";
-import { api, nodePath, type Claim, type Fragment, type FragmentPatch, type Link, type Source } from "./api";
+import {
+  api,
+  nodePath,
+  type Candidate,
+  type Claim,
+  type Fragment,
+  type FragmentPatch,
+  type Link,
+  type Source,
+} from "./api";
+import { useAction } from "./hooks";
 
 export function Loading({ error, loading }: { error?: string; loading: boolean }) {
   if (error) return <p className="error">{error}</p>;
@@ -39,6 +49,43 @@ export function NodeChip({ link }: { link: Link }) {
   );
 }
 
+// Ask why something is overcome by events. null means cancelled; "" means no reason given.
+export function askObeReason(): string | null {
+  return window.prompt("Why is this overcome by events? (optional)");
+}
+
+// Search entities of one type by name and pick one; `label` prefixes each result's button.
+export function EntitySearch({
+  type,
+  label,
+  busy,
+  exclude,
+  onPick,
+}: {
+  type: string;
+  label: string;
+  busy: boolean;
+  exclude?: string;
+  onPick: (id: string) => void;
+}) {
+  const [text, setText] = useState("");
+  const [found, setFound] = useState<Candidate[]>();
+  return (
+    <div className="toolbar">
+      <input placeholder={`${label}: search ${type}s`} value={text} onChange={(e) => setText(e.target.value)} />
+      <button disabled={busy || !text.trim()} onClick={() => void api.choices(type, text).then(setFound)}>
+        Search
+      </button>
+      {found?.filter((c) => c.entity_id !== exclude).map((c) => (
+        <button key={c.entity_id} disabled={busy} onClick={() => onPick(c.entity_id)}>
+          {label} {c.name ?? c.entity_id}
+        </button>
+      ))}
+      {found && found.length === 0 && <span className="muted">no match</span>}
+    </div>
+  );
+}
+
 // One fragment, with its badges and the actions that change its status.
 // Changes are saved to the entry's decisions file, so they survive re-extraction.
 export function FragmentCard({
@@ -50,25 +97,17 @@ export function FragmentCard({
   links?: Link[];
   onChanged?: () => void;
 }) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string>();
+  const { busy, error, run } = useAction();
   const f = fragment;
 
-  async function change(patch: FragmentPatch) {
-    setBusy(true);
-    setError(undefined);
-    try {
+  const change = (patch: FragmentPatch) =>
+    run(async () => {
       await api.patchFragment(f.id, patch);
       onChanged?.();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
+    });
 
   function markObe() {
-    const reason = window.prompt("Why is this overcome by events? (optional)");
+    const reason = askObeReason();
     if (reason === null) return;
     void change({ status: "overcome_by_events", obe_reason: reason || null });
   }

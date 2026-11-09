@@ -12,8 +12,7 @@ from brain.core.pipeline.context import PipelineContext
 def needed_texts(entry: Entry, extraction: Extraction, decisions: Decisions) -> dict[str, str]:
     texts = {entry.id: entry.body}
     for f in extraction.fragments:
-        d = decisions.fragments.get(f.id)
-        if not (d and d.deleted):
+        if not decisions.is_deleted(f.id):
             texts[f.id] = f.text
     return texts
 

@@ -185,3 +185,11 @@ def make_brain(
 
 
 FAKE_LLM_SETTINGS = {"base_url": "https://fake/v1", "chat_model": "fake-chat", "embed_model": "fake-embed"}
+
+
+@pytest.fixture
+def brain(local_storage, state, tmp_path):
+    """A Brain on local storage with the scripted fake LLM."""
+    b = make_brain(local_storage, state, tmp_path, fake_llm=True, llm=FAKE_LLM_SETTINGS)
+    yield b
+    b.close()

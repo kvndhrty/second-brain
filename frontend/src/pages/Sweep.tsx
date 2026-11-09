@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { api, nodePath, type FragmentPatch, type SweepItem } from "../api";
-import { EntryLink, Loading } from "../components";
-import { useLoad } from "../hooks";
+import { askObeReason, EntryLink, Loading } from "../components";
+import { useAction, useLoad } from "../hooks";
 
 // The overcome-by-events sweep: old open items, old speculation, and quiet threads.
 export function SweepPage() {
@@ -35,22 +35,13 @@ export function SweepPage() {
 }
 
 function SweepCard({ item, onDone }: { item: SweepItem; onDone: () => void }) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string>();
-
-  async function act(fn: () => Promise<unknown>) {
-    setBusy(true);
-    setError(undefined);
-    try {
+  const { busy, error, run } = useAction(true);
+  const act = (fn: () => Promise<unknown>) =>
+    run(async () => {
       await fn();
       onDone();
-    } catch (e) {
-      setError((e as Error).message);
-      setBusy(false);
-    }
-  }
-
-  const obeReason = () => window.prompt("Why is this overcome by events? (optional)");
+    });
+  const obeReason = askObeReason;
 
   if (item.kind === "quiet_thread") {
     const id = item.thread_id ?? "";
