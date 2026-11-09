@@ -56,7 +56,9 @@ class AskResult(BaseModel):
 
 class BriefResult(BaseModel):
     today: str = Field(description="today's date (YYYY-MM-DD, local); every age_days counts back from it")
-    target: str = Field(description="node id the brief is about, or text:<words> for a free-text brief")
+    target: str = Field(
+        description="node id the brief is about, several node ids joined by ',', or text:<words> for a free-text brief"
+    )
     label: str
     type: str
     last_looked: str | None = Field(default=None, description="date the user last read a brief on this, if any")

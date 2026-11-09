@@ -56,7 +56,7 @@ SUPERSEDE_CONFIDENCE = 0.7
 ANSWER_CONFIDENCE = 0.6
 ANSWER_LATER = 60
 NOW_FRAGMENTS = 15
-NOW_MAX_CHARS = 300
+NOW_MAX_WORDS = 35
 SWEEP_BATCH = 8
 SWEEP_LATER = 8
 BRIEFED_RECENTLY_DAYS = 14
@@ -371,6 +371,7 @@ class Dreamer:
         out = self._call("dream_supersede", "\n".join(lines), SupersedeOutput, validate).output
         newest = self._newest(t)
         user_set = _user_decided(self.conn, list(by_id))
+        answered = _answer_pairs(self.conn)
         for f in frags:
             self._examined.add(("supersede", f.id, t.id))
             self._affected.add(f.entry_id)
@@ -378,6 +379,8 @@ class Dreamer:
             old, new = by_id[p.older], by_id[p.newer]
             if p.confidence < SUPERSEDE_CONFIDENCE or old.id in user_set:
                 continue
+            if (new.id, old.id) in answered:
+                continue  # a later fragment that answers an open item is an answer, not a replacement
             self._propose(
                 old.entry_id,
                 DreamProposal(
@@ -451,6 +454,7 @@ class Dreamer:
                 ),
             )
             self._run.proposed.append(f"{f.id} answers {link.answers}")
+            self._drop_supersede(item_ids[link.answers].entry_id, link.answers, f.id)
         self._thread_state(t.id).answers_through = newest
 
     # 4. Now line
@@ -484,7 +488,7 @@ class Dreamer:
                 raise ValueError("the line is empty")
 
         result = self._call("dream_now", "\n".join(lines), NowOutput, validate)
-        line = " ".join(result.output.line.split())[:NOW_MAX_CHARS]
+        line = _clip_words(result.output.line, NOW_MAX_WORDS)
         self.ctx.write_sidecar(
             keys.thread_now_key(t.id),
             ThreadNow(
@@ -569,6 +573,14 @@ class Dreamer:
         self._new.setdefault(entry_id, []).append(p)
         self._affected.add(entry_id)
 
+    def _drop_supersede(self, entry_id: str, fragment: str, other: str) -> None:
+        """Remove a supersede proposal from this pass for a pair that the answers step linked."""
+        props = self._new.get(entry_id, [])
+        keep = [p for p in props if not (p.kind == "supersede" and p.fragment == fragment and p.other == other)]
+        if len(keep) != len(props):
+            self._new[entry_id] = keep
+            self._run.proposed.remove(f"{fragment} superseded by {other}")
+
     def _stale(self, p: DreamProposal) -> bool:
         """True if this pass looked at the same thing again, so its new result replaces p."""
         key = p.other if p.kind == "answer" else p.fragment
@@ -622,6 +634,30 @@ def _user_decided(conn: sqlite3.Connection, ids: list[str]) -> set[str]:
         f"SELECT id FROM fragments WHERE status_origin = 'user' AND id IN ({','.join('?' * len(ids))})", ids
     )
     return {r[0] for r in rows}
+
+
+def _clip_words(text: str, limit: int) -> str:
+    """At most `limit` words, cut at the last sentence or clause end that fits, else at a word with "…"."""
+    words = text.split()
+    if len(words) <= limit:
+        return " ".join(words)
+    for ends in (".!?", ";", ","):
+        cut = max((i for i, w in enumerate(words[:limit]) if w[-1] in ends), default=-1)
+        if cut >= limit // 2:
+            return " ".join(words[: cut + 1]).rstrip(",;") + ("" if ends == ".!?" else ".")
+    return " ".join(words[:limit]).rstrip(",;.") + "…"
+
+
+def _answer_pairs(conn: sqlite3.Connection) -> set[tuple[str, str]]:
+    """(answering fragment, answered item) for every accepted answer link and every pending proposal."""
+    pairs = {
+        (src.removeprefix("frag:"), dst.removeprefix("frag:"))
+        for src, dst in conn.execute("SELECT src, dst FROM edges WHERE type = 'answers'")
+    }
+    for (payload,) in conn.execute("SELECT payload FROM review_items WHERE kind = 'proposed_answer'"):
+        p = json.loads(payload)
+        pairs.add((p["fragment"], p["answers"]))
+    return pairs
 
 
 def suggestions(conn: sqlite3.Connection) -> dict[str, dict]:

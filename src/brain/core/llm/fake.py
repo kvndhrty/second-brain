@@ -338,6 +338,26 @@ def heuristic_brief(user: str) -> dict[str, Any]:
     return out
 
 
+def heuristic_brief_route(user: str) -> dict[str, Any]:
+    """Candidates whose whole name appears in the request, threads first; a question when one
+    name belongs to things of different types."""
+    request = re.search(r"<request>(.*?)</request>", user, re.S)
+    words = _words(request.group(1) if request else "")
+    named = []
+    for tag, profile in re.findall(r"<candidate ([^>]*)>(.*?)</candidate>", user):
+        a = _attrs(tag)
+        fields = dict(part.split(": ", 1) for part in profile.split("; ") if ": " in part)
+        for name in [fields.get("name", ""), *fields.get("aliases", "").split(", ")]:
+            if _words(name) and _words(name) <= words:
+                named.append((a["type"] != "thread", a["type"], name.lower(), a["id"]))
+                break
+    named.sort()
+    names = [n for _, _, n, _ in named]
+    if len(set(names)) < len(names) and len({t for _, t, _, _ in named}) > 1:
+        return {"targets": [], "clarify": f"Which {names[0]} do you mean?"}
+    return {"targets": [i for *_, i in named][:4], "clarify": None}
+
+
 def heuristic_ask(user: str) -> dict[str, Any]:
     excerpts = re.findall(r'<excerpt entry="([^"]+)"[^>]*>(.*?)</excerpt>', user, re.S)
     if not excerpts:
@@ -418,6 +438,7 @@ DEFAULT_RESPONDERS: dict[str, Responder] = {
     "answers": heuristic_answers,
     "thread_summary": heuristic_summary,
     "brief": heuristic_brief,
+    "brief_route": heuristic_brief_route,
     "ask": heuristic_ask,
     "dream_supersede": heuristic_supersede,
     "dream_answers": heuristic_answers,

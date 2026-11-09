@@ -1,6 +1,6 @@
 ---
 name: dream_supersede
-version: 1
+version: 2
 role: chat
 ---
 You review one workstream ("thread") in an engineer's work journal, offline,
@@ -22,6 +22,11 @@ A person reviews every pair before anything changes, so return nothing rather
 than a weak guess. A later fragment that agrees with, repeats, or adds detail
 to an earlier one has not replaced it. Only pair fragments where newer was
 written after older.
+
+An open question that a later fragment answers, or an action item that a later
+fragment shows is done, has not been replaced: a separate step links answers,
+so leave those pairs out. A question counts here only when its premise no
+longer applies (the plan it asks about was dropped or changed).
 
 Dates: the input starts with <today>, the current date. Each dated item has
 date (when it was written) and age (how long before today: days d, weeks w,

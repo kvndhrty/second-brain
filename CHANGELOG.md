@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- `brief` takes a request in plain words. A request that does not name
+  exactly one thing is routed by the model, which picks one or more threads,
+  people, orgs, or themes, or asks which one you mean.
+- A name shared by a thread and a theme resolves to the thread, and
+  extraction no longer creates themes named after their own thread.
+- Dreaming no longer proposes an answered question as overcome by events.
+  Now lines are capped at 35 words.
+- Extraction is told about people and orgs still waiting in review, skips
+  generic organizations ("the vendor"), and records each point once. A new
+  name in review offers links to people created since it was queued.
+
 ## 0.1.0
 
 First version.

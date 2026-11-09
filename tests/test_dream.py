@@ -146,6 +146,28 @@ def test_answers_found_later_go_to_review(brain):
     assert "proposed_answer" not in kinds(brain)
 
 
+def test_an_answered_question_is_not_also_proposed_as_overcome(brain):
+    q = jot(brain, "Who owns the [[Billing migration]] cutover runbook now?", days_ago=20)
+    a = jot(brain, "Priya now owns the [[Billing migration]] cutover runbook.", days_ago=2)
+    qf, af = frag(brain, q, "Who owns"), frag(brain, a, "Priya")
+    run = dream(brain)
+    assert f"{qf} superseded by {af}" not in run.proposed
+    assert "dream_obe" not in kinds(brain)
+    assert "proposed_answer" in kinds(brain)
+
+
+def test_now_line_is_clipped_to_whole_clauses():
+    from brain.core.dream import _clip_words
+
+    assert _clip_words("Short  and\nfine.", 35) == "Short and fine."
+    words = " ".join(f"w{i}" for i in range(20))
+    clipped = _clip_words(f"{words}. Then {words}.", 35)
+    assert clipped == f"{words}."
+    clipped = _clip_words(f"{words}, then {words}", 35)
+    assert clipped == f"{words}."
+    assert _clip_words(" ".join(["word"] * 50), 35) == " ".join(["word"] * 35) + "…"
+
+
 def test_accepted_dream_answer_closes_the_question(brain):
     q = jot(brain, "Who owns the [[Billing migration]] cutover runbook?", days_ago=20)
     a = jot(brain, "Priya owns the [[Billing migration]] cutover runbook.", days_ago=2)

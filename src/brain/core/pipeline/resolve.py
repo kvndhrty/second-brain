@@ -34,6 +34,7 @@ from brain.core.formats.sidecars import (
     bytes_hash,
 )
 from brain.core.index import queries, search
+from brain.core.index.build import norm_alias
 from brain.core.llm.prompts import load_prompt
 from brain.core.llm.schemas import AnswersOutput, ResolveOutput
 from brain.core.pipeline.context import PipelineContext
@@ -63,8 +64,13 @@ class Mention:
     description: str = ""  # new thread description
 
 
-def collect_mentions(extraction: Extraction, decisions: Decisions) -> list[Mention]:
+def collect_mentions(
+    extraction: Extraction, decisions: Decisions, thread_names: dict[str, str] | None = None
+) -> list[Mention]:
+    """thread_names maps existing thread ids to names. A theme that only repeats the
+    name of its own fragment's thread is dropped: it would duplicate the thread."""
     found: dict[tuple[MentionType, str], Mention] = {}
+    thread_names = thread_names or {}
 
     def add(mtype: MentionType, surface: str, text: str, **extra) -> None:
         m = found.setdefault((mtype, surface), Mention(mtype, surface, **extra))
@@ -77,8 +83,10 @@ def collect_mentions(extraction: Extraction, decisions: Decisions) -> list[Menti
             continue
         for m in f.mentions:
             add(m.type, m.surface, f.text)
+        own = {norm_alias(r.new.name if r.new else thread_names.get(r.thread or "", "")) for r in f.threads} - {""}
         for t in f.themes:
-            add("theme", t.surface, f.text, kind=t.kind)
+            if norm_alias(t.surface) not in own:
+                add("theme", t.surface, f.text, kind=t.kind)
         for r in f.threads:
             if r.new:
                 add("thread", r.new.name, f.text, description=r.new.description)
@@ -306,7 +314,8 @@ def resolve(
     embedding: EmbeddingFile | None,
 ) -> ResolutionFile:
     resolver = Resolver(ctx, entry, decisions)
-    resolver.run(collect_mentions(extraction, decisions))
+    names = {t.id: t.name for t in queries.threads(ctx.conn, states=("active", "proposed", "archived"))}
+    resolver.run(collect_mentions(extraction, decisions, names))
     answers, answers_model = propose_answers(ctx, entry, extraction, decisions, embedding)
     return ResolutionFile(
         entry_id=entry.id,

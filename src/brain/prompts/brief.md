@@ -1,13 +1,18 @@
 ---
 name: brief
-version: 2
+version: 3
 role: chat
 ---
 You write a re-entry brief for an engineer returning to a topic after time
-away. You are given the topic (a thread, person, organization, theme, or free
-text), the date the engineer last looked at it, and the relevant fragments
-from their journal, each with its entry id, date, kind, status, and whether it
-is newer than that date.
+away. You are given one or more topics (threads, people, organizations,
+themes, or free text), the date the engineer last looked at them, and the
+relevant fragments from their journal, each with its entry id, date, kind,
+status, and whether it is newer than that date.
+
+If a request is given, it is what the engineer asked for in their own words.
+Answer it first in where_things_stand, and keep the other sections to what
+bears on it. With several topics, cover each, and say how they affect each
+other when the fragments show it.
 
 Fill each section with short claims. Each claim is one or two sentences and
 lists the entry ids that support it in citations. Use only entry ids that

@@ -14,7 +14,7 @@ from brain.core.formats.decisions import FragmentDecision
 from brain.core.formats.entity import Membership, ObeInfo, Org, Person, Theme, Thread
 from brain.core.formats.yamlio import FormatError
 from brain.core.index.build import norm_alias
-from brain.core.index.queries import entry_dates, fragments_by_id
+from brain.core.index.queries import entry_dates, fragments_by_id, fuzzy_candidates
 from brain.core.storage.base import NotFound
 from brain.core.temporal import iso_day
 from brain.core.vault import Vault
@@ -127,6 +127,12 @@ class Review:
                 frags = fragments_by_id(self.conn, i.payload.get("fragments", []))
                 i.context = [f.text for f in frags.values()]
                 i.others = same_name[(i.payload["type"], i.payload["surface"])] - 1
+                if i.kind != "ambiguous_mention" and not i.payload.get("candidates"):
+                    # Entities created since this item was queued, such as "Priya Raman" for "Priya".
+                    i.payload["candidates"] = [
+                        {"entity_id": c.entity_id, "score": c.score}
+                        for c in fuzzy_candidates(self.conn, i.payload["type"], i.payload["surface"])
+                    ]
             elif i.kind == "proposed_answer":
                 frags = fragments_by_id(self.conn, [i.payload["fragment"], i.payload["answers"]])
                 i.context = [frags[x].text for x in (i.payload["answers"], i.payload["fragment"]) if x in frags]

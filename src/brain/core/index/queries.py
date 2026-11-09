@@ -215,6 +215,20 @@ def fuzzy_candidates(conn: sqlite3.Connection, etype: str, surface: str, *, limi
     return [Candidate(eid, label, round(s, 3)) for s, eid, label in ranked[:limit]]
 
 
+def pending_names(conn: sqlite3.Connection, *, limit: int = 50) -> list[str]:
+    """Names of people and orgs proposed as new and still in review, most recent first."""
+    rows = conn.execute(
+        "SELECT payload FROM review_items WHERE kind IN ('new_person', 'new_org') ORDER BY created_at DESC, id"
+    ).fetchall()
+    names: list[str] = []
+    for (payload,) in rows:
+        p = json.loads(payload)
+        name = f"{p['surface']} ({p['type']})"
+        if name not in names:
+            names.append(name)
+    return names[:limit]
+
+
 def last_mention(conn: sqlite3.Connection, node_id: str) -> str | None:
     """created_at of the newest fragment that mentions or is about this node."""
     r = conn.execute(

@@ -91,10 +91,11 @@ def test_every_model_input_carries_dates(local_storage, state, tmp_path):
             assert not b.process(entry.id).failed
         b.brief("gpu-quota-migration")
         b.brief("Jane Doe")
+        b.brief("what is new with the GPU quota migration and Jane Doe?")
         b.ask("does the vendor support MIG?")
         b.dream()
         called = {name for name, _ in b.llm.calls}
-        expected = {"extract", "resolve", "answers", "thread_summary", "brief", "ask"}
+        expected = {"extract", "resolve", "answers", "thread_summary", "brief", "brief_route", "ask"}
         expected |= {"dream_supersede", "dream_answers", "dream_now", "dream_sweep"}
         assert expected <= called, expected - called
         problems = [p for name, user in b.llm.calls for p in _check(name, user)]

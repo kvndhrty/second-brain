@@ -16,7 +16,7 @@ from brain.core.index import queries, search
 from brain.core.index.build import norm_alias
 from brain.core.index.queries import FragmentRow
 from brain.core.llm.models import LLM
-from brain.core.llm.schemas import AskOutput, BriefOutput, Claim
+from brain.core.llm.schemas import AskOutput, BriefOutput, BriefRoute, Claim
 from brain.core.pipeline.text import attr
 from brain.core.storage.base import NotFound
 from brain.core.storage.lease import LeaseError
@@ -26,6 +26,9 @@ from brain.core.vault import Vault
 RRF_K = 60
 ASK_EXCERPTS = 14
 BRIEF_FRAGMENTS = 120
+ROUTE_HITS = 40
+ROUTE_CANDIDATES = 12
+ROUTE_MAX_TOPICS = 4
 ENTRY_EXCERPT_CHARS = 1200
 NODE_TYPES = ("thread", "person", "org", "theme")
 
@@ -53,15 +56,17 @@ class NodeMatch:
 
 
 class AmbiguousTarget(Exception):
-    def __init__(self, text: str, matches: list[NodeMatch]) -> None:
+    def __init__(self, text: str, matches: list[NodeMatch], *, question: str | None = None) -> None:
         self.matches = matches
+        self.question = question
         names = ", ".join(f"{m.node_id} ({m.label})" for m in matches)
-        super().__init__(f"'{text}' matches several things: {names}. Use one of the ids.")
+        lead = question or f"'{text}' matches several things."
+        super().__init__(f"{lead} Candidates: {names}. Use one of the ids.")
 
 
 @dataclass
 class Brief:
-    target: str  # node id, or "text:<words>" for a free-text brief
+    target: str  # node id, node ids joined by ",", or "text:<words>" for a free-text brief
     label: str
     type: str
     since: datetime | None
@@ -73,6 +78,7 @@ class Brief:
     recorded: bool = True  # False if the brief time could not be saved (e.g. lease held elsewhere)
     fragment_count: int = 0
     notes: list[str] = field(default_factory=list)
+    topics: list[NodeMatch] = field(default_factory=list)  # empty for a free-text brief
 
 
 def _sources(conn, entry_ids: set[str]) -> dict[str, Source]:
@@ -173,7 +179,19 @@ def ask(conn, llm: LLM, question: str, *, now: datetime | None = None) -> Answer
 
 
 def find_targets(conn, text: str) -> list[NodeMatch]:
-    """Nodes that `text` names: an exact node id, an id, an alias, or a close name."""
+    """Nodes that `text` names: an exact node id, an id, an alias, or a close name.
+
+    When a name matches one thread and otherwise only themes (extraction often
+    names a theme after its thread), the thread wins; the themes stay reachable
+    by node id ("theme:<id>"). A thread and a person or org with the same name
+    stay ambiguous.
+    """
+
+    def prefer_thread(found: list[NodeMatch]) -> list[NodeMatch]:
+        threads = [m for m in found if m.type == "thread"]
+        if len(threads) == 1 and all(m.type in ("thread", "theme") for m in found):
+            return threads
+        return found
 
     def match(nid: str) -> NodeMatch | None:
         r = conn.execute("SELECT id, type, label FROM nodes WHERE id = ?", (nid,)).fetchone()
@@ -183,7 +201,7 @@ def find_targets(conn, text: str) -> list[NodeMatch]:
         return [m]
     found = [m for t in NODE_TYPES if (m := match(f"{t}:{text}"))]
     if found:
-        return found
+        return prefer_thread(found)
     alias = norm_alias(text)
     rows = conn.execute(
         "SELECT DISTINCT n.id, n.type, n.label FROM aliases a JOIN nodes n ON n.id = a.node_id WHERE a.alias = ?",
@@ -191,14 +209,14 @@ def find_targets(conn, text: str) -> list[NodeMatch]:
     ).fetchall()
     found = [NodeMatch(*r) for r in rows if r[1] in NODE_TYPES]
     if found:
-        return found
+        return prefer_thread(found)
     rows = conn.execute(
         f"SELECT a.alias, n.id, n.type, n.label FROM aliases a JOIN nodes n ON n.id = a.node_id "
         f"WHERE n.type IN ({','.join('?' * len(NODE_TYPES))})",
         NODE_TYPES,
     ).fetchall()
     close = {(r[1], r[2], r[3]) for r in rows if difflib.SequenceMatcher(None, r[0], alias).ratio() >= 0.85}
-    return [NodeMatch(*c) for c in sorted(close)]
+    return prefer_thread([NodeMatch(*c) for c in sorted(close)])
 
 
 def _node_fragments(conn, node: NodeMatch) -> list[FragmentRow]:
@@ -218,7 +236,7 @@ def _node_fragments(conn, node: NodeMatch) -> list[FragmentRow]:
     return queries.fragments_linked_to(conn, targets, ("mentions",), limit=BRIEF_FRAGMENTS)
 
 
-def _people_block(conn, frags: list[FragmentRow], exclude: str, *, today: date) -> list[str]:
+def _people_block(conn, frags: list[FragmentRow], exclude: set[str], *, today: date) -> list[str]:
     ids = [f"frag:{f.id}" for f in frags]
     if not ids:
         return []
@@ -231,16 +249,15 @@ def _people_block(conn, frags: list[FragmentRow], exclude: str, *, today: date) 
         f"<person {last_mentioned(queries.last_mention(conn, r[0]), today)}>"
         f"{queries.entity_profile(conn, r[0], today=today)}</person>"
         for r in rows
-        if r[0] != exclude
+        if r[0] not in exclude
     ]
 
 
-def _adjacent_activity(conn, node: NodeMatch, frags: list[FragmentRow], *, limit: int = 20) -> list[FragmentRow]:
-    """Fragments in neighbouring threads, people, and themes newer than the last fragment about this node."""
+def _adjacent_activity(conn, own: set[str], frags: list[FragmentRow], *, limit: int = 20) -> list[FragmentRow]:
+    """Fragments in neighbouring threads, people, and themes newer than the last fragment about these nodes."""
     if not frags:
         return []
     cutoff = max(f.created_at for f in frags)
-    own = set(queries.node_family(conn, node.node_id))
     src = [f"frag:{f.id}" for f in frags[-40:]]
     rows = conn.execute(
         f"SELECT DISTINCT dst FROM edges WHERE src IN ({','.join('?' * len(src))}) "
@@ -257,25 +274,89 @@ def _adjacent_activity(conn, node: NodeMatch, frags: list[FragmentRow], *, limit
     return later[-limit:]
 
 
-def _last_brief(vault: Vault, target: str) -> datetime | None:
+def _read_brief_state(vault: Vault) -> BriefState:
     try:
-        state = BriefState.parse(vault.storage.get(keys.BRIEF_STATE), where=keys.BRIEF_STATE)
+        return BriefState.parse(vault.storage.get(keys.BRIEF_STATE), where=keys.BRIEF_STATE)
     except NotFound:
+        return BriefState()
+
+
+def _last_brief(vault: Vault, targets: list[str]) -> datetime | None:
+    """The earliest last brief among the targets; None if any of them was never briefed."""
+    last = _read_brief_state(vault).last
+    if not targets or any(t not in last for t in targets):
         return None
-    return state.last.get(target)
+    return min(last[t] for t in targets)
 
 
-def _record_brief(vault: Vault, target: str, when: datetime) -> bool:
+def _record_brief(vault: Vault, targets: list[str], when: datetime) -> bool:
     try:
-        try:
-            state = BriefState.parse(vault.storage.get(keys.BRIEF_STATE), where=keys.BRIEF_STATE)
-        except NotFound:
-            state = BriefState()
-        state.last[target] = when
+        state = _read_brief_state(vault)
+        for t in targets:
+            state.last[t] = when
         vault.put_bytes(keys.BRIEF_STATE, state.to_bytes())
         return True
     except LeaseError:
         return False
+
+
+def _node_last_activity(conn, node: NodeMatch) -> str | None:
+    if node.type == "thread":
+        t = queries.thread(conn, node.node_id.split(":", 1)[1])
+        return t.last_activity if t else None
+    return queries.last_mention(conn, node.node_id)
+
+
+def _route_candidates(conn, llm: LLM, text: str, named: list[NodeMatch]) -> list[NodeMatch]:
+    """Nodes the request might be about: the ones it names, then the ones linked to the best search hits."""
+    hits = retrieve(conn, llm, text, limit=ROUTE_HITS)
+    src = [f"frag:{i}" for i, t in hits if t == "fragment"]
+    counts: dict[str, int] = {}
+    if src:
+        for (dst,) in conn.execute(
+            f"SELECT dst FROM edges WHERE src IN ({','.join('?' * len(src))}) "
+            "AND type IN ('in_thread', 'mentions', 'about')",
+            src,
+        ):
+            counts[dst] = counts.get(dst, 0) + 1
+    found = {m.node_id: m for m in named}
+    for nid in sorted(counts, key=lambda n: -counts[n]):
+        r = conn.execute("SELECT id, type, label FROM nodes WHERE id = ?", (nid,)).fetchone()
+        if r and r[1] in NODE_TYPES and r[0] not in found:
+            found[r[0]] = NodeMatch(r[0], r[1], r[2])
+    return list(found.values())[:ROUTE_CANDIDATES]
+
+
+def choose_topics(conn, llm: LLM, text: str, *, now: datetime) -> tuple[list[NodeMatch], bool]:
+    """(topics, routed). A request that names exactly one thing needs no model call. Anything
+    else goes to the model, which picks one or more of the candidate nodes, none (a brief on
+    the words themselves), or asks which one is meant (AmbiguousTarget)."""
+    named = find_targets(conn, text)
+    if len(named) == 1:
+        return named, False
+    cands = _route_candidates(conn, llm, text, named)
+    if not cands:
+        return [], False
+    today = local_date(now)
+    by_id = {c.node_id: c for c in cands}
+    lines = [today_el(now), f"<request>{text}</request>", "<candidates>"]
+    for c in cands:
+        lines.append(
+            f'<candidate id="{attr(c.node_id)}" type="{c.type}" '
+            f"{last_mentioned(_node_last_activity(conn, c), today)}>"
+            f"{queries.entity_profile(conn, c.node_id, today=today)}</candidate>"
+        )
+    lines.append("</candidates>")
+
+    def validate(out: BriefRoute) -> None:
+        bad = [t for t in out.targets if t not in by_id]
+        if bad:
+            raise ValueError(f"use only candidate ids; not found: {', '.join(bad)}")
+
+    out = llm.run("brief_route", "\n".join(lines), BriefRoute, validate=validate).output
+    if out.clarify and not out.targets:
+        raise AmbiguousTarget(text, named or cands, question=out.clarify)
+    return [by_id[t] for t in dict.fromkeys(out.targets)][:ROUTE_MAX_TOPICS], True
 
 
 def brief(
@@ -288,43 +369,51 @@ def brief(
     now: datetime | None = None,
     record: bool = True,
 ) -> Brief:
-    """record=False leaves "last looked" unchanged (e.g. when an agent reads a brief for its own context)."""
+    """A brief on what `target` names, or on what a free-form request is about.
+
+    record=False leaves "last looked" unchanged (e.g. when an agent reads a brief for its own context).
+    """
     now = now or datetime.now(UTC)
     today = local_date(now)
-    matches = find_targets(conn, target)
-    if len(matches) > 1:
-        raise AmbiguousTarget(target, matches)
-    summary = None
-    summary_as_of = None
-    topic_state = ""
-    if matches:
-        node = matches[0]
-        frags = _node_fragments(conn, node)
-        key, label, ntype = node.node_id, node.label, node.type
-        if ntype == "thread":
-            t = queries.thread(conn, node.node_id.split(":", 1)[1])
-            summary = t.summary if t else None
-            summary_as_of = t.summary_as_of if t else None
-            if t and t.state in ("archived", "obe"):
-                topic_state = f' state="{"overcome_by_events" if t.state == "obe" else t.state}"'
+    topics, routed = choose_topics(conn, llm, target, now=now)
+    lines = [today_el(now)]
+    if routed:
+        lines.append(f"<request>{target}</request>")
+    summaries: list[tuple[str, str | None]] = []
+    if topics:
+        by_id: dict[str, FragmentRow] = {}
+        for node in topics:
+            by_id.update((f.id, f) for f in _node_fragments(conn, node))
+            topic_state = ""
+            if node.type == "thread":
+                t = queries.thread(conn, node.node_id.split(":", 1)[1])
+                if t and t.summary:
+                    summaries.append((t.summary, t.summary_as_of))
+                if t and t.state in ("archived", "obe"):
+                    topic_state = f' state="{"overcome_by_events" if t.state == "obe" else t.state}"'
+            lines.append(f'<topic type="{node.type}" name="{attr(node.label)}"{topic_state}/>')
+        frags = sorted(by_id.values(), key=lambda f: (f.created_at, f.id))[-BRIEF_FRAGMENTS:]
+        brief_keys = [n.node_id for n in topics]
+        key = ",".join(brief_keys)
+        label = " + ".join(n.label for n in topics)
+        ntype = topics[0].type if len(topics) == 1 else "several"
+        own = {x for n in topics for x in queries.node_family(conn, n.node_id)}
     else:
         hits = retrieve(conn, llm, target, limit=BRIEF_FRAGMENTS)
-        by_id = queries.fragments_by_id(conn, [i for i, t in hits if t == "fragment"])
-        frags = sorted(by_id.values(), key=lambda f: (f.created_at, f.id))
-        key, label, ntype = f"text:{norm_alias(target)}", target, "text"
-    since = since if since is not None else _last_brief(vault, key)
-    lines = [
-        today_el(now),
-        f'<topic type="{ntype}" name="{attr(label)}"{topic_state}/>',
-        f"<last_looked>{since.date().isoformat() if since else 'never'}</last_looked>",
-    ]
-    if summary:
-        lines += [f"<thread_summary {as_of(summary_as_of, today)}>", summary, "</thread_summary>"]
-    lines += _people_block(conn, frags, key, today=today)
+        found = queries.fragments_by_id(conn, [i for i, t in hits if t == "fragment"])
+        frags = sorted(found.values(), key=lambda f: (f.created_at, f.id))
+        key = f"text:{norm_alias(target)}"
+        brief_keys, label, ntype, own = [key], target, "text", set()
+        lines.append(f'<topic type="text" name="{attr(target)}"/>')
+    since = since if since is not None else _last_brief(vault, brief_keys)
+    lines.append(f"<last_looked>{since.date().isoformat() if since else 'never'}</last_looked>")
+    for text, when in summaries:
+        lines += [f"<thread_summary {as_of(when, today)}>", text, "</thread_summary>"]
+    lines += _people_block(conn, frags, own, today=today)
     lines.append("<fragments>")
     lines += [_fragment_line(f, today=today, since=since) for f in frags]
     lines.append("</fragments>")
-    related = _adjacent_activity(conn, matches[0], frags) if matches else []
+    related = _adjacent_activity(conn, own, frags) if topics else []
     if related:
         lines.append("<related_activity>")
         lines += [_fragment_line(f, today=today, since=since) for f in related]
@@ -339,9 +428,10 @@ def brief(
         BriefOutput(),
         open_now,
         {},
-        summary=summary,
-        summary_as_of=summary_as_of,
+        summary=summaries[0][0] if len(summaries) == 1 else None,
+        summary_as_of=summaries[0][1] if len(summaries) == 1 else None,
         fragment_count=len(frags),
+        topics=topics,
     )
     if not frags:
         result.notes.append("No journal fragments are linked to this yet.")
@@ -353,5 +443,5 @@ def brief(
     result.output = llm.run("brief", "\n".join(lines), BriefOutput, validate=validate).output
     cited = {c for claim in result.output.all_claims() for c in claim.citations} | {f.entry_id for f in open_now}
     result.sources = _sources(conn, cited)
-    result.recorded = _record_brief(vault, key, now) if record else False
+    result.recorded = _record_brief(vault, brief_keys, now) if record else False
     return result

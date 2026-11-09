@@ -94,7 +94,7 @@ class SweepOutput(BaseModel):
 
 
 class NowOutput(BaseModel):
-    line: str = Field(description="one sentence, at most about 30 words")
+    line: str = Field(description="one sentence, at most 25 words")
     citations: list[str] = Field(default_factory=list, description="entry ids the line rests on")
 
 
@@ -119,6 +119,16 @@ class BriefOutput(BaseModel):
 
     def all_claims(self) -> list[Claim]:
         return [c for name in BriefOutput.model_fields for c in getattr(self, name)]
+
+
+class BriefRoute(BaseModel):
+    targets: list[str] = Field(
+        default_factory=list,
+        description="candidate ids the brief should cover, most relevant first; empty for a brief on the words alone",
+    )
+    clarify: str | None = Field(
+        default=None, description="a short question to ask instead, only when the candidates do not settle it"
+    )
 
 
 class Probe(BaseModel):

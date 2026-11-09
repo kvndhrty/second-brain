@@ -378,7 +378,9 @@ def active() -> None:
 
 @app.command()
 def brief(
-    target: Annotated[str, typer.Argument(help="A thread, person, org, or theme (name or id), or free text.")],
+    target: Annotated[
+        str, typer.Argument(help="A thread, person, org, or theme (name or id), or a request in plain words.")
+    ],
     since: Annotated[
         str | None, typer.Option(help="Report changes since this date (default: your last brief).")
     ] = None,

@@ -80,7 +80,7 @@ second-brain/                     repository (public on GitHub)
 │  │  ├─ answers.py               ask and brief: retrieval, synthesis, citation checks
 │  │  ├─ services.py              Brain façade (the only API front-ends use)
 │  │  └─ doctor.py                checks returning structured results
-│  ├─ prompts/                    extract.md, resolve.md, thread_summary.md, brief.md, ask.md
+│  ├─ prompts/                    one versioned .md per prompt (extract, resolve, brief, dream_*, …)
 │  ├─ cli/                        Typer app; output via rich
 │  ├─ web/                        FastAPI app; static/ holds the built frontend
 │  └─ mcp/                        MCP tools, served over HTTP (in `start`) or stdio
@@ -647,8 +647,10 @@ A prompt change does not re-run anything by itself; `brain reextract
 --stale-prompts` does that on request.
 
 1. `extract` → extraction sidecar. The prompt includes the 40 most recently
-   active threads (id, name, description, start of the summary) and the names
-   of known people, orgs, and themes, so the model can reuse them. A validator
+   active threads (id, name, description, start of the summary), the names
+   of known people, orgs, and themes, and the people and orgs still waiting in
+   review, so the model can reuse them (a later "Priya" can be written as the
+   pending "Priya Raman" and land in the same review item). A validator
    makes the model retry if it names a thread id that was not offered. Spans
    are found by locating the model's `quote` in the entry (exactly, then
    case-insensitively, then by fuzzy match), since models are unreliable with
@@ -667,6 +669,8 @@ A prompt change does not re-run anything by itself; `brain reextract
      Anything else (a different candidate, "unsure", or "new") goes to review.
    - Themes: the same, plus embedding similarity of theme names. With no
      match, a theme file is created with `state: proposed` and used right away.
+     A theme whose name is the name of its own fragment's thread is dropped
+     before resolution, since it would only duplicate the thread.
    - Threads proposed by the extraction: matched to existing threads by name;
      otherwise a thread file is created with `state: proposed`.
    - Answer proposals: open questions and action items from other entries
@@ -685,7 +689,8 @@ its remaining steps pending; the error is kept in
 (a non-blocking lock in the state directory).
 
 Prompts live in `src/brain/prompts/` (`extract`, `resolve`, `answers`,
-`thread_summary`, `brief`, `ask`, and `probe` for `doctor`).
+`thread_summary`, `brief_route`, `brief`, `ask`, the `dream_*` prompts, and
+`probe` for `doctor`).
 
 ### Review queue
 
@@ -694,6 +699,9 @@ files: a decisions-file mention mapping (`person: {"Mike": mike-chen}`) for
 each affected entry, a new or updated entity file, or a thread/theme `state`.
 Linking or creating a person can apply to every entry with the same unsettled
 name, and adds that name as an alias so future entries link without asking.
+A new-person or new-org item with no stored candidates gets candidates from
+the current entities when it is listed, so after you create "Priya Raman" the
+item for "Priya" offers to link to her.
 Accepting a proposed answer records it on the answering fragment and closes
 the earlier question or action item.
 
@@ -834,12 +842,16 @@ watermark in `state.json`:
 2. Supersession (`dream_supersede`): finds earlier fragments that a later one
    replaced or contradicted. Pairs with confidence at least 0.7 become
    `dream_obe` review items; fragments whose status you set are never proposed.
+   A pair that is also an answer link (accepted, pending in review, or found
+   by step 3 in the same pass) is left out: an answered question is an answer,
+   not a replacement, and review should show it once.
 3. Answers (`dream_answers`): compares the thread's open questions and action
    items with everything written after them in the thread. Write-time answer
    proposals only see the new entry; this sees the whole later history.
    Links you already accepted or rejected are not proposed again.
 4. Now line (`dream_now`): one sentence on where the thread stands, written
-   directly, for the injected context.
+   directly, for the injected context. The prompt asks for 25 words; the code
+   keeps at most 35, cutting at the last sentence or clause end that fits.
 
 Then the sweep step (`dream_sweep`) checks old open and speculative items, in
 batches of 8, against the fragments written after them in their threads and
@@ -893,6 +905,19 @@ called with its sync entry point inside the core.
 `Brief` and `Answer` are typed outputs where each claim carries
 `citations: list[entry_id]`. An output validator rejects citations that are not
 in the retrieved context and asks the model to retry (PydanticAI `ModelRetry`).
+
+Brief targets: a request that names exactly one node (a node id, an id, an
+alias, or a close name) is briefed with no extra model call. When a name
+matches one thread and otherwise only themes, the thread counts as the one
+node. Anything else is routed by the model (`brief_route`, extract role): it
+gets the request and up to 12 candidate nodes (the ones the request names,
+then the ones linked to the best search hits), each with its last activity
+and profile, and returns one to four of them, none (a brief on the request's
+words, from search), or a question when the candidates do not settle it
+(`AmbiguousTarget`, with the candidates). A brief on several nodes combines
+their fragments; its "last looked" is the earliest of theirs, and writing it
+records the time for each. The request is passed to the brief prompt so the
+brief answers it first.
 
 Brief `since` default: the last time a brief was generated for that node
 (`state/briefs.json`); if none, everything. The "what changed" section also
@@ -1120,6 +1145,9 @@ open_items = 5
 | 22 | Dream proposals are stored per entry, so the entry's index rebuild turns them into review items and drops decided ones | made while building dreaming |
 | 23 | Rejecting a supersession records the current status as yours; no new decisions-file field | made while building dreaming |
 | 24 | The injected context includes proposed threads, marked, because new threads stay proposed until reviewed | made while building the injected context |
+| 25 | A name matching one thread and only themes resolves to the thread; thread-named themes are dropped at extraction | made after the Haiku smoke test |
+| 26 | Now lines are capped at 35 words in code, not only in the prompt | made after the Haiku smoke test |
+| 27 | A brief request that does not name exactly one node is routed by the model, which may pick several nodes or ask | agreed after the Haiku smoke test |
 
 ## 11. Not in v1
 

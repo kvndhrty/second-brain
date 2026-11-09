@@ -50,6 +50,9 @@ def build_message(ctx: PipelineContext, entry: Entry) -> tuple[str, set[str]]:
         if names:
             rendered = ", ".join(f"{n} ({', '.join(a)})" if a else n for _, n, a in names)
             lines.append(f"{label}: {rendered}")
+    pending = queries.pending_names(ctx.conn)
+    if pending:
+        lines.append("names awaiting review (not yet confirmed): " + ", ".join(pending))
     lines.append("</known_entities>")
     return "\n".join(lines), offered
 

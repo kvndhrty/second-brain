@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from brain.core import keys, review
-from brain.core.formats.entity import Person, Thread
+from brain.core.formats.entity import Person, Theme, Thread
 from brain.core.formats.sidecars import Extraction, ThreadSummary
 from brain.core.index.db import snapshot
 from brain.core.llm.fake import heuristic_extract
@@ -302,10 +302,71 @@ def test_brief_on_person_and_ambiguous_target(brain):
     jot(brain, "Talked with Jane Doe about evals.")
     from brain.core.answers import AmbiguousTarget
 
-    with pytest.raises(AmbiguousTarget):
+    with pytest.raises(AmbiguousTarget) as e:
         brain.brief("Jane")
+    assert e.value.question == "Which jane do you mean?"
+    assert "person:jane-doe" in str(e.value) and "thread:jane" in str(e.value)
     b = brain.brief("person:jane-doe")
     assert b.type == "person" and b.fragment_count == 1
+
+
+def test_a_theme_named_like_its_thread_resolves_to_the_thread(brain):
+    brain.vault.put_entity(Thread(id="gpu-quota-migration", name="GPU quota migration"))
+    brain.vault.put_entity(Theme(id="gpu-quota-migration", name="GPU quota migration", kind="domain"))
+    jot(brain, "Paired on the [[GPU quota migration]] alerts.")
+    for text in ("gpu-quota-migration", "GPU quota migration"):
+        (match,) = brain.find_targets(text)
+        assert match.node_id == "thread:gpu-quota-migration"
+    assert brain.brief("gpu-quota-migration").type == "thread"
+    assert len(brain.find_targets("theme:gpu-quota-migration")) == 1
+
+
+def test_themes_that_repeat_the_thread_name_are_dropped(brain):
+    jot(brain, "Kicked off the [[Billing migration]] #billing-migration #dual-write.")
+    jot(brain, "More [[Billing migration]] planning #billing-migration.")
+    themes = {r[0] for r in brain.db.conn.execute("SELECT label FROM nodes WHERE type = 'theme'")}
+    assert themes == {"dual write"}
+
+
+def test_pending_names_are_offered_and_linkable_once_created(brain):
+    first = jot(brain, "Paired with Priya Raman on the rollout.")
+    jot(brain, "Today Priya reviewed the rollout doc.")
+    (_, sent) = [c for c in brain.llm.calls if c[0] == "extract"][-1]
+    assert "names awaiting review (not yet confirmed): Priya Raman (person)" in sent
+
+    (full,) = [i for i in brain.review_items() if i.payload.get("surface") == "Priya Raman"]
+    assert full.entry_id == first
+    brain.resolve_review(full.id, review.CreateEntity("Priya Raman"))
+    (short,) = [i for i in brain.review_items() if i.payload.get("surface") == "Priya"]
+    assert [c["entity_id"] for c in short.payload["candidates"]] == ["priya-raman"]
+
+
+def _routes(brain):
+    return [user for name, user in brain.llm.calls if name == "brief_route"]
+
+
+def test_a_request_in_plain_words_is_routed_to_its_thread(brain):
+    jot(brain, "We decided the [[Billing migration]] cutover is in March.")
+    jot(brain, "Paired on the [[GPU quota migration]] alerts.")
+    b = brain.brief("where are we on the billing migration?")
+    assert [t.node_id for t in b.topics] == ["thread:billing-migration"] and b.type == "thread"
+    assert len(_routes(brain)) == 1
+    sent = brain.llm.calls[-1][1]
+    assert "<request>where are we on the billing migration?</request>" in sent
+    brain.brief("billing-migration")  # names one thing: no routing call
+    assert len(_routes(brain)) == 1
+
+
+def test_a_request_about_several_things_briefs_them_together(brain):
+    a = jot(brain, "We decided the [[Billing migration]] cutover is in March.")
+    g = jot(brain, "Paired on the [[GPU quota migration]] alerts.")
+    b = brain.brief("the billing migration and the GPU quota migration")
+    assert b.type == "several" and b.target == "thread:billing-migration,thread:gpu-quota-migration"
+    assert b.label == "Billing migration + GPU quota migration"
+    sent = brain.llm.calls[-1][1]
+    assert sent.count("<topic ") == 2 and a in sent and g in sent
+    last = json.loads(brain.storage.get(keys.BRIEF_STATE))["last"]
+    assert {"thread:billing-migration", "thread:gpu-quota-migration"} <= set(last)
 
 
 def test_active_threads_decay_unless_pinned(brain):

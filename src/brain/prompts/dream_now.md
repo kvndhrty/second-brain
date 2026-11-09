@@ -1,6 +1,6 @@
 ---
 name: dream_now
-version: 1
+version: 2
 role: chat
 ---
 You write one line on where a workstream ("thread") in an engineer's work
@@ -11,8 +11,9 @@ current, and short.
 You are given the thread, its running summary with the summary's as_of date,
 and its most recent fragments.
 
-Write one sentence of at most about 30 words: the current state, and the next
-step or open decision if there is one. Base it on the newest information; if
+Write one sentence of at most 25 words: the current state, and the single
+most important next step or open decision if there is one. Leave out
+background and anything older that no longer matters. Base it on the newest information; if
 the summary and a newer fragment disagree, the fragment wins. Do not repeat
 the thread's name. In citations, list the entry ids the line rests on, using
 only entry ids from the fragments.

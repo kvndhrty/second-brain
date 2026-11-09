@@ -187,8 +187,9 @@ def build_server(
 
     @srv.tool(annotations=READ)
     def brief(target: str, since: str | None = None, mark_seen: bool = False) -> s.BriefResult:
-        """Re-entry brief on a thread, person, org, or theme (name or id), or on free text: where things
-        stand, recent decisions, open items, people, what is speculative or overcome by events, and what
+        """Re-entry brief on a thread, person, org, or theme (name or id), or on a request in plain words
+        ("where are we on the billing move and what does Dana owe us"), which may cover several of them:
+        where things stand, recent decisions, open items, people, what is speculative or overcome by events, and what
         changed since `since` (YYYY-MM-DD; default: when the user last read a brief on it). Set mark_seen
         only if you are showing this brief to the user, so their "last looked" date moves forward."""
         when = datetime.fromisoformat(since).astimezone() if since else None
