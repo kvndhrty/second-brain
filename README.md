@@ -9,27 +9,54 @@ Three front-ends share one core: the CLI, a web UI (`brain start`), and an MCP
 server for agents such as Claude Code. Plain files in a local directory or an
 S3 bucket are the source of truth; the search index is rebuilt from them.
 
+What it does with an entry:
+
+- Splits it into fragments (decisions, questions, action items, claims,
+  ideas) and links them to people, organizations, themes, and threads
+  (workstreams). New people and organizations wait for you to confirm them.
+- Notices when a later entry seems to answer an earlier open question, and
+  asks you before closing it.
+- Writes briefs and answers that cite the dated entries they come from. Every
+  note given to the model carries its date and age, so newer information wins.
+- Runs an offline "dream" pass that rebuilds thread summaries, proposes items
+  that later entries replaced, and writes a one-line status per thread.
+- Gives agents a short, dated summary of current state at the start of each
+  session.
+
 - [docs/usage.md](docs/usage.md): daily use (writing, review, briefs, keeping things current)
 - [docs/restricted-network.md](docs/restricted-network.md): setup on a machine with internal mirrors, S3, and a TLS gateway
 - [docs/architecture.md](docs/architecture.md): design, file formats, and decisions
 
-## Install
+## Requirements
 
-brain needs a uv-managed Python (3.11 or newer). That build includes a recent
-SQLite with FTS5 and allows loading the sqlite-vec extension; some system
-Pythons do not.
+- [uv](https://docs.astral.sh/uv/), which installs a managed Python 3.11 or
+  newer. That build includes a recent SQLite with FTS5 and allows loading the
+  sqlite-vec extension; some system Pythons do not.
+- An OpenAI-compatible model endpoint and an API key: a local proxy such as
+  LiteLLM, a company gateway, or a provider's own compatible endpoint. The
+  chat model should support tool calling or JSON-schema output.
+- Optionally, an embedding model at the same endpoint. Without one, search is
+  keyword-only and new entries are not checked against earlier open questions
+  until `brain dream` runs.
+- Node 22+ and npm only to build the web UI from a clone. A container runtime
+  (podman or docker) only for the MinIO tests.
+
+To try every command without a model endpoint, set `BRAIN_FAKE_LLM=1` (see
+[Commands](#commands)).
+
+## Install
 
 From a release wheel (the web UI is included; no Node needed):
 
 ```sh
-uv tool install --managed-python --python 3.12 https://github.com/<you>/second-brain/releases/download/v0.1.0/brain_journal-0.1.0-py3-none-any.whl
+uv tool install --managed-python --python 3.12 https://github.com/kvndhrty/second-brain/releases/download/v0.1.0/brain_journal-0.1.0-py3-none-any.whl
 ```
 
 From a clone (the web UI is built during install, which needs Node 22+ and npm;
 set `BRAIN_SKIP_FRONTEND=1` to install without the UI):
 
 ```sh
-git clone https://github.com/<you>/second-brain.git
+git clone https://github.com/kvndhrty/second-brain.git
 cd second-brain
 uv tool install --managed-python --python 3.12 .
 ```
@@ -61,6 +88,26 @@ override single values.
 
 The API key is never stored in the config. `llm.api_key_env` names the
 environment variable that holds it (default `BRAIN_API_KEY`).
+
+### Models
+
+`chat_model` writes briefs, answers, summaries, and dream output;
+`extract_model` does extraction, name resolution, and routing, and can be a
+smaller model. For example, Anthropic's OpenAI-compatible endpoint with Claude
+Haiku for both:
+
+```toml
+[llm]
+base_url = "https://api.anthropic.com/v1"
+api_key_env = "ANTHROPIC_API_KEY"
+chat_model = "claude-haiku-5-5"
+extract_model = "claude-haiku-5-5"
+embed_model = ""                  # Anthropic serves no embedding model
+```
+
+Chat and embedding calls go to the same `base_url`. To use embeddings with a
+provider that has none, put a proxy in front that serves both, such as
+LiteLLM routing embeddings to a local model.
 
 ### S3 bucket + local proxy
 
@@ -112,13 +159,13 @@ brain uses the OS trust store.
 | `brain init` | Write a config file interactively |
 | `brain doctor` | Check config, storage, lease, TLS, proxies, model endpoints, structured output, and the index |
 | `brain jot` | Save an entry from `-m TEXT`, `--file`, stdin, or `$EDITOR`, then process it |
-| `brain review` | Confirm new people and orgs, proposed themes and threads, and proposed answers |
+| `brain review` | Confirm new people and orgs, proposed themes and threads, proposed answers, and items dreaming thinks are overcome by events |
 | `brain active` | Threads with recent activity, plus pinned ones |
-| `brain brief TARGET` | Re-entry brief on a thread, person, org, theme, or free text |
+| `brain brief TARGET` | Re-entry brief on a thread, person, org, or theme, or on a request in plain words that may cover several of them |
 | `brain ask "QUESTION"` | Answer from the journal, citing dated entries |
 | `brain show [ENTRY]` | An entry's fragments with ids and status (default: latest) |
 | `brain status FRAGMENT --obe/--speculative/--confirmed/--closed/--open/--someday` | Change a fragment's status |
-| `brain thread list/rename/pin/archive/obe/merge/split/move/show` | Manage threads |
+| `brain thread list/show/rename/pin/unpin/archive/activate/obe/merge/split/move` | Manage threads |
 | `brain sweep` | Go through stale open items, unconfirmed speculation, and quiet threads |
 | `brain dream [--dry-run] [--thread ID]` | Offline consolidation: rebuild stale summaries, propose superseded and answered items, check the sweep, write each thread's Now line |
 | `brain context [--format json]` | A short, dated summary of current state for agent sessions |

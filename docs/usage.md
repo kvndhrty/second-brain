@@ -39,8 +39,14 @@ close the earlier item only if you accept them.
   Threads you pin stay listed; others drop off after `threads.inactivity_days`.
 - `brain brief "GPU quota migration"`: where things stand, recent decisions,
   open items, who is involved, what is speculative or overcome by events, and
-  what changed since you last asked. Works for threads, people, orgs, themes,
-  or free text. Every claim cites the entries it comes from.
+  what changed since you last asked. Works for threads, people, orgs, and
+  themes by name or id, with no extra model call. Every claim cites the
+  entries it comes from.
+- `brain brief "where are we on the GPU move, and what is Priya waiting on?"`:
+  a request in plain words. The model picks the threads, people, orgs, or
+  themes it is about (several if it asks about several), and the brief
+  answers the request first. If the request could mean two different things,
+  brief asks which one and lists the ids to use.
 - `brain ask "when did we decide to move the eval cluster?"`: a direct answer
   with citations.
 
