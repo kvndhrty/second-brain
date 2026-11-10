@@ -376,6 +376,8 @@ def heuristic_correction_targets(user: str) -> dict[str, Any]:
     page = re.search(r'<written_from_page id="([^"]+)"', user)
     if not named and page:
         named = [page.group(1)]  # "this is finished", written from that page
+    if not named and op in ("close", "reopen") and cands:
+        named = [cands[0][0]["id"]]  # the likeliest piece of work comes first
     if op in ("same_as", "not_same_as", "not_part_of"):
         return {"targets": named[:2]}
     new_name = None

@@ -2,7 +2,7 @@
 
 `brain start` writes `$XDG_STATE_HOME/brain/server.json` with its pid, port,
 and store. `brain jot` reads it and, if that process is alive and serves the
-same store, asks it to process the new entry instead of doing it in the
+same store, asks it to process the new note instead of doing it in the
 foreground.
 """
 

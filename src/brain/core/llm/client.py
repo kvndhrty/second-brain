@@ -1,8 +1,7 @@
 """OpenAI-compatible HTTP client shared by every model call.
 
-One httpx2 transport carries the TLS settings, so the chat, extraction, and
-embedding endpoints all use the same CA, client certificate, and proxy
-environment. Milestone 2 adds the PydanticAI models on top of this client.
+One httpx2 transport carries the TLS settings, so the chat and embedding
+endpoints use the same CA, client certificate, and proxy environment.
 """
 
 from __future__ import annotations

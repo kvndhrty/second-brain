@@ -28,14 +28,20 @@ not, see [Correcting](#correcting).
 
 ## What happens to a note
 
-`brain show` prints what brain made of your latest note:
+`brain show` prints what brain made of your latest note. For the note
+"Kicked off the storage migration with Priya Raman from the Platform Team.
+Decided the cutover will be in the first week of December. Open question:
+does the new object store support object lock?" it prints something like:
 
 ```
-• Priya Raman and the writer decided to cut over the storage migration in December.
+• The storage migration was kicked off with Priya Raman from the Platform Team.
+  fact · Storage migration
+• The cutover of the storage migration was decided for the first week of December.
   decision · Storage migration
-• Does the new object store support object lock?
+• Open question: does the new object store support object lock?
   question · Storage migration
-mentions: Storage migration (thread), Priya Raman (person)
+mentions: Storage migration (thread), Priya Raman (person), Platform Team (org)
+→ New org: Platform Team (provisional)
 → New person: Priya Raman
 → New thread: Storage migration (provisional)
 ```

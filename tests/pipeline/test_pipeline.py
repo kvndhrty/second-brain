@@ -131,7 +131,32 @@ def test_repeated_statement_is_recorded_once_on_the_page(brain):
     assert len(thread_page(brain, "Vendor evaluation").history) == 1
 
 
+def test_a_repeat_shares_the_fate_of_what_it_repeats(brain):
+    write(brain, "We decided the [[Launch plan]] date is March 3.")
+    write(brain, "We decided the [[Launch plan]] date is March 3.", 1)
+    write(brain, "We decided the [[Launch plan]] date is April 9 instead.", 2)
+    page = brain.page("Launch plan")
+    assert [s.text for s in page.decided] == ["We decided the Launch plan date is April 9 instead."]
+    assert all(s.status == "superseded" for s in page.history if "March" in s.text)
+
+
+def test_a_topic_name_can_mean_a_thread(brain):
+    write(brain, "Started [[SRE]] hiring today.")
+    nid = write(brain, "The SRE budget was approved.", 1)
+    links = LinksFile.parse(brain.storage.get(keys.layer_key(nid, "links")), where="links").links
+    assert [(ln.surface, ln.entity) for ln in links] == [("SRE", "sre")]
+    assert [e.type for e in brain.world().roots()] == ["thread"]  # no second "SRE" was created as a topic
+
+
 # --- layer 6b: corrections are notes ---------------------------------------------------
+
+
+def test_same_person_note_about_names_already_linked_changes_nothing(brain):
+    write(brain, "Met Jane Doe about budgets.")
+    write(brain, "Jane Doe and Jane are the same person.", 1)
+    kinds_seen = [e.kind for e in brain.log()]
+    assert "noted" in kinds_seen and "ignored" not in kinds_seen and "merged" not in kinds_seen
+    assert len(brain.world().roots("person")) == 1
 
 
 def test_same_person_note_merges_two_people(brain):
@@ -179,6 +204,25 @@ def test_close_and_reopen_notes(brain):
     assert thread_page(brain).status == "closed"
     write(brain, "Reopen the GPU quota migration.", 4)
     assert thread_page(brain).status == "active"
+
+
+def test_closing_a_thread_by_another_wording(brain):
+    write(brain, "Started the [[Vendor evaluation]] today.")
+    write(brain, "Dana Okafor signed the contract for the [[Vendor evaluation]]. Choosing a vendor is finished.", 1)
+    assert brain.page("Vendor evaluation").status == "closed"  # found through the note's other statements
+
+
+def test_an_answer_that_is_not_the_asked_shape_is_rejected():
+    """In prompted mode a small model sometimes returns the schema itself. That must not read as an empty answer."""
+    import pytest
+    from pydantic import ValidationError
+
+    from brain.core.llm.schemas import AskOutput, NamesOut, SplitOut, SummaryOut, TargetsOut
+
+    echoed = {"properties": {"targets": {"type": "array"}}, "type": "object"}
+    for schema in (TargetsOut, NamesOut, SplitOut, SummaryOut, AskOutput):
+        with pytest.raises(ValidationError):
+            schema.model_validate(echoed)
 
 
 def test_retract_note_hides_statements_but_keeps_the_note(brain):

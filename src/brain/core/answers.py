@@ -241,7 +241,7 @@ def brief(
     refs = [views.Ref(t.id, t.type, t.name) for t in topics]
     statuses = {t.id: t.status for t in topics}
     if not allowed:
-        return Brief(text, refs, since, BriefOutput(), {}, routed=routed, statuses=statuses)
+        return Brief(text, refs, since, BriefOutput(where_things_stand=[]), {}, routed=routed, statuses=statuses)
 
     def validate(out: BriefOutput) -> None:
         for c in out.all_claims():

@@ -1,6 +1,6 @@
 ---
 name: brief
-version: 4
+version: 5
 role: answer
 ---
 You write a re-entry brief for a person returning to a topic in their work
@@ -28,7 +28,9 @@ appear in the input; a claim with no support must be left out.
 If a topic has status "closed", say so in the first claim of
 where_things_stand, and describe everything else as history.
 
-Leave a section empty rather than padding it. Keep the writer's hedges:
+Leave a section empty rather than padding it. State what the journal says;
+do not describe the input, the summaries, or how the journal is organized,
+and do not remark that information is recent. Keep the writer's hedges:
 something written as a possibility must not be stated as fact.
 
 Dates: the input starts with <today>, the current date. Each dated item has

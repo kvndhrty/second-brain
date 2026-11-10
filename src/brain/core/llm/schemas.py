@@ -3,6 +3,11 @@
 Every layer's output is a choice from a list or a short structure, so a small
 model can produce it and code can check it. Field descriptions are sent to the
 model as part of the schema.
+
+The main field of each output is required, with no default. A model that
+answers with something else entirely (in prompted mode, sometimes the schema
+itself) then fails validation and is asked again, instead of being read as an
+empty answer.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ class SplitItem(BaseModel):
 
 
 class SplitOut(BaseModel):
-    statements: list[SplitItem] = Field(default_factory=list)
+    statements: list[SplitItem]
 
 
 class KindOut(BaseModel):
@@ -33,7 +38,7 @@ class SpottedName(BaseModel):
 
 
 class NamesOut(BaseModel):
-    names: list[SpottedName] = Field(default_factory=list)
+    names: list[SpottedName]
 
 
 class ChoiceOut(BaseModel):
@@ -54,7 +59,7 @@ class OpOut(BaseModel):
 
 
 class TargetsOut(BaseModel):
-    targets: list[str] = Field(default_factory=list, description="candidate ids, in the order the rule asks for")
+    targets: list[str] = Field(description="candidate ids, in the order the rule asks for; empty if none apply")
     new_name: str | None = Field(default=None, description="only for rename: the new name")
 
 
@@ -65,11 +70,11 @@ class Cited(BaseModel):
 
 class NowOut(BaseModel):
     text: str = Field(description="one or two sentences, at most 40 words")
-    citations: list[str] = Field(default_factory=list, description="note ids the text rests on")
+    citations: list[str] = Field(description="note ids the text rests on")
 
 
 class SummaryOut(BaseModel):
-    sentences: list[Cited] = Field(default_factory=list)
+    sentences: list[Cited]
 
 
 class CheckOut(BaseModel):
@@ -100,12 +105,12 @@ class Claim(BaseModel):
 
 
 class AskOutput(BaseModel):
-    claims: list[Claim] = Field(default_factory=list)
+    claims: list[Claim]
     insufficient: bool = False
 
 
 class BriefOutput(BaseModel):
-    where_things_stand: list[Claim] = Field(default_factory=list)
+    where_things_stand: list[Claim]
     recent_decisions: list[Claim] = Field(default_factory=list)
     open_items: list[Claim] = Field(default_factory=list)
     people: list[Claim] = Field(default_factory=list)
@@ -118,7 +123,6 @@ class BriefOutput(BaseModel):
 
 class BriefRoute(BaseModel):
     targets: list[str] = Field(
-        default_factory=list,
         description="candidate ids the brief should cover, most relevant first; empty for a brief on the words alone",
     )
     clarify: str | None = Field(

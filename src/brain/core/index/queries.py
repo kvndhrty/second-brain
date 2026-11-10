@@ -14,6 +14,7 @@ import sqlite3
 from dataclasses import dataclass
 from functools import cached_property
 
+from brain.core import keys
 from brain.core.formats.records import OPEN_KINDS, EntityRecord, norm_name
 
 # Statements shown on pages and given to models as knowledge. Corrections are
@@ -150,14 +151,15 @@ class World:
 
     def _load_effects(self) -> None:
         c = self.conn
-        self.retracted: set[str] = set()
+        self.retracted: dict[str, str] = {}  # statement -> the correction statement that retracted it
         self.moves: dict[str, str] = {}
         ops = c.execute(
             "SELECT statement_id, op, targets, moved FROM operations ORDER BY created_at DESC, id DESC"
         ).fetchall()
         for sid, op, targets, _ in ops:  # newest first: a retraction that was itself retracted does nothing
             if op == "retract" and sid not in self.retracted:
-                self.retracted.update(json.loads(targets))
+                for target in json.loads(targets):
+                    self.retracted.setdefault(target, sid)
         for sid, op, targets, moved in reversed(ops):  # oldest first: the latest move wins
             if op == "not_part_of" and sid not in self.retracted:
                 t = json.loads(targets)
@@ -172,6 +174,15 @@ class World:
             else:
                 self.by_rel[rel][dst] = src
 
+    def _fate(self, sid: str) -> tuple[str, str | None]:
+        """(status, the statement that caused it) from retractions and relations aimed at this statement."""
+        if sid in self.retracted:
+            return "retracted", self.retracted.get(sid)
+        for rel, status in (("supersedes", "superseded"), ("answers", "answered")):
+            if sid in self.by_rel[rel]:
+                return status, self.by_rel[rel][sid]
+        return "current", None
+
     def _stmt(self, r: sqlite3.Row) -> Stmt:
         sid = r["id"]
         s = Stmt(
@@ -183,14 +194,16 @@ class World:
             r["created_at"],
             self.root(self.moves.get(sid, r["thread_id"])),
         )
-        if sid in self.retracted:
-            s.status = "retracted"
-        elif sid in self.by_rel["supersedes"]:
-            s.status, s.by = "superseded", self.by_rel["supersedes"][sid]
-        elif sid in self.by_rel["answers"]:
-            s.status, s.by = "answered", self.by_rel["answers"][sid]
-        elif sid in self.by_rel["repeats"]:
-            s.status, s.by = "repeat", self.by_rel["repeats"][sid]
+        s.status, s.by = self._fate(sid)
+        said = self.by_rel["repeats"].get(sid)
+        if s.status == "current" and said:
+            status, by = self._fate(said)
+            if status in ("current", "answered"):
+                s.status, s.by = "repeat", said
+            elif by and keys.note_of_statement(sid) < keys.note_of_statement(by):
+                # Said again before the change, so it shares the fate of what it repeats.
+                # Said again in or after the note that made the change, it stands.
+                s.status, s.by = status, by
         return s
 
     # --- statements --------------------------------------------------------

@@ -1,6 +1,6 @@
 """The storage interface every backend implements.
 
-Keys are '/'-separated relative paths such as 'entries/2026/10/30/x.md'. A
+Keys are '/'-separated relative paths such as 'notes/2026/10/30/x.md'. A
 backend maps them onto its own namespace (a directory, or a bucket prefix).
 """
 

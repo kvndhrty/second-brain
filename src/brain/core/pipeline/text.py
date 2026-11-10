@@ -10,7 +10,7 @@ from collections.abc import Iterable
 from datetime import date
 from typing import TYPE_CHECKING
 
-from brain.core.temporal import dated, last_mentioned
+from brain.core.temporal import dated, last_mentioned, local_date
 
 if TYPE_CHECKING:
     from brain.core.formats.note import Note
@@ -32,7 +32,8 @@ def note_el(note: Note, today: date) -> str:
     if len(body) > NOTE_CHARS:
         body = body[:NOTE_CHARS] + "\n[…]"
     about = f' about_page="{attr(note.about)}"' if note.about else ""
-    return f'<note id="{note.id}" {dated(note.created, today)}{about}>\n{body}\n</note>'
+    weekday = local_date(note.created).strftime("%A")
+    return f'<note id="{note.id}" {dated(note.created, today)} weekday="{weekday}"{about}>\n{body}\n</note>'
 
 
 def stmt_el(s: Stmt, today: date, *, tag: str = "statement", with_id: bool = True, extra: str = "") -> str:

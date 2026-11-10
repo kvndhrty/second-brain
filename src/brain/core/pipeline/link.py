@@ -59,11 +59,17 @@ def _candidates(ctx: PipelineContext, ref: NameRef) -> tuple[Ent | None, list[En
     if len(exact) == 1:
         return exact[0], []
     if not exact:
-        # The same name may have been typed differently in another note (a team as org, then as topic).
-        other = [e for e in world.by_name(ref.surface) if e.type in NAME_TYPES]
-        if len(other) == 1:
+        # The same name may have been typed differently in another note (a team as org, then as
+        # topic), and what one note calls a topic may be a thread ("the storage migration").
+        other = world.by_name(ref.surface)
+        if len(other) == 1 and (other[0].type in NAME_TYPES or ref.type == "topic"):
             return other[0], []
-    return None, exact or world.similar(ref.surface, ref.type, limit=CANDIDATES)
+    if exact:
+        return None, exact
+    cands = world.similar(ref.surface, ref.type, limit=CANDIDATES)
+    if ref.type == "topic":
+        cands += [t for t in world.similar(ref.surface, "thread", limit=CANDIDATES) if t not in cands]
+    return None, cands[:CANDIDATES]
 
 
 def link(ctx: PipelineContext, calls: Calls, note: Note, names: list[NameRef], today: date) -> list[Link]:

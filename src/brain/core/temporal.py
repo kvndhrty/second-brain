@@ -3,10 +3,10 @@
 Every note given to a model carries the date it was written and its age
 relative to today, so the model can tell newer information from older without
 doing date arithmetic. Summaries and other derived text carry `as_of`: the date
-of the newest entry they cover.
+of the newest note they cover.
 
 Dates are local calendar dates in the machine's time zone (set `TZ` to change
-it). Stored timestamps stay UTC; only what is shown is converted, so an entry
+it). Stored timestamps stay UTC; only what is shown is converted, so a note
 written in the evening is dated the day it was written.
 """
 
@@ -70,7 +70,7 @@ def as_of(value: When | None, today: date) -> str:
 
 
 def last_mentioned(value: When | None, today: date) -> str:
-    """Attributes for an entity: when a fragment last mentioned it."""
+    """Attributes for an entity: when a statement last mentioned it."""
     if value is None:
         return 'last_mentioned="never"'
     return f'last_mentioned="{iso_day(value)}" age="{age(value, today)}"'

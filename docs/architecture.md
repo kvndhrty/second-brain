@@ -209,7 +209,8 @@ Layers 1 to 6 run per note, in order, as soon as a note exists. Layers 7 and
 | 9 | Dream | see section 7 | | |
 
 - **Layer 4.** Code links a name with no call when it matches exactly one
-  known name. Candidates for the rest have a similar spelling or share a
+  known name. A topic name may turn out to be a thread ("the storage
+  migration"), so threads are candidates for topics. Candidates for the rest have a similar spelling or share a
   whole word ("Jane" and "Jane Doe"). `new` creates a provisional entity. It
   gets a page when a second note mentions it; a person written with a full
   name gets one at once. Names are processed longest first, so "Jane Doe"
@@ -218,14 +219,19 @@ Layers 1 to 6 run per note, in order, as soon as a note exists. Layers 7 and
   chosen for this note, and the threads of the nearest earlier statements (by
   embedding) and of statements about the same entities. A new thread is
   provisional until a second note files something under it.
-- **Layer 6.** A new statement is compared with up to three earlier ones: the
-  nearest in meaning among those in the same thread, about the same entities,
-  or close by embedding. Only pairs that can relate are compared (anything
-  but a question can answer an open question or action; a decision or fact
-  can supersede a decision, fact, or idea). At most 24 pairs per note.
-- **Layer 7.** The summary is updated from the previous summary plus the new
-  statements once three have arrived. It is rebuilt from all statements when
-  one it covered has been superseded, answered, or retracted, and by dreaming.
+- **Layer 6.** A new statement is compared with at most four earlier ones,
+  nearest in meaning first: up to two open questions or actions from its
+  thread and from the pages it mentions (a question itself answers nothing),
+  and, for a decision or fact, one or two earlier decisions or facts in the
+  same thread, which it may replace. A statement with no thread and no names
+  is compared with its nearest neighbours by embedding. At most 24 pairs per
+  note. A statement that repeats an earlier one is hidden; if what it repeats
+  was replaced or retracted later, the repeat goes with it.
+- **Layer 7.** A thread's summary is updated from the previous summary plus
+  the new statements once five have arrived (eight for a person, org, or
+  topic). It is rebuilt from all statements when one it covered was
+  retracted or a decision it covered was replaced, and by dreaming. A
+  sentence carried over unchanged is not checked again.
 - **Layer 8.** A sentence that is not supported is dropped. When nothing
   survives, the section stays as it was.
 

@@ -60,7 +60,7 @@ def names(calls: Calls, note: Note, today: date) -> list[NameRef]:
         if bad:
             raise ValueError("return names exactly as written in the note; not in the note: " + ", ".join(bad))
 
-    out = calls.ask("names", note_el(note, today), NamesOut, fallback=NamesOut(), validate=validate)
+    out = calls.ask("names", note_el(note, today), NamesOut, fallback=NamesOut(names=[]), validate=validate)
     seen: set[str] = set()
     result = []
     for n in out.names:

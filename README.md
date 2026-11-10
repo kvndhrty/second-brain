@@ -128,7 +128,9 @@ provider that has none, put a proxy in front that serves both, such as
 LiteLLM routing embeddings to a local model.
 
 A note costs roughly 10 to 25 small model calls, depending on how many
-statements and names it has.
+statements and names it has; in a test with Claude Haiku the average was 15,
+each taking one to three seconds. Notes are processed in the background, so
+writing never waits on this.
 
 ### S3 bucket + local proxy
 

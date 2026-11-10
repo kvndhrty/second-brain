@@ -23,12 +23,12 @@ from brain.core.index.queries import CONTENT_KINDS, Ent, Stmt, World
 from brain.core.llm.schemas import OpOut, RelationOut, TargetsOut
 from brain.core.pipeline import link as link_layer
 from brain.core.pipeline.context import Calls, PipelineContext
-from brain.core.pipeline.text import attr, candidate_el, stmt_el
+from brain.core.pipeline.text import attr, candidate_el, stmt_el, words
 from brain.core.storage.base import NotFound
 from brain.core.temporal import local_date, today_el
 
 PROMPTS = ("relate", "correction_op", "correction_targets")
-PAIRS_PER_STATEMENT = 3
+OPEN_PAIRS = 2  # open questions and actions a statement is compared with
 PAIRS_PER_NOTE = 24
 POOL = 200
 RETRACT_CANDIDATES = 10
@@ -44,47 +44,57 @@ def _dot(a: bytes, b: bytes) -> float:
     return sum(p * q for p, q in zip(x, y, strict=False))
 
 
-def _eligible(new_kind: str, old: Stmt) -> bool:
-    if not old.is_current:
-        return False
-    if old.kind in OPEN_KINDS:
-        return new_kind != "question"
-    return new_kind in ("decision", "fact") and old.kind in ("decision", "fact", "idea")
-
-
 def _earlier(ctx: PipelineContext, world: World, note: Note, s: Stmt) -> list[Stmt]:
-    """Earlier statements this one most plausibly affects: same thread or entity, or nearest in meaning."""
+    """Earlier statements this one may settle or replace, nearest in meaning first.
+
+    Open questions and actions come from the statement's thread and from pages
+    it mentions: any statement but a question may answer one. A decision or
+    fact may also replace an earlier decision or fact in the same thread. A
+    statement with no thread and no names is compared with its nearest
+    neighbours by embedding instead.
+    """
+    if s.kind == "question":
+        return []
+    related = ([s.thread] if s.thread else []) + world.entities_of([s.id])[s.id]
     pool: dict[str, Stmt] = {}
-    related = [s.thread] if s.thread else []
-    related += world.entities_of([s.id])[s.id]
     for e in related:
         for other in world.of_entity(e)[-POOL:]:
             pool[other.id] = other
     vec = queries.vectors(ctx.conn, [s.id]).get(s.id)
-    if vec is not None:
-        hits = [h.item_id for h in search.nearest_blob(ctx.conn, vec, k=12) if h.item_type == "statement"]
+    if not related and vec is not None:
+        hits = [h.item_id for h in search.nearest_blob(ctx.conn, vec, k=8) if h.item_type == "statement"]
         pool.update(world.by_id(hits))
-    cands = [
+    earlier = [
         o
         for o in pool.values()
-        if o.note_id != note.id and o.created_at <= s.created_at and o.kind in CONTENT_KINDS and _eligible(s.kind, o)
+        if o.note_id != note.id and o.created_at <= s.created_at and o.kind in CONTENT_KINDS and o.is_current
     ]
-    if vec is None:
-        return sorted(cands, key=lambda o: o.created_at, reverse=True)[:PAIRS_PER_STATEMENT]
-    vecs = queries.vectors(ctx.conn, [o.id for o in cands])
-    scored = sorted(cands, key=lambda o: (-_dot(vec, vecs[o.id]) if o.id in vecs else 0.0, o.id))
-    return scored[:PAIRS_PER_STATEMENT]
+    vecs = queries.vectors(ctx.conn, [o.id for o in earlier]) if vec is not None else {}
+
+    def nearest(cands: list[Stmt], n: int, mine: bytes | None = vec) -> list[Stmt]:
+        if mine is None:
+            return sorted(cands, key=lambda o: o.created_at, reverse=True)[:n]
+        return sorted(cands, key=lambda o: (-_dot(mine, vecs[o.id]) if o.id in vecs else 0.0, o.id))[:n]
+
+    out = nearest([o for o in earlier if o.kind in OPEN_KINDS], OPEN_PAIRS)
+    if s.kind in ("decision", "fact"):
+        same_thread = [o for o in earlier if o.kind in ("decision", "fact") and (o.thread == s.thread or not related)]
+        out += nearest(same_thread, 2 if s.kind == "decision" else 1)
+    return out
 
 
 def relate(ctx: PipelineContext, calls: Calls, note: Note, now: datetime) -> list[Relation]:
     today = local_date(now)
     world = ctx.world()
     relations: list[Relation] = []
+    settled: set[str] = set()  # earlier statements this note has already answered or replaced
     pairs = 0
     for s in world.of_note(note.id):
         if s.kind not in CONTENT_KINDS:
             continue
         for old in _earlier(ctx, world, note, s):
+            if old.id in settled:
+                continue
             if pairs >= PAIRS_PER_NOTE:
                 return relations
             pairs += 1
@@ -105,6 +115,7 @@ def relate(ctx: PipelineContext, calls: Calls, note: Note, now: datetime) -> lis
                 continue
             relations.append(Relation(src=s.id, dst=old.id, rel=out.relation))
             if out.relation != "repeats":
+                settled.add(old.id)
                 verb = "Answered" if out.relation == "answers" else "Replaced"
                 calls.log(out.relation, f'{verb}: "{old.text}" by "{s.text}"', old.thread)
     return relations
@@ -124,8 +135,31 @@ def _named_entities(world: World, text: str) -> list[str]:
     return [eid for _, eid in sorted(found, key=lambda x: (-x[0], x[1]))]
 
 
-def _entity_candidates(world: World, note: Note, s: Stmt, linked: list[str], op: str = "") -> list[str]:
-    """Entities a correction may be about: named in it (longest name first), mentioned by it, or its page."""
+def _shares_words(world: World, text: str) -> list[str]:
+    """Surviving entities at least half of whose name's words appear in the text ("SRE hiring" for "SRE opening hiring")."""
+    said = words(text)
+    scored: list[tuple[float, str]] = []
+    for e in world.roots(with_provisional=False):
+        best = 0.0
+        for n in world.names_of(e.id):
+            w = words(n)
+            if w:
+                best = max(best, len(w & said) / len(w))
+        if best >= 0.5:
+            scored.append((best, e.id))
+    return [eid for _, eid in sorted(scored, key=lambda x: (-x[0], x[1]))]
+
+
+def _entity_candidates(
+    ctx: PipelineContext, world: World, note: Note, s: Stmt, linked: list[str], op: str = ""
+) -> list[str]:
+    """Entities a correction may be about, most likely first.
+
+    Named in it (longest name first), mentioned by it, the page it was written
+    on, the threads of the note's other statements, entities whose names share
+    words with it, the other names in the note, and the threads of the nearest
+    earlier statements.
+    """
     out: list[str] = []
 
     def add(eid: str | None) -> None:
@@ -137,8 +171,17 @@ def _entity_candidates(world: World, note: Note, s: Stmt, linked: list[str], op:
     for eid in world.entities_of([s.id])[s.id]:
         add(eid)
     add(note.about)
+    for other in world.of_note(note.id):
+        add(other.thread)
+    for eid in _shares_words(world, s.text):
+        add(eid)
     for eid in linked:
         add(world.root(eid))
+    vec = queries.vectors(ctx.conn, [s.id]).get(s.id)
+    if vec is not None:
+        hits = [h.item_id for h in search.nearest_blob(ctx.conn, vec, k=8) if h.item_type == "statement"]
+        for near in world.by_id(hits).values():
+            add(near.thread)
     if op in ("close", "reopen"):
         # Closing applies to pieces of work, so threads come first.
         out.sort(key=lambda eid: world.entities[eid].type != "thread")
@@ -160,7 +203,7 @@ def _statement_candidates(ctx: PipelineContext, world: World, note: Note, s: Stm
     if vec is not None:
         hits = [h.item_id for h in search.nearest_blob(ctx.conn, vec, k=20) if h.item_type == "statement"]
         pool.update(world.by_id(hits))
-    for eid in _entity_candidates(world, note, s, linked):
+    for eid in _entity_candidates(ctx, world, note, s, linked):
         root = world.root(eid)
         if root:
             for other in world.of_entity(root)[-8:]:
@@ -174,6 +217,7 @@ def _statement_candidates(ctx: PipelineContext, world: World, note: Note, s: Stm
 def corrections(ctx: PipelineContext, calls: Calls, note: Note, linked: list[str], now: datetime) -> list[Operation]:
     today = local_date(now)
     ops: list[Operation] = []
+    retracted: set[str] = set()  # by this note, so two sentences of one correction do not repeat each other
     for s in ctx.world().of_note(note.id):
         if s.kind != "correction":
             continue
@@ -187,11 +231,11 @@ def corrections(ctx: PipelineContext, calls: Calls, note: Note, linked: list[str
             calls.log("ignored", f'Could not tell what this correction asks for: "{s.text}"')
             continue
         if op == "retract":
-            stmts = _statement_candidates(ctx, world, note, s, linked)
+            stmts = [o for o in _statement_candidates(ctx, world, note, s, linked) if o.id not in retracted]
             ids = [o.id for o in stmts]
             shown = [stmt_el(o, today, tag="candidate") for o in stmts]
         else:
-            ids = _entity_candidates(world, note, s, linked, op)
+            ids = _entity_candidates(ctx, world, note, s, linked, op)
             shown = [
                 candidate_el(world, world.entities[i], today, recent=2)
                 if world.root(i) == i
@@ -211,13 +255,24 @@ def corrections(ctx: PipelineContext, calls: Calls, note: Note, linked: list[str
             if op == "rename" and not (out.new_name or "").strip():
                 raise ValueError("rename needs new_name")
 
+        named = {r for i in _named_entities(world, s.text) if (r := world.root(i))}
+        if op == "same_as" and len(named) == 1:
+            # Layer 4 already took both names to mean one entity; there is nothing to merge.
+            (only,) = named
+            calls.log("noted", f"{world.entities[only].name}: these names already lead to one page", only)
+            continue
+        if not ids:
+            calls.log("ignored", f'Could not tell what this correction applies to: "{s.text}"')
+            continue
         user = "\n".join([today_el(now), f"<operation>{op}</operation>", instruction, *shown])
-        out = calls.ask("correction_targets", user, TargetsOut, fallback=TargetsOut(), validate=validate)
+        out = calls.ask("correction_targets", user, TargetsOut, fallback=TargetsOut(targets=[]), validate=validate)
         applied = apply(ctx, calls, note, s.id, op, out.targets, out.new_name) if out.targets else None
         if applied is None:
             calls.log("ignored", f'Could not tell what this correction applies to: "{s.text}"')
-        else:
-            ops.append(applied)
+            continue
+        ops.append(applied)
+        if op == "retract":
+            retracted.update(applied.targets)
     return ops
 
 

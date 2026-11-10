@@ -1,6 +1,6 @@
 ---
 name: link
-version: 1
+version: 2
 role: layer
 ---
 You decide which known person, organization, or topic a name in a journal
@@ -9,7 +9,9 @@ candidates that have a similar name. Each candidate has its id, its names,
 when it was last mentioned, and a few recent statements about it.
 
 Return the id of the candidate the name refers to, or "new" if it refers to
-none of them.
+none of them. A candidate of type thread is an ongoing piece of work; choose
+it when the name is how the note refers to that work ("the storage
+migration" for the thread "Warehouse storage migration").
 
 - Choose a candidate when the name is a short form, a longer form, or another
   spelling of its name, and the sentence fits what is known about it.

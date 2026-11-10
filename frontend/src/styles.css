@@ -90,15 +90,6 @@ a:hover {
   font-size: 13px;
 }
 
-.count {
-  background: var(--accent);
-  color: var(--accent-text);
-  border-radius: 10px;
-  padding: 0 7px;
-  font-size: 12px;
-  margin-left: 4px;
-}
-
 main {
   flex: 1;
   padding: 24px 32px;
@@ -222,20 +213,6 @@ a.card:hover {
   border-color: var(--open);
 }
 
-.badge.speculative {
-  color: var(--speculative);
-  border-color: var(--speculative);
-}
-
-.badge.overcome_by_events {
-  color: var(--obe);
-}
-
-.badge.someday {
-  color: var(--someday);
-  border-color: var(--someday);
-}
-
 .badge.proposed,
 .badge.pending {
   color: var(--speculative);
@@ -247,76 +224,6 @@ a.card:hover {
   border-radius: 10px;
   padding: 0 8px;
   color: var(--text);
-}
-
-.fragment {
-  border-left: 3px solid var(--border);
-  padding: 6px 12px;
-  margin: 10px 0;
-}
-
-.fragment .text {
-  margin: 0;
-}
-
-.fragment.speculative {
-  border-left-color: var(--speculative);
-}
-
-.fragment.overcome_by_events .text {
-  color: var(--obe);
-  text-decoration: line-through;
-}
-
-.fragment.closed .text {
-  color: var(--muted);
-}
-
-.fragment .actions {
-  display: none;
-  gap: 6px;
-  margin-top: 4px;
-}
-
-.fragment:hover .actions,
-.fragment:focus-within .actions {
-  display: flex;
-}
-
-.fragment .actions button,
-.fragment .actions select {
-  font-size: 12px;
-  padding: 1px 6px;
-}
-
-.filters {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  font-size: 13px;
-  color: var(--muted);
-  margin-bottom: 8px;
-}
-
-.filters .sep {
-  width: 1px;
-  background: var(--border);
-}
-
-.details {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 20px;
-  margin: 0;
-}
-
-.details dt {
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.details dd {
-  margin: 0;
 }
 
 .notes,
@@ -382,32 +289,6 @@ table.list td {
   white-space: nowrap;
 }
 
-.editor textarea,
-.editor input {
-  width: 100%;
-  margin-bottom: 8px;
-}
-
-.editor textarea {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 14px;
-}
-
-.review {
-  margin: 12px 0;
-}
-
-.review blockquote {
-  margin: 4px 0;
-  padding-left: 10px;
-  border-left: 3px solid var(--border);
-  color: var(--muted);
-}
-
-.mention {
-  font-size: 17px;
-}
-
 .hit {
   padding: 8px 0;
   border-bottom: 1px solid var(--border);
@@ -415,28 +296,6 @@ table.list td {
 
 .hit p {
   margin: 4px 0 0;
-}
-
-.graph {
-  width: 100%;
-  height: 70vh;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--panel);
-}
-
-.legend {
-  display: flex;
-  gap: 14px;
-  font-size: 13px;
-}
-
-.legend i {
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  margin-right: 4px;
 }
 
 @media (max-width: 700px) {
@@ -461,21 +320,6 @@ table.list td {
   main {
     padding: 16px;
   }
-}
-
-.select-row {
-  display: flex;
-  gap: 8px;
-  align-items: flex-start;
-}
-
-.select-row .fragment {
-  flex: 1;
-  margin: 4px 0;
-}
-
-.thread-actions {
-  margin: 4px 0 12px;
 }
 
 .notebox {

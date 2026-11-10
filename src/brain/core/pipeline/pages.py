@@ -29,13 +29,25 @@ PROMPTS = ("now", "summary", "check")
 NOW_STATEMENTS = 12
 NOW_MAX_WORDS = 60
 SUMMARY_STATEMENTS = 60
-SUMMARY_MIN_NEW = 3
+SUMMARY_MIN_NEW = 5  # new statements before a thread's summary is updated
+SUMMARY_MIN_NEW_OTHER = 8  # the same for a person, org, or topic
 SUMMARY_MIN_TOTAL = 2
+SUMMARY_MIN_TOTAL_OTHER = 3
 SUMMARY_MAX_SENTENCES = 8
 
 
 def _hash(stmts: list[Stmt], *extra: str) -> str:
     return bytes_hash(*extra, *[f"{s.id}:{s.status}:{s.text}" for s in stmts])
+
+
+def _covered_hash(stmts: list[Stmt]) -> str:
+    """Changes when a summary's basis does: a statement was retracted, or a decision was replaced.
+
+    An answered question or a replaced fact does not count: the summary is
+    brought up to date with the next batch of statements, and Now is always
+    current.
+    """
+    return bytes_hash(*[f"{s.id}:{s.status == 'superseded' and s.kind == 'decision'}" for s in stmts])
 
 
 def _check(calls: Calls, sentence: Cited, stmts: list[Stmt], today) -> bool:
@@ -70,7 +82,7 @@ def _now(calls: Calls, e: Ent, stmts: list[Stmt], prev: Section | None, now: dat
         check_citations(out.citations, allowed)
 
     user = "\n".join([_head(e, now), *[stmt_el(s, today, with_id=False) for s in current]])
-    out = calls.ask("now", user, NowOut, fallback=NowOut(text=""), validate=validate)
+    out = calls.ask("now", user, NowOut, fallback=NowOut(text="", citations=[]), validate=validate)
     sentence = Cited(text=" ".join(out.text.split()), citations=sorted(set(out.citations)))
     if not sentence.text or not _check(calls, sentence, current, today):
         return prev  # keep what was there; tried again the next time the page changes
@@ -92,12 +104,14 @@ def _summary(
     covered = [s for s in basis if through and s.created_at <= through]
     new = [s for s in basis if not through or s.created_at > through]
     # A covered statement was superseded, answered, or retracted since: start again from the statements.
-    changed = prev is not None and prev.input_hash != _hash(covered)
+    changed = prev is not None and prev.input_hash != _covered_hash(covered)
     if len(basis) < SUMMARY_MIN_TOTAL:
         return None if changed else prev  # too little to summarize; an outdated summary is removed
     full = rebuild or prev is None or changed or not prev.sentences
-    if not full and len(new) < SUMMARY_MIN_NEW:
+    if not full and len(new) < (SUMMARY_MIN_NEW if e.type == "thread" else SUMMARY_MIN_NEW_OTHER):
         return prev
+    if prev is None and e.type != "thread" and len(basis) < SUMMARY_MIN_TOTAL_OTHER:
+        return prev  # a person or topic gets a summary once there is something to summarize
     shown = basis[-SUMMARY_STATEMENTS:] if full else new[-SUMMARY_STATEMENTS:]
     allowed = {s.note_id for s in shown}
     lines = [_head(e, now)]
@@ -118,13 +132,19 @@ def _summary(
                 raise ValueError("every sentence needs at least one citation")
             check_citations(s.citations, allowed)
 
-    out = calls.ask("summary", "\n".join(lines), SummaryOut, fallback=SummaryOut(), validate=validate)
-    kept = [s for s in out.sentences if _check(calls, s, basis, today)]
+    out = calls.ask("summary", "\n".join(lines), SummaryOut, fallback=SummaryOut(sentences=[]), validate=validate)
+    # A sentence carried over unchanged from the previous summary was checked when it was written.
+    checked = {(x.text, tuple(x.citations)) for x in prev.sentences} if prev and not changed else set()
+    kept = [
+        s
+        for s in out.sentences
+        if (" ".join(s.text.split()), tuple(sorted(set(s.citations)))) in checked or _check(calls, s, basis, today)
+    ]
     if not kept:
         return prev
     return Section(
         sentences=[Sentence(text=" ".join(s.text.split()), citations=sorted(set(s.citations))) for s in kept],
-        input_hash=_hash(basis),
+        input_hash=_covered_hash(basis),
         through=basis[-1].created_at,
         updates=0 if full else (prev.updates if prev else 0) + 1,
         rebuilt_at=now if full else (prev.rebuilt_at if prev else None),

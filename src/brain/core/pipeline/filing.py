@@ -34,6 +34,9 @@ def _candidates(ctx: PipelineContext, world: World, note: Note, s: Statement, ch
         if thread_id and thread_id not in ranked:
             ranked.append(thread_id)
 
+    about = world.get(note.about)
+    if about is not None and about.type == "thread":
+        add(about.id)  # the note was written on this thread's page
     for t in world.roots("thread"):
         if any(len(n) > 3 and norm_name(n) in body for n in world.names_of(t.id)):
             add(t.id)
