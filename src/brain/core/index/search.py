@@ -1,4 +1,4 @@
-"""Keyword (FTS5) and vector (sqlite-vec) lookups. Milestone 2 combines them for `ask`."""
+"""Keyword (FTS5) and vector (sqlite-vec) lookups."""
 
 from __future__ import annotations
 
@@ -37,14 +37,19 @@ def keyword(conn: sqlite3.Connection, text: str, *, limit: int = 20, types: tupl
 
 
 def nearest(conn: sqlite3.Connection, vector: list[float], *, k: int = 20) -> list[Hit]:
+    return nearest_blob(conn, vec_blob(vector), k=k)
+
+
+def nearest_blob(conn: sqlite3.Connection, blob: bytes, *, k: int = 20) -> list[Hit]:
+    """Nearest items to an already normalized, packed vector (as stored in the index)."""
     rows = conn.execute(
         """
-        SELECT e.owner_id, CASE WHEN e.owner_id LIKE 'e-%' THEN 'entry' ELSE 'fragment' END, v.distance
+        SELECT e.owner_id, CASE WHEN e.owner_id LIKE 'n-%' THEN 'note' ELSE 'statement' END, v.distance
         FROM (SELECT rowid, distance FROM vec_items WHERE embedding MATCH ? AND k = ?) v
         JOIN embeddings e ON e.rowid = v.rowid
         ORDER BY v.distance
         """,
-        (vec_blob(vector), k),
+        (blob, k),
     ).fetchall()
     # Vectors are unit length, so cosine similarity = 1 - d^2 / 2.
     return [Hit(r[0], r[1], 1 - (r[2] ** 2) / 2) for r in rows]

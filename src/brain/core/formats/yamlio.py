@@ -19,7 +19,7 @@ from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from ruamel.yaml.error import YAMLError
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 
 class FormatError(ValueError):

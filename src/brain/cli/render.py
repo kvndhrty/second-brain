@@ -3,61 +3,49 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime
 
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
 from brain.core.answers import Answer, Brief, Source
-from brain.core.index.queries import FragmentRow, ThreadRow
 from brain.core.llm.schemas import Claim
 from brain.core.pipeline.runner import ProcessReport
-from brain.core.review import MENTION_KINDS
 from brain.core.temporal import iso_day
-from brain.core.views import FragmentView
+from brain.core.views import EntitySummary, NoteView
 
 SECTIONS = [
     ("where_things_stand", "Where things stand"),
     ("recent_decisions", "Recent decisions"),
     ("open_items", "Open items"),
     ("people", "People"),
-    ("speculative", "Speculative"),
-    ("overcome_by_events", "Overcome by events"),
+    ("no_longer_applies", "No longer applies"),
     ("changed_since", "Changed since you last looked"),
 ]
 
 
-def run_processing(out: Console, run: Callable[[Callable[[str], None]], ProcessReport], brain) -> ProcessReport | None:
-    """Run the pipeline with a status line. Ctrl-C leaves the entry saved and pending."""
+def run_processing(out: Console, run: Callable[[Callable[[str], None]], ProcessReport]) -> ProcessReport | None:
+    """Run the pipeline with a status line. Ctrl-C leaves the note saved and pending."""
     try:
         with out.status("processing") as status:
             report = run(lambda msg: status.update(msg))
     except KeyboardInterrupt:
-        out.print("[yellow]stopped; the entry is saved and will be processed by `brain process`[/yellow]")
+        out.print("[yellow]stopped; the note is saved and will be processed by `brain process`[/yellow]")
         return None
     print_report(out, report)
-    pending = [i for i in brain.review_items() if i.kind in MENTION_KINDS]
-    if pending:
-        out.print(f"[yellow]{len(pending)} name(s) need review: run `brain review`[/yellow]")
     return report
 
 
 def print_report(out: Console, report: ProcessReport) -> None:
-    for e in report.entries:
-        if e.error:
+    for n in report.notes:
+        if n.error:
             out.print(
-                f"[red]✗[/red] {e.entry_id}: {escape(e.error)}  [dim](still pending; retry with `brain process`)[/dim]"
+                f"[red]✗[/red] {n.note_id}: {escape(n.error)}  [dim](still pending; retry with `brain process`)[/dim]"
             )
-        elif e.steps:
-            out.print(f"[green]✓[/green] {e.entry_id}: {', '.join(e.steps)}")
-    if report.threads:
-        out.print(
-            f"[green]✓[/green] updated {len(report.threads)} thread summar{'y' if len(report.threads) == 1 else 'ies'}"
-        )
-    for tid, error in report.thread_errors.items():
-        out.print(f"[red]✗[/red] thread {tid}: {escape(error)}")
-    if not report.entries and not report.threads:
+        elif n.layers:
+            pages = f"; updated {len(n.pages)} page(s)" if n.pages else ""
+            out.print(f"[green]✓[/green] {n.note_id}: {n.calls} model call(s){pages}")
+    if not report.notes:
         out.print("nothing to process")
 
 
@@ -80,11 +68,11 @@ class Citations:
         if not self.order:
             return
         out.print("\n[bold]Sources[/bold]")
-        for n, eid in enumerate(self.order, 1):
-            s = self.sources.get(eid)
-            label = s.label if s else eid
+        for n, nid in enumerate(self.order, 1):
+            s = self.sources.get(nid)
+            label = s.label if s else nid
             label = label if len(label) <= 60 else label[:59].rstrip() + "…"
-            out.print(f"  [dim]{n}.[/dim] {s.date if s else '?'}  {escape(label)}  [dim]{eid}[/dim]")
+            out.print(f"  [dim]{n}.[/dim] {s.date if s else '?'}  {escape(label)}  [dim]{nid}[/dim]")
 
 
 def print_answer(out: Console, answer: Answer) -> None:
@@ -98,12 +86,8 @@ def print_answer(out: Console, answer: Answer) -> None:
 
 def print_brief(out: Console, brief: Brief) -> None:
     since = brief.since.date().isoformat() if brief.since else "never"
-    out.print(
-        f"[bold]{escape(brief.label)}[/bold]  [dim]{brief.type} · {brief.fragment_count} fragments · "
-        f"last looked: {since}[/dim]"
-    )
-    for note in brief.notes:
-        out.print(f"[dim]{escape(note)}[/dim]")
+    names = ", ".join(t.name for t in brief.topics) or brief.request
+    out.print(f"[bold]{escape(names)}[/bold]  [dim]last looked: {since}[/dim]")
     cites = Citations(brief.sources)
     for field, heading in SECTIONS:
         claims = getattr(brief.output, field)
@@ -112,46 +96,51 @@ def print_brief(out: Console, brief: Brief) -> None:
         out.print(f"\n[bold]{heading}[/bold]")
         for claim in claims:
             out.print(f"  • {escape(claim.text)}{cites.mark(claim)}")
-    if brief.open_items:
-        out.print("\n[bold]Open questions and action items[/bold] [dim](close with `brain status ID --closed`)[/dim]")
-        for f in brief.open_items:
-            out.print(f"  • {escape(f.text)}  [dim]{f.kind} · {iso_day(f.created_at)} · {f.id}[/dim]")
+    if not brief.output.all_claims():
+        out.print("nothing in the journal about this yet")
     cites.print(out)
-    if not brief.recorded:
+    if brief.topics and not brief.recorded:
         out.print("[dim]note: the brief time was not saved (another machine holds the write lease)[/dim]")
 
 
-def print_active(out: Console, threads: list[ThreadRow], now: datetime) -> None:
+def print_threads(out: Console, threads: list[EntitySummary]) -> None:
     if not threads:
         out.print("no active threads")
         return
-    table = Table(box=None, pad_edge=False)
-    for col in ("thread", "last activity", "fragments", "open", "people", "id"):
-        table.add_column(col, overflow="fold")
     for t in threads:
-        name = escape(t.name) + (" [dim](proposed)[/dim]" if t.state == "proposed" else "")
-        if t.pinned:
-            name = "📌 " + name
         last = iso_day(t.last_activity) if t.last_activity else "—"
-        if t.last_activity:
-            days = (now - datetime.fromisoformat(t.last_activity)).days
-            last += f" [dim]({days}d)[/dim]"
+        opened = f" · {t.open_items} open" if t.open_items else ""
+        out.print(f"[bold]{escape(t.name)}[/bold]  [dim]{last}{opened} · {t.id}[/dim]")
+        if t.now:
+            out.print(f"  {escape(t.now)}")
+
+
+def print_pages(out: Console, pages: list[EntitySummary]) -> None:
+    if not pages:
+        out.print("no pages yet")
+        return
+    table = Table(box=None, pad_edge=False)
+    for col in ("page", "type", "status", "last activity", "notes", "id"):
+        table.add_column(col, overflow="fold")
+    for p in pages:
         table.add_row(
-            name,
-            last,
-            str(t.fragments),
-            str(t.open_items) if t.open_items else "",
-            ", ".join(t.people),
-            f"[dim]{t.id}[/dim]",
+            escape(p.name),
+            p.type,
+            p.status,
+            iso_day(p.last_activity) if p.last_activity else "—",
+            str(p.note_count),
+            f"[dim]{p.id}[/dim]",
         )
     out.print(table)
 
 
-def print_fragments(out: Console, fragments: list[FragmentRow] | list[FragmentView]) -> None:
-    for f in fragments:
-        flags = [f.kind, f.status]
-        if f.state:
-            flags.append(f.state)
-        if f.someday:
-            flags.append("someday")
-        out.print(f"• {escape(f.text)}\n  [dim]{' · '.join(flags)} · {f.id}[/dim]")
+def print_note(out: Console, note: NoteView) -> None:
+    state = "processed" if note.done else "pending"
+    out.print(f"[bold]{escape(note.title or note.id)}[/bold]  [dim]{note.created[:16]} · {note.id} · {state}[/dim]")
+    for s in note.statements:
+        flags = [s.kind] + ([s.status] if s.status != "current" else []) + ([s.thread_name] if s.thread_name else [])
+        out.print(f"• {escape(s.text)}\n  [dim]{escape(' · '.join(flags))}[/dim]")
+    if note.entities:
+        out.print("[dim]mentions: " + escape(", ".join(f"{e.name} ({e.type})" for e in note.entities)) + "[/dim]")
+    for ev in note.events:
+        out.print(f"[dim]→ {escape(ev.text)}[/dim]")

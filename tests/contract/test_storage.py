@@ -9,11 +9,11 @@ from brain.core.storage.probe import probe_conditional_writes
 
 
 def test_put_get_roundtrip(storage):
-    info = storage.put("entries/2026/10/30/a.md", b"hello")
-    assert info.key == "entries/2026/10/30/a.md"
+    info = storage.put("notes/2026/10/30/a.md", b"hello")
+    assert info.key == "notes/2026/10/30/a.md"
     assert info.size == 5
     assert info.etag
-    assert storage.get("entries/2026/10/30/a.md") == b"hello"
+    assert storage.get("notes/2026/10/30/a.md") == b"hello"
 
 
 def test_get_missing_raises_not_found(storage):
@@ -30,12 +30,12 @@ def test_exists_and_delete(storage):
 
 
 def test_list_prefix_and_metadata(storage):
-    for key in ("entries/2026/10/30/a.md", "entries/2026/10/31/b.md", "people/c.md", "entriesX/d.md"):
+    for key in ("notes/2026/10/30/a.md", "notes/2026/10/31/b.md", "people/c.md", "notesX/d.md"):
         storage.put(key, key.encode())
-    keys = [o.key for o in storage.list("entries/")]
-    assert keys == ["entries/2026/10/30/a.md", "entries/2026/10/31/b.md"]
-    assert {o.key for o in storage.list("")} >= {"people/c.md", "entriesX/d.md"}
-    assert [o.key for o in storage.list("entries/2026/10/3")] == keys
+    keys = [o.key for o in storage.list("notes/")]
+    assert keys == ["notes/2026/10/30/a.md", "notes/2026/10/31/b.md"]
+    assert {o.key for o in storage.list("")} >= {"people/c.md", "notesX/d.md"}
+    assert [o.key for o in storage.list("notes/2026/10/3")] == keys
     (obj,) = [o for o in storage.list("people/")]
     assert obj.size == len(b"people/c.md")
     assert obj.etag

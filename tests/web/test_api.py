@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from starlette.testclient import TestClient
 
 from brain.core import runtime
+from brain.core.llm.models import LLMError
 from brain.core.shared import SharedBrain
 from brain.core.worker import Worker
 from brain.mcp.server import build_server
 from brain.web.app import create_app
 from tests.conftest import FAKE_LLM_SETTINGS, make_brain
 
-ENTRY = (
-    "Kicked off the [[GPU quota migration]] with Priya. We decided to move the eval cluster in December "
-    "#capacity-planning. Does the vendor support MIG on the new nodes?"
+NOTE = (
+    "Kicked off the [[GPU quota migration]] with Priya Raman. We decided to move the eval cluster in December. "
+    "Does the vendor support MIG on the new nodes?"
 )
+FOLLOW_UP = "Priya Raman needs to file the ticket for the [[GPU quota migration]]."
 
 
 @pytest.fixture
@@ -29,77 +33,88 @@ def post(client, path, body):
     return client.post(path, json=body)
 
 
-def processed(client, brain, text=ENTRY) -> str:
-    entry_id = post(client, "/api/entries", {"text": text, "title": "Kickoff"}).json()["id"]
-    brain.process(entry_id)  # no worker in these tests
-    return entry_id
+def saved(client, brain, text=NOTE, **extra) -> str:
+    note_id = post(client, "/api/notes", {"text": text, **extra}).json()["id"]
+    brain.process(note_id)  # no worker in these tests
+    return note_id
 
 
-def test_create_entry_and_read_views(client, brain):
-    eid = processed(client, brain)
+def test_save_notes_and_read_the_wiki(client, brain):
+    nid = saved(client, brain)
+    saved(client, brain, FOLLOW_UP)
     status = client.get("/api/status").json()
-    assert status["entries"] == 1 and status["pending"] == 0 and status["review"] >= 1
-    assert [t["id"] for t in client.get("/api/active").json()] == ["gpu-quota-migration"]
-    entry = client.get(f"/api/entries/{eid}").json()
-    assert entry["title"] == "Kickoff" and entry["processed"] and len(entry["fragments"]) == 3
-    assert client.get("/api/entries").json()[0]["id"] == eid
-    view = client.get("/api/entity/thread:gpu-quota-migration").json()
-    assert view["name"] == "GPU quota migration" and view["summary"]
-    timeline = client.get("/api/entity/thread:gpu-quota-migration/timeline").json()
-    assert timeline[0]["fragment"]["entry_id"] == eid
-    assert [e["name"] for e in client.get("/api/entities/theme").json()] == ["capacity planning"]
-    graph = client.get("/api/graph").json()
-    assert {n["id"] for n in graph["nodes"]} == {"thread:gpu-quota-migration", "theme:capacity-planning"}
-    assert graph["edges"] == [] or all(e["type"] for e in graph["edges"])
+    assert status["notes"] == 2 and status["pending"] == 0 and status["pages"] >= 2
+    (thread,) = client.get("/api/active").json()
+    assert thread["id"] == "gpu-quota-migration" and thread["open_items"] == 2 and thread["now"]
+    note = client.get(f"/api/notes/{nid}").json()
+    assert note["done"] and [s["kind"] for s in note["statements"]] == ["fact", "decision", "question"]
+    assert {e["id"] for e in note["entities"]} >= {"gpu-quota-migration", "priya-raman"}
+    assert client.get("/api/notes").json()[-1]["id"] == nid
+    page = client.get("/api/pages/gpu-quota-migration").json()
+    assert page["name"] == "GPU quota migration" and page["type"] == "thread" and page["now"]["citations"]
+    assert [s["kind"] for s in page["open"]] == ["question", "action"]
+    assert [r["id"] for r in page["related"]][:1] == ["priya-raman"]
+    assert client.get("/api/pages/GPU quota migration").json()["id"] == "gpu-quota-migration"  # by name too
+    assert [p["id"] for p in client.get("/api/pages", params={"type": "person"}).json()] == ["priya-raman"]
+    assert any("New person: Priya Raman" in e["text"] for e in client.get("/api/log").json())
     hits = client.get("/api/search", params={"q": "vendor MIG"}).json()
-    assert hits and hits[0]["entry_id"] == eid
+    assert hits and hits[0]["note_id"] == nid
 
 
-def test_edit_entry_marks_it_for_processing(client, brain):
-    eid = processed(client, brain)
-    r = client.put(f"/api/entries/{eid}", json={"text": "Rewritten completely.", "title": None})
-    assert r.status_code == 200
-    assert client.get(f"/api/entries/{eid}").json()["processed"] is False
-    assert client.get("/api/status").json()["pending"] == 1
+def test_this_is_wrong_is_a_note_about_the_page(client, brain):
+    saved(client, brain)
+    saved(client, brain, FOLLOW_UP)
+    nid = saved(client, brain, "This is finished.", about="gpu-quota-migration")
+    assert client.get(f"/api/notes/{nid}").json()["about"] == "gpu-quota-migration"
+    page = client.get("/api/pages/gpu-quota-migration").json()
+    assert page["status"] == "closed" and page["open"] == [] and page["now"] is None
+    assert client.get("/api/active").json() == []
+    assert post(client, "/api/notes", {"text": "x", "about": "no-such-page"}).status_code == 404
 
 
-def test_fragment_patch_someday_and_review(client, brain):
-    eid = processed(client, brain, "Someday we could build a self-serve portal. Met with Zed about it.")
-    frag = client.get(f"/api/entries/{eid}").json()["fragments"][0]["id"]
-    assert client.patch(f"/api/fragments/{frag}", json={"someday": True}).status_code == 200
-    assert [f["id"] for f in client.get("/api/someday").json()] == [frag]
-    item = next(i for i in client.get("/api/review").json() if i["payload"].get("surface") == "Zed")
-    r = post(client, f"/api/review/{item['id']}", {"action": "create", "name": "Zed Shaw", "role": "SRE"})
-    assert r.status_code == 200
-    assert [p["name"] for p in client.get("/api/entities/person").json()] == ["Zed Shaw"]
-    assert client.get("/api/choices/person", params={"q": "zed"}).json()[0]["entity_id"] == "zed-shaw"
+def test_notes_are_the_only_write(client):
+    """Nothing in the API changes the wiki directly."""
+    writes = sorted(
+        (r.path, m)
+        for r in client.app.routes
+        for m in getattr(r, "methods", ())
+        if m in ("POST", "PUT", "PATCH", "DELETE")
+    )
+    assert writes == [
+        ("/api/ask", "POST"),
+        ("/api/brief", "POST"),
+        ("/api/dream", "POST"),
+        ("/api/notes", "POST"),
+        ("/api/worker/wake", "POST"),
+    ]
 
 
 def test_ask_and_brief(client, brain):
-    eid = processed(client, brain)
+    nid = saved(client, brain)
+    saved(client, brain, FOLLOW_UP)
     answer = post(client, "/api/ask", {"question": "does the vendor support MIG?"}).json()
-    assert answer["claims"] and answer["sources"][0]["entry_id"] == eid
-    brief = post(client, "/api/brief", {"target": "GPU quota migration"}).json()
-    assert brief["type"] == "thread" and brief["sections"]["where_things_stand"]
-    again = post(client, "/api/brief", {"target": "GPU quota migration"}).json()
+    assert answer["claims"] and answer["sources"][0]["note_id"] == nid
+    brief = post(client, "/api/brief", {"request": "GPU quota migration"}).json()
+    assert brief["topics"][0]["type"] == "thread" and brief["sections"]["where_things_stand"]
+    again = post(client, "/api/brief", {"request": "GPU quota migration"}).json()
     assert again["since"] is not None  # the first brief was recorded
 
 
 def test_errors_map_to_status_codes(client, brain):
-    assert client.get("/api/entries/e-19990101T000000Z").status_code == 404
-    r = client.get("/api/entity/person:nobody")
-    assert r.status_code == 404 and "nothing named" in r.json()["detail"]
-    assert post(client, "/api/entries", {"text": "   "}).status_code == 400
-    r = post(client, "/api/review/missing", {"action": "drop"})
-    assert r.status_code == 400 and "no review item" in r.json()["detail"]
-    assert post(client, "/api/review/x", {"action": "link"}).status_code in (400, 422)
+    assert client.get("/api/notes/n-19990101T000000Z").status_code == 404
+    r = client.get("/api/pages/nobody")
+    assert r.status_code == 404 and "no page for" in r.json()["detail"]
+    assert post(client, "/api/notes", {"text": "   "}).status_code == 400
+    brain.llm.responders["ask"] = lambda _user: (_ for _ in ()).throw(LLMError("gateway is down"))
+    saved(client, brain)
+    assert post(client, "/api/ask", {"question": "vendor MIG?"}).status_code == 502
 
 
 def test_local_only_safeguards(client):
     assert client.get("/api/status", headers={"Host": "evil.example"}).status_code == 400
-    r = client.post("/api/entries", content="text=hello", headers={"Content-Type": "application/x-www-form-urlencoded"})
+    r = client.post("/api/notes", content="text=hello", headers={"Content-Type": "application/x-www-form-urlencoded"})
     assert r.status_code == 415
-    r = client.post("/api/entries", content='{"text": "hi"}', headers={"Content-Type": "text/plain"})
+    r = client.post("/api/notes", content='{"text": "hi"}', headers={"Content-Type": "text/plain"})
     assert r.status_code == 415
 
 
@@ -111,7 +126,7 @@ def test_serves_built_ui_with_history_fallback(brain, tmp_path):
     (static / "favicon.svg").write_text("<svg/>")
     with TestClient(create_app(SharedBrain(lambda: brain), static_dir=static), base_url="http://127.0.0.1") as c:
         assert c.get("/").text == "<html>brain ui</html>"
-        assert c.get("/threads/anything").text == "<html>brain ui</html>"
+        assert c.get("/p/anything").text == "<html>brain ui</html>"
         assert c.get("/assets/app.js").text == "console.log(1)"
         assert c.get("/favicon.svg").text == "<svg/>"
         assert c.get("/api/nope").status_code == 404
@@ -138,21 +153,41 @@ def test_mcp_is_mounted_and_checks_host(brain, tmp_path):
         assert c.post("/mcp", json=init, headers={**headers, "Host": "evil.example"}).status_code == 400
 
 
-def test_worker_processes_saved_entries(brain, local_storage, state, tmp_path):
+def _worker(brain, local_storage, state, tmp_path, **kw) -> tuple[Worker, object]:
     other = make_brain(
-        local_storage, state, tmp_path, fake_llm=True, llm=FAKE_LLM_SETTINGS, index_name=brain.db.path.stem
+        local_storage, state, tmp_path, fake_llm=True, llm=FAKE_LLM_SETTINGS, index_name=brain.db.path.stem, **kw
     )
-    worker = Worker(lambda: other, poll_seconds=30)
+    return Worker(lambda: other, poll_seconds=30), other
+
+
+def test_worker_processes_saved_notes(brain, local_storage, state, tmp_path):
+    worker, _ = _worker(brain, local_storage, state, tmp_path)
     worker.start()
     try:
         app = create_app(SharedBrain(lambda: brain), worker=worker, static_dir=tmp_path / "x")
         with TestClient(app, base_url="http://127.0.0.1") as c:
-            eid = post(c, "/api/entries", {"text": ENTRY}).json()["id"]
-            result = worker.process_now(eid, timeout=30)
+            nid = post(c, "/api/notes", {"text": NOTE}).json()["id"]
+            result = worker.process_now(nid, timeout=30)
             assert result is not None and result.error is None
-            assert c.get(f"/api/entries/{eid}").json()["processed"]
+            assert c.get(f"/api/notes/{nid}").json()["done"]
             assert c.get("/api/status").json()["worker"]["processed"] >= 1
-            assert worker.process_now(eid, timeout=5) is not None  # already done: returns at once
+            assert worker.process_now(nid, timeout=5) is not None  # already done: returns at once
+    finally:
+        worker.stop()
+
+
+def test_worker_adopts_files_saved_into_notes(brain, local_storage, state, tmp_path):
+    local_storage.put("notes/from my editor.md", b"Priya Raman is out this week.\n")
+    worker, _ = _worker(brain, local_storage, state, tmp_path)
+    worker.start()
+    try:
+        for _ in range(100):
+            if worker.status.processed:
+                break
+            time.sleep(0.1)
+        brain.sync(full=True)
+        (note,) = brain.recent_notes()
+        assert note.done and note.label == "from my editor"
     finally:
         worker.stop()
 
@@ -169,89 +204,57 @@ def test_runtime_file_ignores_dead_or_other_servers(state):
     assert not (state.root / runtime.FILE).exists()
 
 
-def test_thread_ops_and_sweep(client, brain):
-    processed(client, brain, "Started the [[Cache rewrite]]. Need to benchmark the [[Cache rewrite]].")
-    op = lambda body: post(client, "/api/threads/cache-rewrite", body)  # noqa: E731
-    assert op({"op": "rename", "name": "Cache v2"}).status_code == 200
-    assert op({"op": "pin"}).status_code == 200
-    assert client.get("/api/entity/thread:cache-rewrite").json()["details"]["pinned"] is True
-    frag = client.get("/api/entity/thread:cache-rewrite/timeline").json()[0]["fragment"]["id"]
-    r = op({"op": "split", "name": "Benchmarks", "fragment_ids": [frag]})
-    assert r.json()["id"] == "benchmarks"
-    r = post(client, "/api/threads/benchmarks", {"op": "obe", "reason": "dropped", "cascade": True})
-    assert r.json()["cascaded"] == 1
-    assert op({"op": "merge"}).status_code == 400
-    assert post(client, "/api/threads/nope", {"op": "pin"}).status_code == 400
-    sweep = client.get("/api/sweep", params={"days": 0, "quiet_days": 0}).json()
-    assert {i["kind"] for i in sweep} <= {"stale_open", "stale_speculative", "quiet_thread"}
-
-
 def test_context_and_dream_endpoints(client, brain):
-    processed(client, brain)
+    saved(client, brain)
+    saved(client, brain, FOLLOW_UP)
     ctx = client.get("/api/context").json()
     assert ctx["text"].startswith("# brain: ") and "GPU quota migration [gpu-quota-migration]" in ctx["text"]
-    assert ctx["doc"]["threads"][0]["now_source"] == "summary"
+    assert ctx["doc"]["threads"][0]["now"]
     status = client.get("/api/dream").json()
-    assert status["last"] is None and any("Now line" in p for p in status["planned"])
+    assert status["last"] is None and set(status["planned"]) >= {"duplicates", "stale", "close", "profiles"}
     assert client.post("/api/dream", json={}).status_code == 409  # no worker in this app
     brain.dream()
-    status = client.get("/api/dream").json()
-    assert status["last"]["calls"] >= 1 and status["planned"] == []
-    (thread,) = client.get("/api/active").json()
-    assert thread["now_line"] and thread["now_as_of"]
+    assert client.get("/api/dream").json()["last"]["run_id"]
+
+
+def _wait_for_dream(worker: Worker) -> None:
+    for _ in range(100):
+        if worker.status.last_dream:
+            break
+        time.sleep(0.1)
+    assert worker.status.last_dream
 
 
 def test_worker_dreams_when_asked(brain, local_storage, state, tmp_path):
-    other = make_brain(
-        local_storage, state, tmp_path, fake_llm=True, llm=FAKE_LLM_SETTINGS, index_name=brain.db.path.stem
-    )
+    worker, other = _worker(brain, local_storage, state, tmp_path)
     other.settings.dream.enabled = False  # nothing scheduled; only the request makes it dream
-    worker = Worker(lambda: other, poll_seconds=30)
     worker.start()
     try:
         app = create_app(SharedBrain(lambda: brain), worker=worker, static_dir=tmp_path / "x")
         with TestClient(app, base_url="http://127.0.0.1") as c:
-            eid = post(c, "/api/entries", {"text": ENTRY}).json()["id"]
-            assert worker.process_now(eid, timeout=30) is not None
+            nid = post(c, "/api/notes", {"text": NOTE}).json()["id"]
+            assert worker.process_now(nid, timeout=30) is not None
             assert c.post("/api/dream", json={}).json() == {"requested": True}
-            import time
-
-            for _ in range(100):
-                if worker.status.last_dream:
-                    break
-                time.sleep(0.1)
-            assert worker.status.last_dream
+            _wait_for_dream(worker)
             assert c.get("/api/dream").json()["last"]["run_id"] == worker.status.last_dream
     finally:
         worker.stop()
 
 
-def test_a_failing_entry_does_not_stop_dreaming(brain, local_storage, state, tmp_path):
-    bad = make_brain(
-        local_storage,
-        state,
-        tmp_path,
-        fake_llm=True,
-        responders={"extract": {"fragments": "not a list"}},  # extraction always fails validation
-        llm=FAKE_LLM_SETTINGS,
-        index_name=brain.db.path.stem,
-    )
+def test_a_failing_note_does_not_stop_dreaming(brain, local_storage, state, tmp_path):
+    def down(_user: str) -> dict:
+        raise LLMError("gateway is down")
+
+    worker, bad = _worker(brain, local_storage, state, tmp_path, responders={"split": down})
     bad.settings.dream.enabled = False
-    worker = Worker(lambda: bad, poll_seconds=30)
     worker.start()
     try:
         app = create_app(SharedBrain(lambda: brain), worker=worker, static_dir=tmp_path / "x")
         with TestClient(app, base_url="http://127.0.0.1") as c:
-            eid = post(c, "/api/entries", {"text": ENTRY}).json()["id"]
-            result = worker.process_now(eid, timeout=30)
+            nid = post(c, "/api/notes", {"text": NOTE}).json()["id"]
+            result = worker.process_now(nid, timeout=30)
             assert result is not None and result.error  # it stays pending and fails every round
             c.post("/api/dream", json={})
-            import time
-
-            for _ in range(100):
-                if worker.status.last_dream:
-                    break
-                time.sleep(0.1)
-            assert worker.status.last_dream
+            _wait_for_dream(worker)
     finally:
         worker.stop()

@@ -34,7 +34,7 @@ def test_doctor_has_no_failures(live_config):
 
 
 def test_pipeline_end_to_end_on_real_models(live_config, tmp_path):
-    """Process one entry with the real models into a throwaway local store, then ask about it."""
+    """Process one note with the real models into a throwaway local store, then ask about it."""
     from brain.core.config import LoadedSettings, load
     from brain.core.services import Brain
 
@@ -43,13 +43,13 @@ def test_pipeline_end_to_end_on_real_models(live_config, tmp_path):
     settings.storage.path = str(tmp_path / "store")
     settings.index.path = str(tmp_path / "index.db")
     with Brain(LoadedSettings(settings=settings, path=None, env_overrides=[]), command="pytest-live") as b:
-        entry = b.jot(
+        note = b.jot(
             "Met Priya from the platform team about moving the eval cluster to the new GPU quota pool. "
             "We decided to migrate in December. Open question: does the new pool support MIG partitioning?"
-        ).entry
-        report = b.process(entry.id)
+        ).note
+        report = b.process(note.id)
         assert not report.failed, report.failed[0].error
-        kinds = {r[0] for r in b.db.conn.execute("SELECT kind FROM fragments")}
+        kinds = {r[0] for r in b.db.conn.execute("SELECT kind FROM statements")}
         assert "decision" in kinds and "question" in kinds
         answer = b.ask("When is the eval cluster migrating?")
-        assert answer.claims and entry.id in {c for claim in answer.claims for c in claim.citations}
+        assert answer.claims and note.id in {c for claim in answer.claims for c in claim.citations}

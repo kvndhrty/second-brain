@@ -1,79 +1,284 @@
-"""Read models for front-ends: search hits, entity pages, and entries.
+"""Read models for front-ends and for the wiki files: pages, notes, search hits, the change log.
 
 These are plain data so the MCP server and the web UI can serialize them
-directly. They read only from the index.
+directly, and the wiki renderer can print them. They read only from the index.
 """
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 
-from brain.core.answers import NODE_TYPES, AmbiguousTarget, find_targets, retrieve
+from brain.core.formats.records import ENTITY_TYPES, PageFile
 from brain.core.index import queries, search
+from brain.core.index.db import get_meta
+from brain.core.index.queries import Ent, Stmt, World
 from brain.core.llm.models import LLM
-from brain.core.temporal import iso_day
+from brain.core.temporal import age, iso_day
 
 SNIPPET_CHARS = 280
+HISTORY_LIMIT = 150
+RRF_K = 60
+
+
+@dataclass
+class Line:
+    """One statement as shown on a page."""
+
+    id: str
+    note_id: str
+    date: str
+    age: str
+    kind: str
+    text: str
+    status: str
+    replaced_by: str | None = None  # text of the statement that superseded or answered it
+    thread: str | None = None
+    thread_name: str | None = None
+
+
+@dataclass
+class CitedText:
+    text: str
+    citations: list[str]
+
+
+@dataclass
+class Ref:
+    id: str
+    type: str
+    name: str
+
+
+@dataclass
+class PageData:
+    id: str
+    type: str
+    name: str
+    names: list[str]
+    status: str
+    profile: dict[str, str]
+    as_of: str | None  # date of the newest note it covers
+    last_activity: str | None
+    closed_at: str | None
+    now: CitedText | None
+    summary: list[CitedText]
+    open: list[Line]
+    decided: list[Line]
+    history: list[Line]
+    related: list[Ref]
+    note_count: int
+    log: list[queries.LogEvent] = field(default_factory=list)
+
+
+@dataclass
+class EntitySummary:
+    id: str
+    type: str
+    name: str
+    status: str
+    now: str | None
+    last_activity: str | None
+    open_items: int
+    note_count: int
+
+
+@dataclass
+class NoteSummary:
+    id: str
+    date: str
+    label: str
+    done: bool
+    statements: int
+
+
+@dataclass
+class NoteView:
+    id: str
+    created: str
+    title: str | None
+    about: str | None
+    body: str
+    done: bool
+    statements: list[Line]
+    entities: list[Ref]
+    events: list[queries.LogEvent]
 
 
 @dataclass
 class Hit:
     id: str
-    type: str  # entry | fragment | person | org | theme | thread
+    type: str  # note | statement | thread | person | org | topic
     label: str
     snippet: str
     date: str | None = None
-    entry_id: str | None = None
+    note_id: str | None = None
     kind: str | None = None
     status: str | None = None
 
 
-@dataclass
-class FragmentView:
-    id: str
-    entry_id: str
-    date: str
-    kind: str
-    text: str
-    status: str
-    state: str | None
-    someday: bool
-    obe_reason: str | None
+class NoSuchPage(LookupError):
+    pass
 
 
-@dataclass
-class EntityView:
-    id: str  # node id, e.g. "person:jane-doe"
-    type: str
-    name: str
-    aliases: list[str]
-    details: dict
-    notes: str
-    summary: str | None
-    related: dict[str, list[str]]  # type -> labels of linked threads, people, orgs, themes
-    open_items: list[FragmentView]
-    recent: list[FragmentView]
-    fragment_count: int
-    summary_as_of: str | None = None  # date of the newest entry the summary covers
-    notes_as_of: str | None = None  # when the entity file was last changed
+def line(world: World, s: Stmt, today: date, texts: dict[str, Stmt] | None = None) -> Line:
+    by = (texts or {}).get(s.by or "")
+    thread = world.entities.get(s.thread or "")
+    return Line(
+        s.id,
+        s.note_id,
+        iso_day(s.created_at),
+        age(s.created_at, today),
+        s.kind,
+        s.text,
+        s.status,
+        by.text if by else None,
+        thread.id if thread else None,
+        thread.name if thread else None,
+    )
 
 
-@dataclass
-class EntryView:
-    id: str
-    date: str
-    title: str | None
-    text: str
-    key: str
-    processed: bool
-    fragments: list[FragmentView] = field(default_factory=list)
+def lines(world: World, stmts: list[Stmt], today: date) -> list[Line]:
+    texts = world.by_id([s.by for s in stmts if s.by])
+    return [line(world, s, today, texts) for s in stmts]
 
 
-def fragment_view(f: queries.FragmentRow) -> FragmentView:
-    return FragmentView(
-        f.id, f.entry_id, iso_day(f.created_at), f.kind, f.text, f.status, f.state, f.someday, f.obe_reason
+def _ref(e: Ent) -> Ref:
+    return Ref(e.id, e.type, e.name)
+
+
+def _page_file(conn: sqlite3.Connection, entity_id: str) -> PageFile | None:
+    row = conn.execute("SELECT data FROM pages WHERE entity_id = ?", (entity_id,)).fetchone()
+    return PageFile.model_validate_json(row[0]) if row else None
+
+
+def resolve(world: World, text: str) -> Ent:
+    """The surviving entity with this id or exactly this name."""
+    e = world.get(text)
+    if e is None:
+        found = world.by_name(text)
+        # A thread and a topic may share a name; the thread is the page people mean.
+        found = [x for x in found if x.type == "thread"] or found
+        if len(found) != 1:
+            raise NoSuchPage(f"no page for {text!r}" if not found else f"{text!r} matches several pages")
+        e = found[0]
+    return e
+
+
+def page(conn: sqlite3.Connection, entity: str, *, now: datetime, world: World | None = None) -> PageData:
+    world = world or World(conn)
+    e = resolve(world, entity)
+    today = now.astimezone().date()
+    stmts = [s for s in world.of_entity(e.id) if s.status != "retracted"]
+    pf = _page_file(conn, e.id)
+    sections = pf.sections if pf else {}
+    now_s = sections.get("now")
+    summary = sections.get("summary")
+    closed = e.status == "closed"
+    visible = [s for s in stmts if s.status != "repeat"]
+    rec = e.record
+    return PageData(
+        id=e.id,
+        type=e.type,
+        name=e.name,
+        names=[n for n in world.names_of(e.id) if n != e.name],
+        status=e.status,
+        profile=dict(rec.profile),
+        as_of=iso_day(stmts[-1].created_at) if stmts else None,
+        last_activity=world.last_activity(e.id),
+        closed_at=iso_day(rec.closed_at) if rec.closed_at else None,
+        now=CitedText(now_s.text, now_s.sentences[0].citations) if now_s and now_s.sentences and not closed else None,
+        summary=[CitedText(s.text, s.citations) for s in summary.sentences] if summary else [],
+        open=lines(world, [s for s in visible if s.is_open and not closed], today),
+        decided=lines(world, [s for s in reversed(visible) if s.kind == "decision" and s.is_current][:30], today),
+        history=lines(world, list(reversed(visible))[:HISTORY_LIMIT], today),
+        related=[_ref(r) for r in world.related(e.id)],
+        note_count=world.note_count(e.id),
+        log=queries.events(conn, limit=20, entity=world.members(e.id)),
+    )
+
+
+def entity_list(
+    conn: sqlite3.Connection, etype: str | None = None, *, world: World | None = None
+) -> list[EntitySummary]:
+    world = world or World(conn)
+    nows = dict(conn.execute("SELECT entity_id, now FROM pages").fetchall())
+    open_by_thread: dict[str, int] = {}
+    for s in world.open_items():
+        if s.thread:
+            open_by_thread[s.thread] = open_by_thread.get(s.thread, 0) + 1
+    out = []
+    for e in world.roots(etype, with_provisional=False):
+        out.append(
+            EntitySummary(
+                e.id,
+                e.type,
+                e.name,
+                e.status,
+                nows.get(e.id) if e.status != "closed" else None,
+                world.last_activity(e.id),
+                open_by_thread.get(e.id, 0),
+                world.note_count(e.id),
+            )
+        )
+    return sorted(out, key=lambda s: (s.last_activity or "", s.name), reverse=True)
+
+
+def active_threads(conn: sqlite3.Connection, *, now: datetime, inactivity_days: int) -> list[EntitySummary]:
+    """Threads that are not closed and had activity recently, or still have open items."""
+    cutoff = (now - timedelta(days=inactivity_days)).isoformat()
+    return [
+        t
+        for t in entity_list(conn, "thread")
+        if t.status == "active" and ((t.last_activity or "") >= cutoff or t.open_items)
+    ]
+
+
+def recent_notes(conn: sqlite3.Connection, *, limit: int = 50, before: str | None = None) -> list[NoteSummary]:
+    rows = conn.execute(
+        "SELECT n.id, n.created_at, COALESCE(n.title, n.body), n.done, "
+        "(SELECT COUNT(*) FROM statements s WHERE s.note_id = n.id) FROM notes n "
+        "WHERE (? IS NULL OR n.created_at < ?) ORDER BY n.created_at DESC, n.id DESC LIMIT ?",
+        (before, before, limit),
+    ).fetchall()
+    out = []
+    for r in rows:
+        first = next((ln.strip() for ln in r[2].splitlines() if ln.strip()), r[0])
+        out.append(NoteSummary(r[0], r[1], first[:120], bool(r[3]), r[4]))
+    return out
+
+
+def note(conn: sqlite3.Connection, note_id: str, *, now: datetime) -> NoteView:
+    row = conn.execute("SELECT id, created_at, title, about, body, done FROM notes WHERE id = ?", (note_id,)).fetchone()
+    if row is None:
+        raise NoSuchPage(f"no note {note_id}")
+    world = World(conn)
+    stmts = world.of_note(note_id)
+    ents: dict[str, Ent] = {}
+    for (eid,) in conn.execute("SELECT DISTINCT entity_id FROM mentions WHERE note_id = ?", (note_id,)):
+        e = world.get(eid)
+        if e:
+            ents[e.id] = e
+    for s in stmts:
+        if s.thread and s.thread in world.entities:
+            ents[s.thread] = world.entities[s.thread]
+    evs = [
+        queries.LogEvent(*r)
+        for r in conn.execute(
+            "SELECT at, source, kind, text, entity_id FROM events WHERE source = ? ORDER BY seq", (note_id,)
+        )
+    ]
+    return NoteView(
+        row[0],
+        row[1],
+        row[2],
+        row[3],
+        row[4],
+        bool(row[5]),
+        lines(world, stmts, now.astimezone().date()),
+        [_ref(e) for e in sorted(ents.values(), key=lambda e: (ENTITY_TYPES.index(e.type), e.name))],  # type: ignore[arg-type]
+        evs,
     )
 
 
@@ -82,296 +287,53 @@ def _snippet(text: str) -> str:
     return text if len(text) <= SNIPPET_CHARS else text[: SNIPPET_CHARS - 1] + "…"
 
 
+def rrf(*rankings: list[search.Hit]) -> list[tuple[str, str]]:
+    """Reciprocal rank fusion of keyword and vector results: (item id, item type), best first."""
+    scores: dict[tuple[str, str], float] = {}
+    for ranking in rankings:
+        for rank, hit in enumerate(ranking):
+            key = (hit.item_id, hit.item_type)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
+    return sorted(scores, key=lambda k: (-scores[k], k))
+
+
+def retrieve(conn: sqlite3.Connection, llm: LLM | None, text: str, *, limit: int) -> list[tuple[str, str]]:
+    kw = search.keyword(conn, text, limit=limit * 2)
+    vec: list[search.Hit] = []
+    if llm is not None and llm.embed_model and get_meta(conn, "embed_dim") is not None:
+        vec = search.nearest(conn, llm.embed([text])[0], k=limit * 2)
+    return rrf(kw, vec)[: limit * 2]
+
+
 def search_all(
     conn: sqlite3.Connection, llm: LLM | None, query: str, *, limit: int = 10, types: tuple[str, ...] | None = None
 ) -> list[Hit]:
-    """Entries and fragments by keyword and meaning, plus entities by name, best first."""
-    want = set(types or ("entry", "fragment", *NODE_TYPES))
+    world = World(conn)
     hits: list[Hit] = []
-    entity_types = tuple(t for t in NODE_TYPES if t in want)
-    if entity_types:
-        for h in search.keyword(conn, query, limit=limit, types=entity_types):
-            node = conn.execute("SELECT label FROM nodes WHERE id = ?", (f"{h.item_type}:{h.item_id}",)).fetchone()
-            body = conn.execute(
-                "SELECT body FROM fts WHERE item_id = ? AND item_type = ?", (h.item_id, h.item_type)
-            ).fetchone()
-            if node:
-                hits.append(Hit(f"{h.item_type}:{h.item_id}", h.item_type, node[0], _snippet(body[0] if body else "")))
-    if want & {"entry", "fragment"}:
-        if llm is not None:
-            ranked = retrieve(conn, llm, query, limit=limit * 2)
-        else:
-            ranked = [
-                (h.item_id, h.item_type)
-                for h in search.keyword(conn, query, limit=limit * 2, types=("entry", "fragment"))
-            ]
-        frags = queries.fragments_by_id(conn, [i for i, t in ranked if t == "fragment"])
-        for item_id, item_type in ranked:
-            if item_type not in want:
+    seen: set[str] = set()
+    for e in [*world.by_name(query), *world.similar(query, limit=5, floor=0.7)]:
+        if e.id not in seen and e.status != "provisional":
+            seen.add(e.id)
+            hits.append(Hit(e.id, e.type, e.name, "; ".join(world.names_of(e.id)[1:4])))
+    ranked = retrieve(conn, llm, query, limit=limit)
+    stmts = world.by_id([i for i, t in ranked if t == "statement"])
+    dates = queries.note_dates(conn, [i for i, t in ranked if t == "note"])
+    for item_id, item_type in ranked:
+        if item_type == "statement" and item_id in stmts:
+            s = stmts[item_id]
+            if s.status == "retracted":
                 continue
-            if item_type == "fragment" and item_id in frags:
-                f = frags[item_id]
-                hits.append(
-                    Hit(
-                        f.id,
-                        "fragment",
-                        f.text[:80],
-                        _snippet(f.text),
-                        iso_day(f.created_at),
-                        f.entry_id,
-                        f.kind,
-                        f.status,
-                    )
-                )
-            elif item_type == "entry":
-                r = conn.execute(
-                    "SELECT e.created_at, e.body, n.label FROM entries e JOIN nodes n "
-                    "ON n.id = 'entry:' || e.id WHERE e.id = ?",
-                    (item_id,),
-                ).fetchone()
-                if r:
-                    hits.append(Hit(item_id, "entry", r[2], _snippet(r[1]), iso_day(r[0]), item_id))
+            hits.append(
+                Hit(s.id, "statement", s.kind, _snippet(s.text), iso_day(s.created_at), s.note_id, s.kind, s.status)
+            )
+        elif item_type == "note" and item_id in dates:
+            created, label = dates[item_id]
+            hits.append(Hit(item_id, "note", label, "", iso_day(created), item_id))
+        elif item_type == "entity":
+            e = world.get(item_id)
+            if e and e.id not in seen and e.status != "provisional":
+                seen.add(e.id)
+                hits.append(Hit(e.id, e.type, e.name, "; ".join(world.names_of(e.id)[1:4])))
+    if types:
+        hits = [h for h in hits if h.type in types]
     return hits[:limit]
-
-
-def entity_view(conn: sqlite3.Connection, text: str, *, recent: int = 20) -> EntityView:
-    """An entity by node id, id, alias, or close name. Raises AmbiguousTarget or KeyError."""
-    matches = find_targets(conn, text)
-    if not matches:
-        raise KeyError(f"nothing named '{text}'")
-    if len(matches) > 1:
-        raise AmbiguousTarget(text, matches)
-    m = matches[0]
-    row = conn.execute("SELECT label, data FROM nodes WHERE id = ?", (m.node_id,)).fetchone()
-    data = json.loads(row["data"])
-    notes = data.pop("notes", "") if isinstance(data.get("notes"), str) else ""
-    file_key = data.pop("key", None) or ""
-    aliases = [a[0] for a in conn.execute("SELECT alias FROM aliases WHERE node_id = ? ORDER BY alias", (m.node_id,))]
-    family = queries.node_family(conn, m.node_id)
-    frags = queries.node_fragments(conn, m.node_id, limit=500)
-    related: dict[str, list[str]] = {}
-    if frags:
-        src = [f"frag:{f.id}" for f in frags]
-        rows = conn.execute(
-            f"SELECT n.type, n.label, COUNT(*) c FROM edges e JOIN nodes n ON n.id = e.dst "
-            f"WHERE e.src IN ({','.join('?' * len(src))}) AND e.type IN {queries.LINK_EDGES_SQL} "
-            f"AND n.id NOT IN ({','.join('?' * len(family))}) GROUP BY n.id ORDER BY c DESC, n.label",
-            [*src, *family],
-        ).fetchall()
-        for t, label, _ in rows:
-            related.setdefault(t, []).append(label)
-    for r in conn.execute(
-        "SELECT e.type, n.label FROM edges e JOIN nodes n ON n.id = e.dst "
-        "WHERE e.src = ? AND e.type IN ('member_of', 'part_of', 'merged_into')",
-        (m.node_id,),
-    ):
-        related.setdefault({"member_of": "member of", "part_of": "part of"}.get(r[0], "merged into"), []).append(r[1])
-    summary = summary_as_of = None
-    if m.type == "thread":
-        t = queries.thread(conn, m.node_id.split(":", 1)[1])
-        summary = t.summary if t else None
-        summary_as_of = iso_day(t.summary_as_of) if t and t.summary_as_of else None
-    changed = conn.execute("SELECT mtime FROM objects WHERE key = ?", (file_key,)).fetchone()
-    return EntityView(
-        id=m.node_id,
-        type=m.type,
-        name=row["label"],
-        aliases=aliases,
-        details=data,
-        notes=notes,
-        summary=summary,
-        related=related,
-        open_items=[fragment_view(f) for f in frags if f.is_open],
-        recent=[fragment_view(f) for f in frags[-recent:]][::-1],
-        fragment_count=len(frags),
-        summary_as_of=summary_as_of,
-        notes_as_of=iso_day(changed[0]) if changed and changed[0] else None,
-    )
-
-
-def entry_view(conn: sqlite3.Connection, entry_id: str) -> EntryView:
-    r = conn.execute(
-        "SELECT id, created_at, title, body, key, next_step FROM entries WHERE id = ?", (entry_id,)
-    ).fetchone()
-    if r is None:
-        raise KeyError(f"no entry {entry_id}")
-    ids = [x[0] for x in conn.execute("SELECT id FROM fragments WHERE entry_id = ? ORDER BY id", (entry_id,))]
-    frags = queries.fragments_by_id(conn, ids)
-    return EntryView(
-        r["id"],
-        r["created_at"][:16],
-        r["title"],
-        r["body"],
-        r["key"],
-        r["next_step"] == "done",
-        [fragment_view(frags[i]) for i in ids if i in frags],
-    )
-
-
-# --- lists and graph for the web UI --------------------------------------------
-
-
-@dataclass
-class EntitySummary:
-    id: str  # node id
-    type: str
-    name: str
-    state: str | None
-    fragments: int
-    last_seen: str | None
-    detail: str | None  # role for people, kind for themes, description for threads
-
-
-def entity_list(conn: sqlite3.Connection, etype: str) -> list[EntitySummary]:
-    edge = queries.edge_for(etype)
-    rows = conn.execute(
-        """
-        SELECT n.id, n.label, n.data, COUNT(DISTINCT f.id), MAX(f.created_at)
-        FROM nodes n
-        LEFT JOIN edges e ON e.dst = n.id AND e.type = ?
-        LEFT JOIN fragments f ON e.src = 'frag:' || f.id
-        WHERE n.type = ? GROUP BY n.id ORDER BY MAX(f.created_at) IS NULL, MAX(f.created_at) DESC, n.label
-        """,
-        (edge, etype),
-    ).fetchall()
-    out = []
-    for nid, label, data, count, last in rows:
-        d = json.loads(data)
-        detail = d.get("role") or d.get("kind") or d.get("description")
-        out.append(EntitySummary(nid, etype, label, d.get("state"), count, iso_day(last) if last else None, detail))
-    return out
-
-
-@dataclass
-class EntrySummary:
-    id: str
-    date: str
-    title: str | None
-    preview: str
-    processed: bool
-    fragments: int
-
-
-def recent_entries(conn: sqlite3.Connection, *, limit: int = 50, before: str | None = None) -> list[EntrySummary]:
-    rows = conn.execute(
-        """
-        SELECT e.id, e.created_at, e.title, e.body, e.next_step,
-               (SELECT COUNT(*) FROM fragments f WHERE f.entry_id = e.id)
-        FROM entries e WHERE e.created_at < ? ORDER BY e.created_at DESC, e.id DESC LIMIT ?
-        """,
-        (before or "9999", limit),
-    ).fetchall()
-    return [EntrySummary(r[0], r[1][:16], r[2], _snippet(r[3]), r[4] == "done", r[5]) for r in rows]
-
-
-def someday(conn: sqlite3.Connection) -> list[FragmentView]:
-    frags = queries.select_fragments(conn, "f.someday = 1 ORDER BY f.created_at DESC, f.id DESC")
-    return [fragment_view(f) for f in frags]
-
-
-@dataclass
-class Link:
-    id: str
-    type: str
-    label: str
-
-
-@dataclass
-class TimelineFragment:
-    fragment: FragmentView
-    links: list[Link]
-
-
-def node_timeline(conn: sqlite3.Connection, node_id: str) -> list[TimelineFragment]:
-    """Every fragment linked to a node (and nodes merged into it), newest first, with its other links."""
-    family = queries.node_family(conn, node_id)
-    frags = queries.node_fragments(conn, node_id, limit=2000)
-    links: dict[str, list[Link]] = {}
-    if frags:
-        src = [f"frag:{f.id}" for f in frags]
-        for fid, nid, t, label in conn.execute(
-            f"SELECT substr(e.src, 6), n.id, n.type, n.label FROM edges e JOIN nodes n ON n.id = e.dst "
-            f"WHERE e.src IN ({','.join('?' * len(src))}) AND e.type IN {queries.LINK_EDGES_SQL} "
-            "ORDER BY n.type, n.label",
-            src,
-        ):
-            if nid not in family:
-                links.setdefault(fid, []).append(Link(nid, t, label))
-    return [TimelineFragment(fragment_view(f), links.get(f.id, [])) for f in reversed(frags)]
-
-
-@dataclass
-class GraphNode:
-    id: str
-    type: str
-    label: str
-    weight: int  # number of fragments linked to it
-
-
-@dataclass
-class GraphEdge:
-    source: str
-    target: str
-    weight: int  # fragments linking both, or 1 for a membership edge
-    type: str  # co_occurs | member_of | part_of
-
-
-@dataclass
-class Graph:
-    nodes: list[GraphNode]
-    edges: list[GraphEdge]
-    truncated: bool
-
-
-def entity_graph(conn: sqlite3.Connection, *, center: str | None = None, depth: int = 2, limit: int = 250) -> Graph:
-    """People, orgs, themes, and threads; two are joined when fragments link to both.
-
-    This is where cross-thread patterns show up: a technique theme linked to
-    two threads means the same approach was used in both.
-    """
-    weights = dict(
-        conn.execute(
-            "SELECT e.dst, COUNT(DISTINCT e.src) FROM edges e JOIN nodes n ON n.id = e.dst "
-            f"WHERE e.type IN {queries.LINK_EDGES_SQL} AND n.type IN ('person', 'org', 'theme', 'thread') "
-            "GROUP BY e.dst"
-        ).fetchall()
-    )
-    labels = {
-        r[0]: (r[1], r[2])
-        for r in conn.execute(
-            "SELECT id, type, label FROM nodes WHERE type IN ('person', 'org', 'theme', 'thread')"
-        ).fetchall()
-    }
-    merged = {r[0] for r in conn.execute("SELECT src FROM edges WHERE type = 'merged_into'")}
-    pairs: dict[tuple[str, str], int] = {}
-    for a, b, n in conn.execute(
-        f"""
-        SELECT e1.dst, e2.dst, COUNT(DISTINCT e1.src) FROM edges e1
-        JOIN edges e2 ON e2.src = e1.src AND e2.dst > e1.dst
-        WHERE e1.type IN {queries.LINK_EDGES_SQL} AND e2.type IN {queries.LINK_EDGES_SQL}
-        GROUP BY e1.dst, e2.dst
-        """
-    ):
-        if a in labels and b in labels and a not in merged and b not in merged:
-            pairs[(a, b)] = n
-    edges = [GraphEdge(a, b, n, "co_occurs") for (a, b), n in pairs.items()]
-    for src, dst, t in conn.execute("SELECT src, dst, type FROM edges WHERE type IN ('member_of', 'part_of')"):
-        if src in labels and dst in labels:
-            edges.append(GraphEdge(src, dst, 1, t))
-
-    keep = {n for n in labels if n not in merged}
-    if center:
-        adj: dict[str, set[str]] = {}
-        for e in edges:
-            adj.setdefault(e.source, set()).add(e.target)
-            adj.setdefault(e.target, set()).add(e.source)
-        frontier, seen = {center}, {center}
-        for _ in range(depth):
-            frontier = {m for n in frontier for m in adj.get(n, set())} - seen
-            seen |= frontier
-        keep &= seen
-    ranked = sorted(keep, key=lambda n: (n != center, -weights.get(n, 0), labels[n][1]))
-    truncated = len(ranked) > limit
-    keep = set(ranked[:limit])
-    nodes = [GraphNode(n, labels[n][0], labels[n][1], weights.get(n, 0)) for n in ranked[:limit]]
-    return Graph(nodes, [e for e in edges if e.source in keep and e.target in keep], truncated)

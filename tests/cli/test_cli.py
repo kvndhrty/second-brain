@@ -9,7 +9,6 @@ import pytest
 from typer.testing import CliRunner
 
 from brain.cli import app as cli
-from brain.core import keys
 from brain.core.localstate import LocalState
 from brain.core.storage.lease import Lease
 from brain.core.storage.local import LocalStorage
@@ -29,12 +28,12 @@ def run(cfg: Path, *args: str, input: str | None = None):
 
 
 def test_jot_message_then_reindex(cfg, tmp_path):
-    r = run(cfg, "jot", "-m", "Talked to Jane about quotas.", "--title", "Quota", "--tag", "gpu")
+    r = run(cfg, "jot", "-m", "Talked to Jane about quotas.", "--title", "Quota")
     assert r.exit_code == 0, r.output
-    assert "saved e-" in r.output
-    files = list((tmp_path / "store" / "entries").rglob("*.md"))
+    assert "saved n-" in r.output
+    files = list((tmp_path / "store" / "notes").rglob("*.md"))
     assert len(files) == 1 and files[0].name.endswith("-quota.md")
-    assert "tags:\n  - gpu" in files[0].read_text()
+    assert files[0].read_text().endswith("---\nTalked to Jane about quotas.\n")
     r = run(cfg, "reindex")
     assert r.exit_code == 0 and "1 units rebuilt" in r.output
     r = run(cfg, "sync")
@@ -44,7 +43,7 @@ def test_jot_message_then_reindex(cfg, tmp_path):
 def test_jot_from_stdin(cfg, tmp_path):
     r = run(cfg, "jot", input="from a pipe\n")
     assert r.exit_code == 0, r.output
-    (f,) = (tmp_path / "store" / "entries").rglob("*.md")
+    (f,) = (tmp_path / "store" / "notes").rglob("*.md")
     assert f.name.endswith("-from-a-pipe.md")
 
 
@@ -70,7 +69,7 @@ def test_lease_held_by_other_machine_exits_3_and_force_works(cfg, tmp_path):
     r = run(cfg, "jot", "-m", "hello")
     assert r.exit_code == 3
     assert "Another machine holds the write lease" in r.output and "--force" in r.output
-    assert not list((tmp_path / "store").rglob("entries/**/*.md"))
+    assert not list((tmp_path / "store").rglob("notes/**/*.md"))
     assert "--force" in r.output and "jot --file" in r.output  # the text is kept as a draft
     r = run(cfg, "jot", "-m", "hello", "--force")
     assert r.exit_code == 0, r.output
@@ -83,7 +82,7 @@ def test_failed_save_keeps_draft(cfg, tmp_path, monkeypatch):
         raise OSError("disk full")
 
     with monkeypatch.context() as m:  # undo only this patch, not the env isolation
-        m.setattr(vault.Vault, "save_entry", boom)
+        m.setattr(vault.Vault, "save_note", boom)
         r = run(cfg, "jot", "-m", "precious words")
     assert r.exit_code == 1
     assert "jot --file" in r.output
@@ -135,20 +134,7 @@ def test_core_does_not_import_front_end_libraries():
     assert out.stdout.strip() == ""
 
 
-def test_keys_layout():
-    from datetime import UTC, datetime
-
-    dt = datetime(2026, 10, 30, 23, 30, 5, tzinfo=UTC)
-    eid = keys.entry_id_for(dt)
-    assert keys.entry_key(dt, eid, "vendor-call") == "entries/2026/10/30/20261030T233005Z-vendor-call.md"
-    assert keys.classify("generated/embeddings/text-embed_3/e-1.json").model_slug == "text-embed_3"
-    assert keys.classify("decisions/e-1.yaml").unit == "entry:e-1"
-    assert keys.classify("threads/gpu.md").entity_type == "thread"
-    assert keys.classify("_system/lease.json") is None
-    assert keys.slugify("Ünïcode & Punctuation!! 2026 plan") == "unicode-punctuation-2026-plan"
-
-
-# --- milestone 2 commands (scripted fake LLM) ------------------------------------
+# --- commands that call a model (scripted fake LLM) ------------------------------
 
 
 @pytest.fixture
@@ -157,109 +143,84 @@ def fake_cfg(tmp_path: Path, monkeypatch) -> Path:
     p = tmp_path / "config.toml"
     p.write_text(
         f'[storage]\nbackend = "local"\npath = "{tmp_path / "store"}"\n'
-        '[llm]\nbase_url = "https://fake/v1"\nchat_model = "fake-chat"\nembed_model = "fake-embed"\n'
+        '[llm]\nbase_url = "https://fake/v1"\nsmall_model = "fake-small"\nembed_model = "fake-embed"\n'
     )
     return p
 
 
-def test_jot_processes_and_points_to_review(fake_cfg):
+def test_jot_processes_the_note(fake_cfg):
     r = run(fake_cfg, "jot", "-m", "Met Jane Doe about the [[GPU quota migration]]. Does MIG work?")
     assert r.exit_code == 0, r.output
-    assert "extract, embed, resolve" in r.output and "brain review" in r.output
+    assert "model call(s)" in r.output
     r = run(fake_cfg, "process")
     assert "nothing to process" in r.output
 
 
-def test_jot_without_model_endpoint_leaves_extraction_pending(cfg):
+def test_jot_without_model_endpoint_leaves_the_note_pending(cfg):
     r = run(cfg, "jot", "-m", "hello")
-    assert r.exit_code == 0 and "extraction is pending" in r.output
+    assert r.exit_code == 0 and "saved and pending" in r.output
 
 
-def test_show_status_active_ask_brief(fake_cfg):
+def test_show_active_wiki_ask_brief_search_log(fake_cfg):
     run(fake_cfg, "jot", "-m", "Kicked off the [[GPU quota migration]]. Does the vendor support MIG on the nodes?")
+    run(fake_cfg, "jot", "-m", "Jane Doe needs to file the ticket for the [[GPU quota migration]].")
     r = run(fake_cfg, "show")
-    assert r.exit_code == 0 and "processed" in r.output
-    frag = next(w for w in r.output.split() if w.startswith("f-e-") and w.endswith("-02"))
-    r = run(fake_cfg, "status", frag, "--obe", "--reason", "vendor left")
-    assert r.exit_code == 0, r.output
-    assert "overcome_by_events" in run(fake_cfg, "show").output
-    r = run(fake_cfg, "status", frag)
-    assert r.exit_code == 2 and "nothing to change" in r.output
+    assert r.exit_code == 0 and "processed" in r.output and "action · GPU quota migration" in r.output
     r = run(fake_cfg, "active")
-    assert "GPU quota" in r.output and "proposed" in r.output
+    assert r.exit_code == 0 and "GPU quota migration" in r.output and "2 open" in r.output
+    r = run(fake_cfg, "wiki")
+    assert r.exit_code == 0 and "gpu-quota-migration" in r.output and "jane-doe" in r.output
+    r = run(fake_cfg, "wiki", "GPU quota migration")
+    assert r.exit_code == 0 and r.output.startswith("---\nid: gpu-quota-migration") and "## Open" in r.output
+    assert run(fake_cfg, "wiki", "nothing like this").exit_code == 2
     r = run(fake_cfg, "ask", "does the vendor support MIG?")
     assert r.exit_code == 0 and "Sources" in r.output
     r = run(fake_cfg, "brief", "GPU quota migration")
     assert r.exit_code == 0, r.output
     assert "Where things stand" in r.output and "last looked: never" in r.output
     assert "last looked: 20" in run(fake_cfg, "brief", "GPU quota migration").output
+    r = run(fake_cfg, "search", "vendor MIG")
+    assert r.exit_code == 0 and "Does the vendor support MIG on the nodes?" in r.output
+    r = run(fake_cfg, "log")
+    assert r.exit_code == 0 and "New person: Jane Doe" in r.output
 
 
-def test_review_creates_person_and_accepts_thread(fake_cfg, tmp_path):
-    run(fake_cfg, "jot", "-m", "Paired with Zed on the [[Cache rewrite]].")
-    # Person: create "Zed Shaw" with a role and no org. Thread: accept.
-    r = run(fake_cfg, "review", input="c\nZed Shaw\nStaff engineer\n\na\n")
+def test_correction_from_the_command_line(fake_cfg):
+    run(fake_cfg, "jot", "-m", "Kicked off the [[GPU quota migration]].")
+    run(fake_cfg, "jot", "-m", "More on the [[GPU quota migration]].")
+    r = run(fake_cfg, "jot", "-m", "This is finished.", "--about", "GPU quota migration")
     assert r.exit_code == 0, r.output
-    assert "2 decided" in r.output
-    person = (tmp_path / "store" / "people" / "zed-shaw.md").read_text()
-    assert "role: Staff engineer" in person and "- Zed" in person
-    assert "state: active" in (tmp_path / "store" / "threads" / "cache-rewrite.md").read_text()
+    assert "status: closed" in run(fake_cfg, "wiki", "gpu-quota-migration").output
+    assert "no active threads" in run(fake_cfg, "active").output
+    assert run(fake_cfg, "jot", "-m", "x", "--about", "no such page").exit_code == 2
 
 
-def test_reextract_requires_confirmation(fake_cfg):
-    run(fake_cfg, "jot", "-m", "Something happened.")
-    r = run(fake_cfg, "reextract", input="n\n")
-    assert "Re-extract all 1 entries" in r.output
-    r = run(fake_cfg, "reextract", "-y")
-    assert r.exit_code == 0 and "extract" in r.output
+def test_file_saved_into_notes_is_picked_up_by_process(fake_cfg, tmp_path):
+    notes = tmp_path / "store" / "notes"
+    notes.mkdir(parents=True)
+    (notes / "from my editor.md").write_text("Jane Doe is out this week.\n")
+    r = run(fake_cfg, "process")
+    assert r.exit_code == 0 and "model call(s)" in r.output
+    assert "Jane Doe is out this week." in run(fake_cfg, "show").output
 
 
-def test_thread_commands_and_sweep(fake_cfg, tmp_path):
-    run(fake_cfg, "jot", "-m", "Started the [[Cache rewrite]]. Need to benchmark the [[Cache rewrite]].")
-    r = run(fake_cfg, "thread", "list")
-    assert "Cache rewrite" in r.output and "cache-rewrite" in r.output
-    assert run(fake_cfg, "thread", "rename", "cache-rewrite", "Cache v2").exit_code == 0
-    assert run(fake_cfg, "thread", "pin", "cache-rewrite").exit_code == 0
-    r = run(fake_cfg, "thread", "show", "cache-rewrite")
-    frag = next(w for w in r.output.split() if w.startswith("f-e-") and w.endswith("-02"))
-    r = run(fake_cfg, "thread", "split", "cache-rewrite", frag, "--name", "Benchmarks")
-    assert r.exit_code == 0 and "created thread benchmarks" in r.output
-    r = run(fake_cfg, "thread", "merge", "benchmarks", "nope")
-    assert r.exit_code == 1 and "no thread nope" in r.output
-    r = run(fake_cfg, "thread", "obe", "benchmarks", "--reason", "dropped", "--cascade")
-    assert "1 open items marked" in r.output
-    assert "state: obe" in (tmp_path / "store" / "threads" / "benchmarks.md").read_text()
-    assert "nothing stale" in run(fake_cfg, "sweep").output
-    run(fake_cfg, "jot", "-m", "Does the cache need warming?")
-    r = run(fake_cfg, "sweep", "--days", "0", "--quiet-days", "0", input="c\n")
-    assert r.exit_code == 0 and "Still open" in r.output and "sweep done: 1 changed" in r.output
-    assert "nothing stale" in run(fake_cfg, "sweep", "--days", "0", "--quiet-days", "0").output
+def test_rebuild_requires_confirmation(fake_cfg):
+    run(fake_cfg, "jot", "-m", "Something happened with the [[Cache rewrite]].")
+    r = run(fake_cfg, "rebuild", input="n\n")
+    assert r.exit_code == 0 and "rebuilt" not in r.output
+    r = run(fake_cfg, "rebuild", "-y")
+    assert r.exit_code == 0 and "rebuilt from 1 note(s)" in r.output
 
 
 def test_context_and_dream_commands(fake_cfg):
-    import json
-
     run(fake_cfg, "jot", "-m", "We decided the [[Billing migration]] cutover is in March.")
-    run(fake_cfg, "jot", "-m", "The [[Billing migration]] cutover moved to May instead of March.")
+    run(fake_cfg, "jot", "-m", "We decided the [[Billing migration]] cutover is in May instead.")
     r = run(fake_cfg, "context")
-    assert r.exit_code == 0, r.output
-    assert r.output.startswith("# brain: ") and "Billing migration [billing-migration]" in r.output
+    assert r.exit_code == 0 and r.output.startswith("# brain: ") and "Billing migration [billing-migration]" in r.output
     r = run(fake_cfg, "context", "--format", "json")
-    assert json.loads(r.output)["threads"][0]["id"] == "billing-migration"
+    assert r.exit_code == 0 and '"threads"' in r.output
+    assert run(fake_cfg, "context", "--format", "xml").exit_code == 2
     r = run(fake_cfg, "dream", "--dry-run")
-    assert r.exit_code == 0 and "look for superseded fragments in Billing migration" in r.output
-    r = run(fake_cfg, "dream")
     assert r.exit_code == 0, r.output
-    assert "wrote the Now line for thread billing-migration" in r.output and "brain review" in r.output
     r = run(fake_cfg, "dream")
-    assert "nothing to do" in r.output
-    r = run(fake_cfg, "review", input="y\n")
-    assert "Has this been overcome by events?" in r.output
-    r = run(fake_cfg, "doctor")
-    assert "last pass" in r.output
-
-
-def test_dream_unknown_thread_is_reported(fake_cfg):
-    for args in (("dream", "--thread", "nope"), ("dream", "--dry-run", "--thread", "nope")):
-        r = run(fake_cfg, *args)
-        assert r.exit_code == 1 and "no thread nope" in r.output and "Traceback" not in r.output
+    assert r.exit_code == 0 and ("nothing changed" in r.output or "✓" in r.output)

@@ -1,8 +1,9 @@
 """Versioned prompt files in brain/prompts.
 
-Each file has frontmatter `name`, `version`, and `role` (which configured
-model runs it). The stamp recorded on every generated sidecar includes the
-SHA-256 of the file, so an edit made without bumping `version` is visible.
+Each file has frontmatter `name`, `version`, and `role`: `layer` prompts run
+on the small model, `dream` and `answer` prompts on whichever model the
+config assigns. The stamp recorded on every generated file includes the
+SHA-256 of the prompt, so an edit made without bumping `version` is visible.
 """
 
 from __future__ import annotations
@@ -13,10 +14,10 @@ from functools import cache
 from importlib import resources
 from typing import Literal
 
-from brain.core.formats.sidecars import PromptStamp
+from brain.core.formats.records import PromptStamp
 from brain.core.formats.yamlio import load_yaml, split_frontmatter
 
-Role = Literal["chat", "extract"]
+Role = Literal["layer", "dream", "answer"]
 
 
 @dataclass(frozen=True)
@@ -42,7 +43,7 @@ def load_prompt(name: str) -> Prompt:
     return Prompt(
         name=name,
         version=int(fm["version"]),
-        role=fm.get("role", "chat"),
+        role=fm.get("role", "layer"),
         instructions=body.strip(),
         sha256=hashlib.sha256(text.encode()).hexdigest()[:16],
     )

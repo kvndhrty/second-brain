@@ -1,7 +1,7 @@
 [project]
 name = "brain-journal"
-version = "0.1.0"
-description = "A work journal that an LLM turns into a linked, searchable knowledge graph"
+version = "0.2.0"
+description = "A work journal: you write notes, and a model keeps the wiki"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

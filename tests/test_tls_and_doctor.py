@@ -155,8 +155,8 @@ def doctor(local_storage, state, transport=None, **settings_kw) -> dict[str, lis
 
 LLM = {
     "base_url": "https://gateway.test/v1",
-    "chat_model": "chat-model",
-    "extract_model": "extract-model",
+    "small_model": "small-model",
+    "strong_model": "strong-model",
     "embed_model": "embed-model",
 }
 
@@ -165,7 +165,16 @@ def test_doctor_all_green_with_fake_gateway(local_storage, state, monkeypatch):
     monkeypatch.setenv("BRAIN_API_KEY", "test-key")
     fake = FakeOpenAI(dim=12)
     r = doctor(local_storage, state, fake.transport(), llm=LLM)
-    for name in ("storage", "conditional writes", "lease", "models", "chat", "extract", "embedding", "sqlite-vec"):
+    for name in (
+        "storage",
+        "conditional writes",
+        "lease",
+        "models",
+        "small model",
+        "strong model",
+        "embedding",
+        "sqlite-vec",
+    ):
         assert r[name][0].status == "ok", (name, r[name][0])
     assert "12 dimensions" in r["embedding"][0].detail
     assert not list(local_storage.list("_system/doctor/"))
@@ -182,16 +191,16 @@ def test_doctor_reports_bad_key_once(local_storage, state, monkeypatch):
     monkeypatch.setenv("BRAIN_API_KEY", "wrong")
     r = doctor(local_storage, state, FakeOpenAI().transport(), llm=LLM)
     assert r["models"][0].status == "fail" and "401" in r["models"][0].detail
-    assert "chat" not in r
+    assert "small model" not in r
 
 
 def test_doctor_reports_wrong_model_and_dim(local_storage, state, monkeypatch):
     monkeypatch.setenv("BRAIN_API_KEY", "test-key")
     r = doctor(
-        local_storage, state, FakeOpenAI(dim=12).transport(), llm=LLM | {"chat_model": "typo-model", "embed_dim": 1024}
+        local_storage, state, FakeOpenAI(dim=12).transport(), llm=LLM | {"small_model": "typo-model", "embed_dim": 1024}
     )
     assert r["models"][0].status == "warn" and "typo-model" in r["models"][0].detail
-    assert r["chat"][0].status == "fail" and "404" in r["chat"][0].detail
+    assert r["small model"][0].status == "fail" and "404" in r["small model"][0].detail
     assert r["embedding"][0].status == "fail" and "1024" in r["embedding"][0].detail
 
 
@@ -200,14 +209,14 @@ def test_doctor_over_real_mtls(local_storage, state, certs, mtls_fake_gateway, m
     monkeypatch.setenv("BRAIN_API_KEY", "test-key")
     tls = {"ca_bundle": str(certs.ca_file), "client_cert": str(certs.client_cert), "client_key": str(certs.client_key)}
     r = doctor(local_storage, state, llm=LLM | {"base_url": url}, tls=tls)
-    assert r["chat"][0].status == "ok", r["chat"][0]
+    assert r["small model"][0].status == "ok", r["small model"][0]
     assert r["embedding"][0].status == "ok"
     r = doctor(local_storage, state, llm=LLM | {"base_url": url}, tls={"ca_bundle": str(certs.ca_file)})
     assert r["models"][0].status == "fail"
 
 
 def test_doctor_warns_when_localhost_goes_through_proxy(local_storage, state, monkeypatch):
-    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.corp:3128")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
     monkeypatch.delenv("NO_PROXY", raising=False)
     monkeypatch.delenv("no_proxy", raising=False)
     r = doctor(local_storage, state, llm={"base_url": "https://localhost:8443/v1"})

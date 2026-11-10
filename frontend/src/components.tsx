@@ -1,15 +1,6 @@
 import { useState, type ReactNode } from "react";
-import { Link as RouterLink } from "react-router-dom";
-import {
-  api,
-  nodePath,
-  type Candidate,
-  type Claim,
-  type Fragment,
-  type FragmentPatch,
-  type Link,
-  type Source,
-} from "./api";
+import { Link } from "react-router-dom";
+import { api, notePath, pagePath, type Claim, type Cited, type Ref, type Source, type Statement } from "./api";
 import { useAction } from "./hooks";
 
 export function Loading({ error, loading }: { error?: string; loading: boolean }) {
@@ -19,144 +10,120 @@ export function Loading({ error, loading }: { error?: string; loading: boolean }
 }
 
 const KIND_LABEL: Record<string, string> = {
-  observation: "observation",
-  decision: "decision",
+  fact: "",
+  decision: "decided",
   question: "question",
+  action: "to do",
   idea: "idea",
-  claim: "claim",
-  action_item: "action",
-};
-
-const STATUS_LABEL: Record<Fragment["status"], string> = {
-  confirmed: "confirmed",
-  speculative: "speculative",
-  overcome_by_events: "overcome by events",
+  correction: "correction",
 };
 
 export function Badge({ children, tone }: { children: ReactNode; tone?: string }) {
   return <span className={`badge ${tone ?? ""}`}>{children}</span>;
 }
 
-export function EntryLink({ id, children }: { id: string; children?: ReactNode }) {
-  return <RouterLink to={`/entries/${encodeURIComponent(id)}`}>{children ?? id}</RouterLink>;
+export function NoteLink({ id, children }: { id: string; children?: ReactNode }) {
+  return <Link to={notePath(id)}>{children ?? id}</Link>;
 }
 
-export function NodeChip({ link }: { link: Link }) {
+export function PageChip({ page }: { page: Ref }) {
   return (
-    <RouterLink className={`chip ${link.type}`} to={nodePath(link.id)}>
-      {link.label}
-    </RouterLink>
+    <Link className={`chip ${page.type}`} to={pagePath(page.id)}>
+      {page.name}
+    </Link>
   );
 }
 
-// Ask why something is overcome by events. null means cancelled; "" means no reason given.
-export function askObeReason(): string | null {
-  return window.prompt("Why is this overcome by events? (optional)");
-}
-
-// Search entities of one type by name and pick one; `label` prefixes each result's button.
-export function EntitySearch({
-  type,
-  label,
-  busy,
-  exclude,
-  onPick,
+// The one place a person writes. With `about`, the note is a correction to that wiki page.
+export function NoteBox({
+  about,
+  placeholder = "What happened, what was decided, what is still open…",
+  autoFocus = false,
+  onSaved,
+  onCancel,
 }: {
-  type: string;
-  label: string;
-  busy: boolean;
-  exclude?: string;
-  onPick: (id: string) => void;
+  about?: Ref;
+  placeholder?: string;
+  autoFocus?: boolean;
+  onSaved?: (id: string) => void;
+  onCancel?: () => void;
 }) {
   const [text, setText] = useState("");
-  const [found, setFound] = useState<Candidate[]>();
+  const [saved, setSaved] = useState<string>();
+  const { busy, error, run } = useAction();
+  const submit = () =>
+    run(async () => {
+      const { id } = await api.jot(text, about?.id);
+      setText("");
+      setSaved(id);
+      onSaved?.(id);
+    });
+
   return (
-    <div className="toolbar">
-      <input placeholder={`${label}: search ${type}s`} value={text} onChange={(e) => setText(e.target.value)} />
-      <button disabled={busy || !text.trim()} onClick={() => void api.choices(type, text).then(setFound)}>
-        Search
-      </button>
-      {found?.filter((c) => c.entity_id !== exclude).map((c) => (
-        <button key={c.entity_id} disabled={busy} onClick={() => onPick(c.entity_id)}>
-          {label} {c.name ?? c.entity_id}
+    <div className="notebox">
+      {about && (
+        <p className="muted">
+          Say what is wrong with <strong>{about.name}</strong> in your own words, for example “this is the same
+          person as …”, “this is finished”, or “the December date is wrong, it moved to January”.
+        </p>
+      )}
+      <textarea
+        aria-label="note"
+        autoFocus={autoFocus}
+        placeholder={placeholder}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && text.trim()) void submit();
+        }}
+        rows={about ? 3 : 5}
+      />
+      <div className="toolbar">
+        <button className="primary" disabled={busy || !text.trim()} onClick={() => void submit()}>
+          {busy ? "Saving…" : about ? "Save correction" : "Save note"}
         </button>
-      ))}
-      {found && found.length === 0 && <span className="muted">no match</span>}
+        {onCancel && <button onClick={onCancel}>Cancel</button>}
+        <span className="muted">⌘/Ctrl + Enter to save</span>
+        {saved && (
+          <span className="muted">
+            Saved. <NoteLink id={saved}>See what brain made of it</NoteLink>
+          </span>
+        )}
+      </div>
+      {error && <p className="error">{error}</p>}
     </div>
   );
 }
 
-// One fragment, with its badges and the actions that change its status.
-// Changes are saved to the entry's decisions file, so they survive re-extraction.
-export function FragmentCard({
-  fragment,
-  links = [],
-  onChanged,
-}: {
-  fragment: Fragment;
-  links?: Link[];
-  onChanged?: () => void;
-}) {
-  const { busy, error, run } = useAction();
-  const f = fragment;
-
-  const change = (patch: FragmentPatch) =>
-    run(async () => {
-      await api.patchFragment(f.id, patch);
-      onChanged?.();
-    });
-
-  function markObe() {
-    const reason = askObeReason();
-    if (reason === null) return;
-    void change({ status: "overcome_by_events", obe_reason: reason || null });
-  }
-
+// One statement as a line on a page: its date, kind, text, and what replaced it.
+export function StatementLine({ statement: s, showThread = false }: { statement: Statement; showThread?: boolean }) {
+  const label = KIND_LABEL[s.kind] ?? s.kind;
   return (
-    <article className={`fragment ${f.status} ${f.state === "closed" ? "closed" : ""}`} data-testid="fragment">
-      <p className="text">{f.text}</p>
-      <div className="meta">
-        <Badge tone={f.kind}>{KIND_LABEL[f.kind] ?? f.kind}</Badge>
-        {f.status !== "confirmed" && <Badge tone={f.status}>{STATUS_LABEL[f.status]}</Badge>}
-        {f.state && <Badge tone={f.state}>{f.state}</Badge>}
-        {f.someday && <Badge tone="someday">someday</Badge>}
-        {f.obe_reason && <span className="muted">({f.obe_reason})</span>}
-        <EntryLink id={f.entry_id}>{f.date}</EntryLink>
-        {links.map((l) => (
-          <NodeChip key={l.id} link={l} />
-        ))}
-      </div>
-      <div className="actions">
-        <select
-          aria-label="status"
-          value={f.status}
-          disabled={busy}
-          onChange={(e) => {
-            const status = e.target.value as Fragment["status"];
-            if (status === "overcome_by_events") markObe();
-            else void change({ status });
-          }}
-        >
-          <option value="confirmed">confirmed</option>
-          <option value="speculative">speculative</option>
-          <option value="overcome_by_events">overcome by events</option>
-        </select>
-        {f.state === "open" && (
-          <button disabled={busy} onClick={() => void change({ state: "closed" })}>
-            Close
-          </button>
-        )}
-        {f.state === "closed" && (
-          <button disabled={busy} onClick={() => void change({ state: "open" })}>
-            Reopen
-          </button>
-        )}
-        <button disabled={busy} onClick={() => void change({ someday: !f.someday })}>
-          {f.someday ? "Not someday" : "Someday"}
-        </button>
-        {error && <span className="error">{error}</span>}
-      </div>
-    </article>
+    <li className={`statement ${s.status}`} data-testid="statement">
+      <NoteLink id={s.note_id}>{s.date}</NoteLink>{" "}
+      {label && <Badge tone={s.kind}>{label}</Badge>} <span className="text">{s.text}</span>
+      {s.status === "superseded" && <span className="muted"> Replaced{s.replaced_by ? ` by: ${s.replaced_by}` : ""}</span>}
+      {s.status === "answered" && <span className="muted"> Answered{s.replaced_by ? `: ${s.replaced_by}` : ""}</span>}
+      {showThread && s.thread && (
+        <>
+          {" "}
+          <PageChip page={{ id: s.thread, type: "thread", name: s.thread_name ?? s.thread }} />
+        </>
+      )}
+    </li>
+  );
+}
+
+export function CitedText({ cited }: { cited: Cited }) {
+  return (
+    <span>
+      {cited.text}{" "}
+      {cited.citations.map((id) => (
+        <sup key={id}>
+          <NoteLink id={id}>[{id.slice(2, 10)}]</NoteLink>
+        </sup>
+      ))}
+    </span>
   );
 }
 
@@ -175,7 +142,7 @@ export function ClaimList({ claims, order }: { claims: Claim[]; order: string[] 
           {c.text}{" "}
           {c.citations.map((id) => (
             <sup key={id}>
-              <EntryLink id={id}>[{order.indexOf(id) + 1}]</EntryLink>
+              <NoteLink id={id}>[{order.indexOf(id) + 1}]</NoteLink>
             </sup>
           ))}
         </li>
@@ -186,61 +153,17 @@ export function ClaimList({ claims, order }: { claims: Claim[]; order: string[] 
 
 export function SourceList({ order, sources }: { order: string[]; sources: Source[] }) {
   if (order.length === 0) return null;
-  const byId = new Map(sources.map((s) => [s.entry_id, s]));
+  const byId = new Map(sources.map((s) => [s.note_id, s]));
   return (
     <ol className="sources">
       {order.map((id) => {
         const s = byId.get(id);
         return (
           <li key={id}>
-            <EntryLink id={id}>{s ? `${s.date} · ${s.label}` : id}</EntryLink>
+            <NoteLink id={id}>{s ? `${s.date} · ${s.label}` : id}</NoteLink>
           </li>
         );
       })}
     </ol>
   );
-}
-
-// Thread summaries are short markdown with [entry-id] citations. This renders
-// paragraphs, "- " bullets, **bold**, and turns citations into entry links.
-export function SummaryText({ text }: { text: string }) {
-  const blocks: ReactNode[] = [];
-  let bullets: string[] = [];
-  const flush = () => {
-    if (bullets.length) {
-      blocks.push(
-        <ul key={blocks.length}>
-          {bullets.map((b, i) => (
-            <li key={i}>{inline(b)}</li>
-          ))}
-        </ul>,
-      );
-      bullets = [];
-    }
-  };
-  for (const line of text.split("\n")) {
-    const t = line.trim();
-    if (t.startsWith("- ") || t.startsWith("* ")) bullets.push(t.slice(2));
-    else {
-      flush();
-      if (t) blocks.push(<p key={blocks.length}>{inline(t.replace(/^#+\s*/, ""))}</p>);
-    }
-  }
-  flush();
-  return <div className="summary">{blocks}</div>;
-}
-
-function inline(text: string): ReactNode[] {
-  return text.split(/(\[e-[^\]\s]+\]|\*\*[^*]+\*\*)/g).map((part, i) => {
-    if (/^\[e-[^\]\s]+\]$/.test(part)) {
-      const id = part.slice(1, -1);
-      return (
-        <sup key={i}>
-          <EntryLink id={id}>[{id.slice(2, 10)}]</EntryLink>
-        </sup>
-      );
-    }
-    if (part.startsWith("**") && part.endsWith("**")) return <strong key={i}>{part.slice(2, -2)}</strong>;
-    return part;
-  });
 }

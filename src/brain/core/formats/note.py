@@ -1,4 +1,4 @@
-"""Journal entries: markdown with YAML frontmatter. The LLM never rewrites them."""
+"""Notes: markdown with YAML frontmatter. The only thing a person writes; the tool never changes the body."""
 
 from __future__ import annotations
 
@@ -35,27 +35,21 @@ def _aware(v: datetime) -> datetime:
     return v if v.tzinfo else v.astimezone()
 
 
-class Entry(BaseModel):
+class Note(BaseModel):
     format: int = FORMAT_VERSION
     id: Id
     created: datetime
-    updated: datetime
     title: str | None = None
-    tags: list[str] = Field(default_factory=list)
+    about: str | None = None  # the wiki page a "This is wrong" note was written from
     body: str = Field(default="", exclude=True)
 
     _fm: CommentedMap | None = PrivateAttr(default=None)
 
-    _aware_created = field_validator("created", "updated")(_aware)
-
-    @field_validator("tags", mode="before")
-    @classmethod
-    def _tags(cls, v: object) -> object:
-        return [] if v is None else v
+    _aware_created = field_validator("created")(_aware)
 
     @property
     def content_hash(self) -> str:
-        return content_hash(self.body)
+        return content_hash(f"{self.about or ''}\n{self.body}")
 
     @property
     def label(self) -> str:
@@ -65,19 +59,19 @@ class Entry(BaseModel):
         return first[:80] or self.id
 
     @classmethod
-    def parse(cls, text: str, *, where: str = "entry") -> Entry:
+    def parse(cls, text: str, *, where: str = "note") -> Note:
         fm_text, body = split_frontmatter(text)
         fm = load_yaml(fm_text)
         check_format(fm, where)
         try:
-            entry = cls.model_validate({**fm, "body": body})
+            note = cls.model_validate({**fm, "body": body})
         except ValidationError as e:
             raise FormatError(f"{where}: {e}") from e
-        entry._fm = fm
-        return entry
+        note._fm = fm
+        return note
 
     def to_text(self) -> str:
         fm = self._fm if self._fm is not None else CommentedMap()
-        merge_into(fm, self.model_dump(mode="json"))
+        merge_into(fm, self.model_dump(mode="json", exclude_none=True))
         self._fm = fm
         return join_frontmatter(fm, normalize_body(self.body))

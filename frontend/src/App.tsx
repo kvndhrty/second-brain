@@ -1,17 +1,11 @@
-import { lazy, Suspense } from "react";
 import { NavLink, Route, Routes } from "react-router-dom";
 import { api } from "./api";
 import { useInterval, useLoad } from "./hooks";
-import { ActivePage } from "./pages/Active";
-import { SomedayPage } from "./pages/Someday";
-import { EditorPage, EntriesPage, EntryPage } from "./pages/Entries";
-import { EntityListPage, EntityPage } from "./pages/Entity";
-import { ReviewPage } from "./pages/Review";
+import { HomePage } from "./pages/Home";
+import { LogPage } from "./pages/Log";
+import { NotePage, NotesPage } from "./pages/Notes";
 import { SearchPage } from "./pages/Search";
-import { SweepPage } from "./pages/Sweep";
-
-// The graph explorer pulls in Cytoscape; load it only when the page is opened.
-const GraphPage = lazy(() => import("./pages/Graph").then((m) => ({ default: m.GraphPage })));
+import { EntityPage, WikiPage } from "./pages/Wiki";
 
 export function App() {
   const status = useLoad(() => api.status());
@@ -22,32 +16,27 @@ export function App() {
     <div className="layout">
       <nav className="sidebar">
         <h1>brain</h1>
-        <NavLink to="/entries/new" className="button primary">
-          New entry
+        <NavLink to="/" end className="button primary">
+          Write a note
         </NavLink>
-        <NavLink to="/" end>
-          Active
-        </NavLink>
+        <NavLink to="/wiki">Wiki</NavLink>
         <NavLink to="/search">Search &amp; ask</NavLink>
-        <NavLink to="/review">
-          Review {s && s.review > 0 && <span className="count">{s.review}</span>}
-        </NavLink>
-        <NavLink to="/entries">Entries</NavLink>
-        <NavLink to="/threads">Threads</NavLink>
-        <NavLink to="/people">People</NavLink>
-        <NavLink to="/orgs">Orgs</NavLink>
-        <NavLink to="/themes">Themes</NavLink>
-        <NavLink to="/someday">Someday</NavLink>
-        <NavLink to="/tidy">Tidy up</NavLink>
-        <NavLink to="/graph">Graph</NavLink>
+        <NavLink to="/notes">Notes</NavLink>
+        <NavLink to="/log">Change log</NavLink>
         <footer className="muted">
           {s && (
             <>
-              <div>{s.entries} entries</div>
+              <div>
+                {s.notes} notes · {s.pages} pages
+              </div>
               {s.pending > 0 && <div>{s.pending} processing</div>}
               {s.failures > 0 && <div className="error">{s.failures} failed</div>}
               {!s.llm_configured && <div>no model endpoint</div>}
-              {s.worker?.last_error && <div className="error" title={s.worker.last_error}>worker error</div>}
+              {s.worker?.last_error && (
+                <div className="error" title={s.worker.last_error}>
+                  worker error
+                </div>
+              )}
             </>
           )}
           {status.error && <div className="error">server unreachable</div>}
@@ -55,27 +44,13 @@ export function App() {
       </nav>
       <main>
         <Routes>
-          <Route path="/" element={<ActivePage />} />
+          <Route path="/" element={<HomePage onSaved={status.reload} />} />
+          <Route path="/wiki" element={<WikiPage />} />
+          <Route path="/p/:id" element={<EntityPage />} />
           <Route path="/search" element={<SearchPage />} />
-          <Route path="/review" element={<ReviewPage onChange={status.reload} />} />
-          <Route path="/entries" element={<EntriesPage />} />
-          <Route path="/entries/new" element={<EditorPage />} />
-          <Route path="/entries/:id" element={<EntryPage />} />
-          <Route path="/threads" element={<EntityListPage type="thread" title="Threads" />} />
-          <Route path="/people" element={<EntityListPage type="person" title="People" />} />
-          <Route path="/orgs" element={<EntityListPage type="org" title="Organizations" />} />
-          <Route path="/themes" element={<EntityListPage type="theme" title="Themes" />} />
-          <Route path="/e/:nodeId" element={<EntityPage />} />
-          <Route path="/someday" element={<SomedayPage />} />
-          <Route path="/tidy" element={<SweepPage />} />
-          <Route
-            path="/graph"
-            element={
-              <Suspense fallback={<p className="muted">Loading…</p>}>
-                <GraphPage />
-              </Suspense>
-            }
-          />
+          <Route path="/notes" element={<NotesPage />} />
+          <Route path="/notes/:id" element={<NotePage />} />
+          <Route path="/log" element={<LogPage />} />
           <Route path="*" element={<p>Not found.</p>} />
         </Routes>
       </main>

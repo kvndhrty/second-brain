@@ -18,119 +18,112 @@ CREATE TABLE problems (                 -- files that could not be parsed
   message TEXT NOT NULL
 );
 
-CREATE TABLE nodes (
-  id         TEXT PRIMARY KEY,          -- 'entry:e-…', 'frag:f-…', 'person:jane-doe', …
-  type       TEXT NOT NULL,             -- entry|fragment|person|org|theme|thread
-  label      TEXT NOT NULL,
-  created_at TEXT,
-  updated_at TEXT,
-  data       TEXT NOT NULL DEFAULT '{}',
-  owner      TEXT NOT NULL
-);
-CREATE INDEX nodes_type ON nodes(type);
-CREATE INDEX nodes_owner ON nodes(owner);
-
-CREATE TABLE entries (
+CREATE TABLE notes (
   id           TEXT PRIMARY KEY,
   key          TEXT NOT NULL UNIQUE,
   created_at   TEXT NOT NULL,
-  updated_at   TEXT NOT NULL,
   title        TEXT,
+  about        TEXT,
   body         TEXT NOT NULL,
   content_hash TEXT NOT NULL,
-  extraction   TEXT NOT NULL,           -- current|pending|stale
-  next_step    TEXT NOT NULL            -- extract|embed|resolve|done (pipeline progress)
+  layers       TEXT NOT NULL,           -- comma-separated layers that are present
+  done         INTEGER NOT NULL         -- 1 when every layer is present and current
 );
-CREATE INDEX entries_next_step ON entries(next_step);
-CREATE INDEX entries_created ON entries(created_at);
+CREATE INDEX notes_created ON notes(created_at);
+CREATE INDEX notes_done ON notes(done);
 
-CREATE TABLE fragments (
-  id            TEXT PRIMARY KEY,
-  entry_id      TEXT NOT NULL,
-  kind          TEXT NOT NULL,
-  text          TEXT NOT NULL,
-  status        TEXT NOT NULL,          -- confirmed|speculative|overcome_by_events
-  status_origin TEXT NOT NULL,          -- llm|user
-  someday       INTEGER NOT NULL DEFAULT 0,
-  state         TEXT,                   -- open|closed (questions and action items)
-  state_origin  TEXT NOT NULL DEFAULT 'llm',  -- llm|user: whether you set the state yourself
-  closed_note   TEXT,
-  obe_date      TEXT,
-  obe_reason    TEXT,
-  span_start    INTEGER,
-  span_end      INTEGER,
-  quote         TEXT,
-  created_at    TEXT NOT NULL           -- the entry's timestamp
+CREATE TABLE statements (
+  id         TEXT PRIMARY KEY,
+  note_id    TEXT NOT NULL,
+  seq        INTEGER NOT NULL,
+  text       TEXT NOT NULL,
+  quote      TEXT NOT NULL,
+  kind       TEXT NOT NULL,             -- fact|decision|question|action|idea|correction
+  thread_id  TEXT,                      -- as filed by layer 5; moves and merges are applied when read
+  created_at TEXT NOT NULL              -- the note's timestamp
 );
-CREATE INDEX fragments_entry ON fragments(entry_id);
-CREATE INDEX fragments_kind_status ON fragments(kind, status);
+CREATE INDEX statements_note ON statements(note_id);
+CREATE INDEX statements_thread ON statements(thread_id);
 
-CREATE TABLE threads (
-  id              TEXT PRIMARY KEY,
-  name            TEXT NOT NULL,
-  description     TEXT,
-  state           TEXT NOT NULL,
-  pinned          INTEGER NOT NULL,
-  merged_into     TEXT,
-  summary         TEXT,
-  summary_through TEXT,                 -- last entry the summary covers
-  now_line        TEXT,                 -- one line on where it stands (generated/dreams/now)
-  now_through     TEXT,                 -- last entry the now line covers
-  last_activity   TEXT,                 -- max(created_at) of linked fragments
-  last_entry      TEXT                  -- entry of the newest linked fragment
+CREATE TABLE entities (
+  id          TEXT PRIMARY KEY,
+  type        TEXT NOT NULL,            -- person|org|topic|thread
+  name        TEXT NOT NULL,
+  status      TEXT NOT NULL,            -- provisional|active|closed
+  merged_into TEXT,
+  created_at  TEXT NOT NULL,
+  data        TEXT NOT NULL             -- the whole record, JSON
 );
+CREATE INDEX entities_type ON entities(type);
 
-CREATE TABLE aliases (
-  alias   TEXT NOT NULL,                -- casefolded, whitespace-normalized
-  node_id TEXT NOT NULL,
-  owner   TEXT NOT NULL,
-  PRIMARY KEY (alias, node_id)
+CREATE TABLE names (
+  name      TEXT NOT NULL,              -- casefolded, whitespace-normalized
+  entity_id TEXT NOT NULL,
+  owner     TEXT NOT NULL,
+  PRIMARY KEY (name, entity_id)
 );
-CREATE INDEX aliases_owner ON aliases(owner);
+CREATE INDEX names_owner ON names(owner);
 
-CREATE TABLE edges (
-  id          INTEGER PRIMARY KEY,
-  src         TEXT NOT NULL,
-  dst         TEXT NOT NULL,
-  type        TEXT NOT NULL,            -- contains|mentions|about|in_thread|member_of|part_of|merged_into|answers
-  weight      REAL NOT NULL DEFAULT 1.0,
-  origin      TEXT NOT NULL,            -- llm|user
-  confirmed   INTEGER NOT NULL,         -- 1 if you created or confirmed it
-  entry_id    TEXT,                     -- provenance
-  fragment_id TEXT,
-  valid_from  TEXT,
-  valid_to    TEXT,
-  owner       TEXT NOT NULL
+CREATE TABLE mentions (                 -- a statement (or a whole note, statement_id '') names an entity
+  note_id      TEXT NOT NULL,
+  statement_id TEXT NOT NULL,
+  entity_id    TEXT NOT NULL,
+  created_at   TEXT NOT NULL,
+  owner        TEXT NOT NULL,
+  PRIMARY KEY (statement_id, entity_id, note_id)
 );
-CREATE UNIQUE INDEX edges_uniq ON edges(src, dst, type, IFNULL(fragment_id, ''), IFNULL(valid_from, ''));
-CREATE INDEX edges_src ON edges(src, type);
-CREATE INDEX edges_dst ON edges(dst, type);
-CREATE INDEX edges_owner ON edges(owner);
+CREATE INDEX mentions_entity ON mentions(entity_id);
+CREATE INDEX mentions_owner ON mentions(owner);
 
-CREATE TABLE review_items (
-  id         TEXT PRIMARY KEY,          -- stable hash of (kind, owner, subject)
-  kind       TEXT NOT NULL,             -- new_person|new_org|ambiguous_mention|proposed_theme|proposed_thread|proposed_answer|dream_obe|orphaned_decision
-  entry_id   TEXT,
-  created_at TEXT NOT NULL,
-  payload    TEXT NOT NULL,             -- JSON
+CREATE TABLE relations (
+  src    TEXT NOT NULL,                 -- the later statement
+  dst    TEXT NOT NULL,                 -- the earlier one
+  rel    TEXT NOT NULL,                 -- answers|supersedes|repeats
+  origin TEXT NOT NULL,                 -- note|dream
+  owner  TEXT NOT NULL,
+  PRIMARY KEY (src, dst, rel)
+);
+CREATE INDEX relations_dst ON relations(dst);
+CREATE INDEX relations_owner ON relations(owner);
+
+CREATE TABLE operations (               -- instructions that came from correction notes
+  id           INTEGER PRIMARY KEY,
+  note_id      TEXT NOT NULL,
+  statement_id TEXT NOT NULL,
+  op           TEXT NOT NULL,
+  targets      TEXT NOT NULL,           -- JSON list
+  name         TEXT,
+  moved        TEXT NOT NULL,           -- JSON list of statements moved to targets[0]
+  created_at   TEXT NOT NULL,
+  owner        TEXT NOT NULL
+);
+CREATE INDEX operations_owner ON operations(owner);
+
+CREATE TABLE events (                   -- the change log
+  id        INTEGER PRIMARY KEY,
+  at        TEXT NOT NULL,
+  source    TEXT NOT NULL,              -- note id or 'dream:<run>'
+  seq       INTEGER NOT NULL,
+  kind      TEXT NOT NULL,
+  text      TEXT NOT NULL,
+  entity_id TEXT,
+  owner     TEXT NOT NULL
+);
+CREATE INDEX events_at ON events(at);
+CREATE INDEX events_owner ON events(owner);
+
+CREATE TABLE pages (
+  entity_id  TEXT PRIMARY KEY,
+  updated_at TEXT NOT NULL,
+  now        TEXT,
+  summary    TEXT,
+  data       TEXT NOT NULL,             -- the whole page file, JSON
   owner      TEXT NOT NULL
 );
-CREATE INDEX review_owner ON review_items(owner);
-
-CREATE TABLE suggestions (              -- dream verdicts on items in the OBE sweep
-  fragment_id     TEXT PRIMARY KEY,
-  verdict         TEXT NOT NULL,        -- still_open|probably_resolved|unclear
-  evidence        TEXT,                 -- later fragment the verdict rests on
-  reason          TEXT NOT NULL,
-  citations       TEXT NOT NULL,        -- JSON list of entry ids
-  checked_through TEXT,                 -- newest entry the verdict took into account
-  owner           TEXT NOT NULL
-);
-CREATE INDEX suggestions_owner ON suggestions(owner);
 
 CREATE TABLE embeddings (               -- rowid is shared with vec_items
   rowid        INTEGER PRIMARY KEY,
-  owner_id     TEXT NOT NULL UNIQUE,    -- entry or fragment id
+  owner_id     TEXT NOT NULL UNIQUE,    -- note or statement id
   model        TEXT NOT NULL,
   content_hash TEXT NOT NULL,
   owner        TEXT NOT NULL

@@ -477,3 +477,45 @@ table.list td {
 .thread-actions {
   margin: 4px 0 12px;
 }
+
+.notebox {
+  margin-bottom: 20px;
+}
+
+.notebox textarea {
+  width: 100%;
+  font: inherit;
+}
+
+ul.statements,
+ul.log {
+  list-style: none;
+  padding: 0;
+}
+
+.statement,
+ul.log li {
+  border-left: 3px solid var(--border);
+  padding: 3px 10px;
+  margin: 6px 0;
+}
+
+.statement.superseded .text,
+.statement.retracted .text {
+  color: var(--obe);
+  text-decoration: line-through;
+}
+
+.statement.answered .text,
+.statement.repeat .text {
+  color: var(--muted);
+}
+
+.badge.action {
+  color: var(--open);
+  border-color: var(--open);
+}
+
+.related .chip {
+  margin-right: 6px;
+}

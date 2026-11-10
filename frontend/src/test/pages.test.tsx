@@ -3,7 +3,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { mockFetch } from "./fetch";
-import { status, thread } from "./fixtures";
+import { page, status, thread } from "./fixtures";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -15,49 +15,92 @@ function renderAt(path: string) {
   );
 }
 
+const home = {
+  "GET /api/status": status,
+  "GET /api/active": [thread],
+  "GET /api/log": [
+    { at: "2026-11-05T10:00:00+00:00", source: "n-20261105T100000Z", kind: "supersedes", text: "Replaced: December by January", entity_id: null },
+  ],
+  "GET /api/dream": { last: null, planned: { duplicates: [["a", "b"]], stale: [] }, max_calls: 50 },
+  "GET /api/context": { text: "# brain: the user's work journal" },
+};
+
 describe("App", () => {
-  it("lists active threads and the review count", async () => {
-    mockFetch({ "GET /api/status": status, "GET /api/active": [thread] });
+  it("shows the note box, active threads with where they stand, and recent changes", async () => {
+    mockFetch(home);
     renderAt("/");
     expect(await screen.findByText("GPU quota migration")).toBeTruthy();
-    expect(screen.getByText("Priya Raman")).toBeTruthy();
-    expect(screen.getByText("1").className).toBe("count");
+    expect(screen.getByText(/Moving in January; the quota ticket/)).toBeTruthy();
+    expect(await screen.findByText(/Replaced: December by January/)).toBeTruthy();
+    expect(screen.getByLabelText("note")).toBeTruthy();
+    expect(await screen.findByText(/1 thing\(s\) to look at/)).toBeTruthy();
   });
 
-  it("settles a new person from the review page", async () => {
-    const item = {
-      id: "r1",
-      kind: "new_person",
-      entry_id: "e-1",
-      payload: { type: "person", surface: "Priya", proposed: { name: "Priya" }, candidates: [] },
-      entry_date: "2026-10-30",
-      entry_label: "Quota kickoff",
-      context: ["Kicked off the migration with Priya."],
-      others: 2,
-    };
-    const calls = mockFetch({ "GET /api/status": status, "GET /api/review": [item], "POST /api/review/r1": { id: "r1" } });
-    renderAt("/review");
-    expect(await screen.findByText("Kicked off the migration with Priya.")).toBeTruthy();
-    expect(screen.getByText(/also apply to 2 other entries/)).toBeTruthy();
-    fireEvent.change(screen.getByLabelText("name"), { target: { value: "Priya Raman" } });
-    fireEvent.click(screen.getByText("Create person"));
+  it("saves a note as the only write", async () => {
+    const calls = mockFetch({ ...home, "POST /api/notes": { id: "n-1" } });
+    renderAt("/");
+    fireEvent.change(screen.getByLabelText("note"), { target: { value: "Met Priya about the quota." } });
+    fireEvent.click(screen.getByText("Save note"));
     await waitFor(() => expect(calls.some((c) => c.method === "POST")).toBe(true));
     const post = calls.find((c) => c.method === "POST")!;
-    expect(post.body).toEqual({ apply_to_all: true, action: "create", name: "Priya Raman" });
+    expect(post.url).toBe("/api/notes");
+    expect(post.body).toEqual({ text: "Met Priya about the quota.", about: null });
+    expect(post.contentType).toBe("application/json");
+    expect(await screen.findByText(/See what brain made of it/)).toBeTruthy();
+  });
+
+  it("shows a wiki page with superseded statements struck through", async () => {
+    mockFetch({ "GET /api/status": status, "GET /api/pages/gpu-quota-migration": page });
+    renderAt("/p/gpu-quota-migration");
+    expect(await screen.findByText("Moving in January.")).toBeTruthy();
+    expect(screen.getByText(/also called quota work/)).toBeTruthy();
+    expect(screen.getByText("Priya Raman")).toBeTruthy();
+    const lines = screen.getAllByTestId("statement");
+    expect(lines.some((l) => l.className.includes("superseded") && l.textContent?.includes("January instead"))).toBe(true);
+  });
+
+  it("turns 'This is wrong' into a note about that page", async () => {
+    const calls = mockFetch({
+      "GET /api/status": status,
+      "GET /api/pages/gpu-quota-migration": page,
+      "POST /api/notes": { id: "n-2" },
+    });
+    renderAt("/p/gpu-quota-migration");
+    fireEvent.click(await screen.findByText("This is wrong"));
+    fireEvent.change(screen.getByLabelText("note"), { target: { value: "This is finished." } });
+    fireEvent.click(screen.getByText("Save correction"));
+    await waitFor(() => expect(calls.some((c) => c.method === "POST")).toBe(true));
+    expect(calls.find((c) => c.method === "POST")!.body).toEqual({
+      text: "This is finished.",
+      about: "gpu-quota-migration",
+    });
+    // No other kind of write exists in the UI.
+    expect(calls.filter((c) => c.method !== "GET").map((c) => c.url)).toEqual(["/api/notes"]);
   });
 
   it("asks a question and shows numbered sources", async () => {
     const answer = {
       question: "when?",
-      claims: [{ text: "The cluster moves in December.", citations: ["e-1"] }],
+      claims: [{ text: "The cluster moves in January.", citations: ["n-1"] }],
       insufficient: false,
-      sources: [{ entry_id: "e-1", date: "2026-10-30", label: "Quota kickoff" }],
+      sources: [{ note_id: "n-1", date: "2026-11-05", label: "Quota update" }],
     };
     mockFetch({ "GET /api/status": status, "POST /api/ask": answer });
     renderAt("/search");
     fireEvent.change(screen.getByPlaceholderText(/question to answer/), { target: { value: "when does it move?" } });
     fireEvent.click(screen.getByText("Ask"));
-    expect(await screen.findByText(/The cluster moves in December/)).toBeTruthy();
-    expect(screen.getByText("2026-10-30 · Quota kickoff")).toBeTruthy();
+    expect(await screen.findByText(/The cluster moves in January/)).toBeTruthy();
+    expect(screen.getByText("2026-11-05 · Quota update")).toBeTruthy();
+  });
+
+  it("lists wiki pages by type", async () => {
+    mockFetch({
+      "GET /api/status": status,
+      "GET /api/pages": [thread, { ...thread, id: "priya-raman", type: "person", name: "Priya Raman", now: null }],
+    });
+    renderAt("/wiki");
+    expect(await screen.findByText("Threads")).toBeTruthy();
+    expect(screen.getByText("People")).toBeTruthy();
+    expect(screen.getByText("Priya Raman")).toBeTruthy();
   });
 });

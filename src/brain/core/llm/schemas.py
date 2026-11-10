@@ -1,7 +1,8 @@
-"""Typed outputs requested from the models.
+"""What each prompt returns.
 
-These are what the model fills in. The pipeline turns them into the sidecar
-formats in formats/sidecars.py, adding ids, spans, and version stamps.
+Every layer's output is a choice from a list or a short structure, so a small
+model can produce it and code can check it. Field descriptions are sent to the
+model as part of the schema.
 """
 
 from __future__ import annotations
@@ -10,97 +11,92 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-
-class XMention(BaseModel):
-    name: str = Field(description="name as written in the entry")
-    type: Literal["person", "org"]
+from brain.core.formats.records import Kind, NameType
 
 
-class XTheme(BaseModel):
-    name: str
-    kind: Literal["domain", "technique"]
+class SplitItem(BaseModel):
+    text: str = Field(description="one statement that can be read on its own, with names written out")
+    quote: str = Field(description="the exact words of the note this statement comes from")
 
 
-class XThread(BaseModel):
-    thread_id: str | None = Field(None, description="id of an existing thread from the list")
-    new_name: str | None = Field(None, description="name for a new thread, only if no existing thread fits")
-    new_description: str | None = None
-    weight: float = Field(0.8, ge=0, le=1)
+class SplitOut(BaseModel):
+    statements: list[SplitItem] = Field(default_factory=list)
 
 
-class XFragment(BaseModel):
-    kind: Literal["observation", "decision", "question", "idea", "claim", "action_item"]
-    text: str
-    quote: str = Field(description="exact substring of the entry")
-    status: Literal["confirmed", "speculative"] = "confirmed"
-    someday: bool = False
-    mentions: list[XMention] = Field(default_factory=list)
-    themes: list[XTheme] = Field(default_factory=list)
-    threads: list[XThread] = Field(default_factory=list)
+class KindOut(BaseModel):
+    kind: Kind
 
 
-class ExtractOutput(BaseModel):
-    fragments: list[XFragment]
+class SpottedName(BaseModel):
+    name: str = Field(description="the name exactly as written in the note")
+    type: NameType
 
 
-class MentionChoice(BaseModel):
-    key: str
-    choice: str = Field(description='a candidate entity id, "new", or "unsure"')
-    confidence: float = Field(ge=0, le=1)
-    reason: str = ""
+class NamesOut(BaseModel):
+    names: list[SpottedName] = Field(default_factory=list)
 
 
-class ResolveOutput(BaseModel):
-    choices: list[MentionChoice]
+class ChoiceOut(BaseModel):
+    choice: str = Field(description='the id of one candidate, or "new"')
 
 
-class AnswerLink(BaseModel):
-    fragment: str = Field(description="id of the new fragment")
-    answers: str = Field(description="id of the earlier open item it answers or closes")
-    confidence: float = Field(ge=0, le=1)
+class FileOut(BaseModel):
+    choice: str = Field(description='the id of one candidate thread, "new", or "none"')
+    new_name: str | None = Field(default=None, description='only when choice is "new": a short name for the new thread')
 
 
-class AnswersOutput(BaseModel):
-    links: list[AnswerLink] = Field(default_factory=list)
+class RelationOut(BaseModel):
+    relation: Literal["answers", "supersedes", "repeats", "unrelated"]
 
 
-class SummaryOutput(BaseModel):
-    summary_md: str
-    citations: list[str] = Field(default_factory=list)
+class OpOut(BaseModel):
+    op: Literal["same_as", "not_same_as", "rename", "close", "reopen", "retract", "not_part_of", "none"]
 
 
-class SupersedePair(BaseModel):
-    older: str = Field(description="id of the earlier fragment that may no longer hold")
-    newer: str = Field(description="id of the later fragment that replaces or contradicts it")
-    reason: str = Field(description="one sentence: what changed")
-    confidence: float = Field(ge=0, le=1)
+class TargetsOut(BaseModel):
+    targets: list[str] = Field(default_factory=list, description="candidate ids, in the order the rule asks for")
+    new_name: str | None = Field(default=None, description="only for rename: the new name")
 
 
-class SupersedeOutput(BaseModel):
-    pairs: list[SupersedePair] = Field(default_factory=list)
+class Cited(BaseModel):
+    text: str = Field(description="one sentence")
+    citations: list[str] = Field(description="note ids that support the sentence")
 
 
-class SweepCheck(BaseModel):
-    item: str = Field(description="id of the open or speculative item")
-    verdict: Literal["still_open", "probably_resolved", "unclear"]
-    evidence: str | None = Field(None, description="id of the later fragment the verdict rests on, if any")
-    reason: str = Field(description="one sentence")
-    confidence: float = Field(0.7, ge=0, le=1)
-    citations: list[str] = Field(default_factory=list, description="entry ids the verdict rests on")
+class NowOut(BaseModel):
+    text: str = Field(description="one or two sentences, at most 40 words")
+    citations: list[str] = Field(default_factory=list, description="note ids the text rests on")
 
 
-class SweepOutput(BaseModel):
-    checks: list[SweepCheck] = Field(default_factory=list)
+class SummaryOut(BaseModel):
+    sentences: list[Cited] = Field(default_factory=list)
 
 
-class NowOutput(BaseModel):
-    line: str = Field(description="one sentence, at most 25 words")
-    citations: list[str] = Field(default_factory=list, description="entry ids the line rests on")
+class CheckOut(BaseModel):
+    supported: bool
+
+
+class SameOut(BaseModel):
+    same: bool
+
+
+class StaleOut(BaseModel):
+    verdict: Literal["answered", "overtaken", "open"]
+    by: str | None = Field(default=None, description="id of the later statement that answers or overtakes it")
+
+
+class ProfileOut(BaseModel):
+    role: str | None = Field(
+        default=None, description="the person's role or job, in a few words, if the statements say"
+    )
+    org: str | None = Field(
+        default=None, description="id of the candidate organization the person belongs to, if stated"
+    )
 
 
 class Claim(BaseModel):
     text: str
-    citations: list[str] = Field(description="entry ids that support the claim")
+    citations: list[str] = Field(description="note ids that support the claim")
 
 
 class AskOutput(BaseModel):
@@ -113,8 +109,7 @@ class BriefOutput(BaseModel):
     recent_decisions: list[Claim] = Field(default_factory=list)
     open_items: list[Claim] = Field(default_factory=list)
     people: list[Claim] = Field(default_factory=list)
-    speculative: list[Claim] = Field(default_factory=list)
-    overcome_by_events: list[Claim] = Field(default_factory=list)
+    no_longer_applies: list[Claim] = Field(default_factory=list)
     changed_since: list[Claim] = Field(default_factory=list)
 
     def all_claims(self) -> list[Claim]:

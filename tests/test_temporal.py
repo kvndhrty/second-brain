@@ -1,117 +1,53 @@
-"""Temporal context: every note given to a model carries its date and age."""
+"""Every note given to a model carries its date and its age relative to today."""
 
 from __future__ import annotations
 
-import os
 import re
-import time
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
+from importlib import resources
 
-import pytest
+from brain.core import temporal
+from brain.core.llm.prompts import load_prompt
+from tests.conftest import set_now, write
 
-from brain.core.formats.entity import Person
-from brain.core.temporal import age, as_of, iso_day, local_date, today_el
-from tests.conftest import FAKE_LLM_SETTINGS, make_brain
-
-# Elements that hold a note. Each must say when it was written (date) or what
-# it covers (as_of), and how old that is; entities say when they were last mentioned.
-DATED = ("fragment", "excerpt", "item", "entry", "context", "later")
-AS_OF = ("thread_summary", "previous_summary")
-ENTITIES = ("candidate", "person")
+DATED = re.compile(r'date="\d{4}-\d{2}-\d{2}" age="\d+(d|w|mo)"')
+# Prompts whose input is a single note or sentence with nothing to compare by date.
+UNDATED = {"split", "names", "check", "correction_op", "correction_targets", "probe"}
 
 
-@pytest.fixture
-def los_angeles():
-    old = os.environ.get("TZ")
-    os.environ["TZ"] = "America/Los_Angeles"
-    time.tzset()
-    yield
-    if old is None:
-        os.environ.pop("TZ")
-    else:
-        os.environ["TZ"] = old
-    time.tzset()
-
-
-def test_ages_are_days_then_weeks_then_months():
+def test_age_is_days_then_weeks_then_months():
     today = date(2026, 11, 8)
-    assert age(date(2026, 11, 8), today) == "0d"
-    assert age(date(2026, 10, 30), today) == "9d"
-    assert age(date(2026, 10, 18), today) == "3w"
-    assert age(date(2026, 6, 1), today) == "5mo"
-    assert age(date(2026, 11, 9), today) == "0d"  # clock skew never gives a negative age
+    assert temporal.age("2026-11-08", today) == "0d"
+    assert temporal.age("2026-10-30", today) == "9d"
+    assert temporal.age("2026-10-20", today) == "2w"
+    assert temporal.age("2026-06-01", today) == "5mo"
+    assert temporal.today_el(datetime(2026, 11, 8, 12, tzinfo=UTC)).startswith('<today date="2026-11-0')
 
 
-def test_dates_are_local_calendar_dates(los_angeles):
-    evening = "2026-11-07T04:30:00+00:00"  # 8:30 pm on the 6th in Los Angeles
-    assert iso_day(evening) == "2026-11-06"
-    assert local_date(datetime(2026, 11, 7, 4, 30, tzinfo=UTC)) == date(2026, 11, 6)
-    assert iso_day("2026-11-07") == "2026-11-07"  # a calendar date stays as it is
-    assert today_el(datetime(2026, 11, 8, 18, 0, tzinfo=UTC)) == '<today date="2026-11-08" weekday="Sunday"/>'
-    assert as_of(None, date(2026, 11, 8)) == 'as_of="unknown"'
+def test_prompts_that_compare_notes_explain_dates():
+    names = [p.name[:-3] for p in resources.files("brain.prompts").iterdir() if p.name.endswith(".md")]
+    for name in names:
+        text = load_prompt(name).instructions
+        assert ("the input starts with <today>" in text) == (name not in UNDATED), name
 
 
-def _check(prompt: str, user: str) -> list[str]:
-    problems = []
-    if not user.startswith("<today "):
-        problems.append(f"{prompt}: input does not start with <today>")
-    for tag, attrs in re.findall(r"<(\w+)((?:\s+\w+=\"[^\"]*\")*)\s*/?>", user):
-        if tag in DATED and not ("date=" in attrs and "age=" in attrs):
-            problems.append(f"{prompt}: <{tag}{attrs}> has no date and age")
-        if tag in AS_OF and "as_of=" not in attrs:
-            problems.append(f"{prompt}: <{tag}{attrs}> has no as_of")
-        if tag in ENTITIES and "last_mentioned=" not in attrs:
-            problems.append(f"{prompt}: <{tag}{attrs}> has no last_mentioned")
-    for line in re.findall(r"^- id: .*$", user, re.M):
-        if "last activity:" not in line:
-            problems.append(f"{prompt}: thread line has no last activity: {line}")
-        if "summary" in line and "summary (as of" not in line:
-            problems.append(f"{prompt}: thread summary has no as-of date: {line}")
-    return problems
-
-
-def test_every_model_input_carries_dates(local_storage, state, tmp_path):
-    b = make_brain(local_storage, state, tmp_path, fake_llm=True, llm=FAKE_LLM_SETTINGS)
-    try:
-        b.settings.dream.rebuild_after_updates = 2
-        b.vault.put_entity(Person(id="mike-chen", name="Mike Chen"))
-        b.vault.put_entity(Person(id="mike-ross", name="Mike Ross"))
-        start = datetime.now(UTC) - timedelta(days=60)
-        for i, text in enumerate(
-            (
-                "Met Jane Doe about the [[GPU quota migration]]. Who owns the [[GPU quota migration]] runbook?",
-                "We decided the [[GPU quota migration]] cutover is in March.",
-                "Confirmed the vendor does support MIG on the new nodes. [[GPU quota migration]]",
-                "The [[GPU quota migration]] cutover moved to May instead of March.",
-                "Paired with Mike on the [[GPU quota migration]] rollout plan.",
-            )
-        ):
-            b.vault.clock = lambda i=i: start + timedelta(days=12 * i)
-            entry = b.jot(text).entry
-            assert not b.process(entry.id).failed
-        b.brief("gpu-quota-migration")
-        b.brief("Jane Doe")
-        b.brief("what is new with the GPU quota migration and Jane Doe?")
-        b.ask("does the vendor support MIG?")
-        b.dream()
-        called = {name for name, _ in b.llm.calls}
-        expected = {"extract", "resolve", "answers", "thread_summary", "brief", "brief_route", "ask"}
-        expected |= {"dream_supersede", "dream_answers", "dream_now", "dream_sweep"}
-        assert expected <= called, expected - called
-        problems = [p for name, user in b.llm.calls for p in _check(name, user)]
-        assert not problems, "\n".join(problems)
-    finally:
-        b.close()
-
-
-def test_ask_orders_excerpts_oldest_first(local_storage, state, tmp_path):
-    b = make_brain(local_storage, state, tmp_path, fake_llm=True, llm=FAKE_LLM_SETTINGS)
-    try:
-        for text in ("The vendor said MIG ships in March.", "The vendor now says MIG ships in May."):
-            assert not b.process(b.jot(text).entry.id).failed
-        b.ask("when does MIG ship?")
-        (user,) = [u for name, u in b.llm.calls if name == "ask"]
-        dates = re.findall(r'<excerpt entry="(e-[^"]+)"', user)
-        assert dates == sorted(dates)
-    finally:
-        b.close()
+def test_model_inputs_start_with_today_and_date_every_statement(brain):
+    write(brain, "Met Jane Doe about the [[GPU quota migration]]. We decided to migrate in December. Does MIG work?")
+    write(brain, "Then Jane says MIG does work for the [[GPU quota migration]].", 3)
+    write(brain, "We decided to migrate the [[GPU quota migration]] in January instead.", 5)
+    set_now(brain, 20)
+    brain.ask("When do we migrate?")
+    brain.brief("GPU quota migration")
+    brain.dream()
+    seen = set()
+    for name, user in brain.llm.calls:
+        seen.add(name)
+        if name in UNDATED:
+            continue
+        assert user.startswith("<today date="), name
+        for tag in re.findall(r"<(?:statement|earlier|later|item|candidate) [^>]*note=[^>]*>", user):
+            assert DATED.search(tag), (name, tag)
+    assert {"classify", "link", "file", "relate", "now", "summary", "ask", "brief"} <= seen
+    # Ages are counted from today, not from when the note was processed.
+    ask_input = next(user for name, user in reversed(brain.llm.calls) if name == "ask")
+    assert '<today date="2026-10-21"' in ask_input and 'date="2026-10-01" age="2w"' in ask_input

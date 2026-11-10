@@ -4,7 +4,7 @@ The store's `_system/generation.json` changes on every write made through
 brain. If its token matches the one recorded in the index, listing the store
 is skipped. Otherwise the store is listed, compared with the `objects`
 manifest by ETag, and only the affected units are rebuilt. A full listing
-also runs at least once a day, to pick up files edited outside brain.
+also runs at least once a day, to pick up files written outside brain.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from brain.core import keys
-from brain.core.formats.sidecars import Generation
+from brain.core.formats.records import Generation
 from brain.core.formats.yamlio import FormatError
 from brain.core.index.build import UnitBuilder, UnitFile, UnitFiles, unit_of
 from brain.core.index.db import IndexDB, get_meta, set_meta
@@ -42,7 +42,7 @@ def read_generation(storage: Storage) -> Generation | None:
 
 
 def _indexed(key: str) -> bool:
-    return not (key.startswith(keys.SYSTEM) or key.startswith(keys.STATE))
+    return keys.classify(key) is not None
 
 
 class Syncer:
@@ -91,7 +91,6 @@ class Syncer:
                     affected.add(unit)
             for unit in sorted(affected):
                 self._rebuild(unit, cache)
-            self.builder.refresh_thread_activity()
             if gen:
                 set_meta(self.conn, "generation", gen.token)
             set_meta(self.conn, "last_full_sync", self.clock().isoformat())
@@ -145,10 +144,7 @@ class Syncer:
                 except NotFound:
                     continue
             files.by_role.setdefault(kinfo.role, []).append(UnitFile(key, cache[key]))
-        if unit.startswith("entry:"):
-            self.builder.build_entry(files)
-        else:
-            self.builder.build_entity(files)
+        self.builder.build(files)
 
     def apply_write(
         self, key: str, info: ObjectInfo, data: bytes | None, *, prev_token: str | None, new_token: str
@@ -175,7 +171,6 @@ class Syncer:
                     affected.add(unit)
             for unit in sorted(affected):
                 self._rebuild(unit, cache)
-            self.builder.refresh_thread_activity()
             if prev_token is not None and get_meta(self.conn, "generation") == prev_token:
                 set_meta(self.conn, "generation", new_token)
             self.conn.execute("COMMIT")

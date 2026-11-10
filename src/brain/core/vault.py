@@ -9,15 +9,13 @@ from __future__ import annotations
 
 import socket
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TypeVar
 
 from brain.core import keys
-from brain.core.formats.decisions import Decisions
-from brain.core.formats.entity import ENTITY_MODELS, Entity, parse_entity
-from brain.core.formats.entry import Entry
-from brain.core.formats.sidecars import Generation, Sidecar, StoreFormat
+from brain.core.formats.note import Note
+from brain.core.formats.records import EntityRecord, Generation, Record, StoreFormat
 from brain.core.formats.yamlio import FORMAT_VERSION, FormatError, check_format
 from brain.core.index.sync import read_generation
 from brain.core.localstate import LocalState
@@ -28,7 +26,7 @@ from brain.core.storage.lease import Lease
 WriteHook = Callable[[str, ObjectInfo, bytes | None, str | None, str], None]
 
 
-S = TypeVar("S", bound=Sidecar)
+R = TypeVar("R", bound=Record)
 
 
 class Vault:
@@ -114,114 +112,132 @@ class Vault:
         if self.on_write:
             self.on_write(key, ObjectInfo(key, "", 0, datetime.now(UTC)), None, prev, new)
 
-    # --- entries -------------------------------------------------------------
+    # --- notes ---------------------------------------------------------------
 
-    def _entry_candidates(self, created: datetime, stem: str) -> list[str]:
-        return [o.key for o in self.storage.list(keys.entry_dir(created)) if o.key.rsplit("/", 1)[-1].startswith(stem)]
+    def _note_candidates(self, created: datetime, stem: str) -> list[str]:
+        return [o.key for o in self.storage.list(keys.note_dir(created)) if o.key.rsplit("/", 1)[-1].startswith(stem)]
 
-    def save_entry(self, body: str, *, title: str | None = None, tags: list[str] | None = None) -> tuple[Entry, str]:
+    def save_note(
+        self, body: str, *, title: str | None = None, about: str | None = None, created: datetime | None = None
+    ) -> tuple[Note, str]:
         if not body.strip():
-            raise ValueError("entry is empty")
-        now = self.clock().replace(microsecond=0)
+            raise ValueError("note is empty")
+        now = (created or self.clock()).replace(microsecond=0)
         # Ids are per second. Choosing the id and writing the file happen under
         # one lock, so two processes on this machine cannot pick the same id.
         with self.state.write_lock():
             taken = set()
-            for k in self._entry_candidates(now, keys.basic_timestamp(now)):
+            for k in self._note_candidates(now, keys.basic_timestamp(now)):
                 try:
-                    taken.add(Entry.parse(self.storage.get(k).decode(), where=k).id)
-                except (FormatError, NotFound):
+                    taken.add(Note.parse(self.storage.get(k).decode(), where=k).id)
+                except (FormatError, NotFound, UnicodeDecodeError):
                     continue
             suffix = 0
-            while (entry_id := keys.entry_id_for(now, suffix)) in taken:
+            while (note_id := keys.note_id_for(now, suffix)) in taken:
                 suffix = 2 if suffix == 0 else suffix + 1
-            entry = Entry(id=entry_id, created=now, updated=now, title=title or None, tags=tags or [], body=body)
-            key = keys.entry_key(now, entry_id, keys.slugify(title or body))
-            data = entry.to_text().encode()
+            note = Note(id=note_id, created=now, title=title or None, about=about or None, body=body)
+            key = keys.note_key(now, note_id, keys.slugify(title or body))
+            data = note.to_text().encode()
             info, prev, new = self._write_locked(key, data, if_absent=True)
         if self.on_write:
             self.on_write(key, info, data, prev, new)
-        return entry, key
+        return note, key
 
-    def find_entry_key(self, entry_id: str) -> str | None:
-        stem = entry_id.removeprefix("e-")
+    def adopt_bare_notes(self) -> list[Note]:
+        """Turn markdown files saved into notes/ by hand into notes.
+
+        A file without frontmatter gets an id and a creation time (its
+        modification time); its text is kept exactly. The bare file is removed
+        once the note is written.
+        """
+        adopted = []
+        for o in list(self.storage.list(keys.NOTES)):
+            if not keys.is_bare_note(o.key):
+                continue  # judged by its path, so brain's own notes are not read again on every pass
+            try:
+                text = self.storage.get(o.key).decode()
+            except (NotFound, UnicodeDecodeError):
+                continue
+            if not text.strip():
+                continue
+            if text.startswith("---\n"):
+                try:
+                    Note.parse(text, where=o.key)
+                    continue  # a complete note at a path of the user's choosing; indexed where it is
+                except FormatError:
+                    pass  # frontmatter from another tool: adopt it, text unchanged
+            stem = o.key.rsplit("/", 1)[-1][:-3]
+            title = stem.replace("-", " ").replace("_", " ").strip() or None
+            note, _ = self.save_note(text, title=title, created=o.mtime)
+            self.delete(o.key)
+            adopted.append(note)
+        return adopted
+
+    def find_note_key(self, note_id: str) -> str | None:
+        stem = note_id.removeprefix("n-")
         try:
             ts = datetime.strptime(stem[:16], "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
         except ValueError:
             ts = None
-        candidates = self._entry_candidates(ts, stem) if ts else [o.key for o in self.storage.list(keys.ENTRIES)]
+        candidates = self._note_candidates(ts, stem) if ts else [o.key for o in self.storage.list(keys.NOTES)]
         for key in candidates:
             try:
-                if Entry.parse(self.storage.get(key).decode(), where=key).id == entry_id:
+                if Note.parse(self.storage.get(key).decode(), where=key).id == note_id:
                     return key
             except (FormatError, NotFound):
                 continue
         return None
 
-    def get_entry(self, entry_id: str, key: str | None = None) -> tuple[Entry, str]:
-        key = key or self.find_entry_key(entry_id)
+    def get_note(self, note_id: str, key: str | None = None) -> tuple[Note, str]:
+        key = key or self.find_note_key(note_id)
         if key is None:
-            raise NotFound(f"entry {entry_id}")
-        return Entry.parse(self.storage.get(key).decode(), where=key), key
-
-    def update_entry(self, entry: Entry, key: str) -> Entry:
-        entry.updated = self.clock().replace(microsecond=0)
-        self.write(key, entry.to_text().encode())
-        return entry
-
-    def iter_entries(self) -> Iterator[tuple[Entry, str]]:
-        for o in self.storage.list(keys.ENTRIES):
-            if o.key.endswith(".md"):
-                yield Entry.parse(self.storage.get(o.key).decode(), where=o.key), o.key
+            raise NotFound(f"note {note_id}")
+        return Note.parse(self.storage.get(key).decode(), where=key), key
 
     # --- entities ------------------------------------------------------------
 
-    def get_entity(self, entity_type: keys.EntityType, entity_id: str) -> Entity:
-        key = keys.entity_key(entity_type, entity_id)
-        return parse_entity(self.storage.get(key).decode(), where=key, default_type=entity_type)
+    def get_entity(self, entity_id: str) -> EntityRecord:
+        key = keys.entity_key(entity_id)
+        return EntityRecord.parse(self.storage.get(key), where=key)
 
-    def allocate_entity_id(self, entity_type: keys.EntityType, name: str) -> str:
-        base = keys.slugify(name, max_words=8, max_len=60, default=entity_type)
-        candidate, n = base, 2
-        while self.storage.exists(keys.entity_key(entity_type, candidate)):
-            candidate, n = f"{base}-{n}", n + 1
-        return candidate
-
-    def create_entity(self, entity_type: keys.EntityType, name: str, build: Callable[[str], Entity]) -> Entity:
+    def create_entity(self, name: str, build: Callable[[str], EntityRecord]) -> EntityRecord:
         """Pick a free id for a new entity and write it, under one lock so no other process takes the same id."""
         with self.state.write_lock():
-            entity = build(self.allocate_entity_id(entity_type, name))
-            key = keys.entity_key(entity_type, entity.id)
-            data = entity.to_text().encode()
+            base = keys.slugify(name, max_words=8, max_len=60, default="entity")
+            entity_id, n = base, 2
+            while self.storage.exists(keys.entity_key(entity_id)):
+                entity_id, n = f"{base}-{n}", n + 1
+            entity = build(entity_id)
+            key = keys.entity_key(entity.id)
+            data = entity.to_bytes()
             info, prev, new = self._write_locked(key, data, if_absent=True)
         if self.on_write:
             self.on_write(key, info, data, prev, new)
         return entity
 
-    def put_entity(self, entity: Entity) -> str:
-        if entity.type not in ENTITY_MODELS:
-            raise ValueError(f"unknown entity type {entity.type}")
-        key = keys.entity_key(entity.type, entity.id)
-        self.write(key, entity.to_text().encode())
-        return key
+    def put_entity(self, entity: EntityRecord) -> None:
+        self.write(keys.entity_key(entity.id), entity.to_bytes())
 
-    # --- decisions and sidecars ----------------------------------------------
+    # --- generated files -----------------------------------------------------
 
-    def get_decisions(self, entry_id: str) -> Decisions:
-        key = keys.decisions_key(entry_id)
-        try:
-            return Decisions.parse(self.storage.get(key).decode(), where=key)
-        except NotFound:
-            return Decisions(entry=entry_id)
-
-    def put_decisions(self, decisions: Decisions) -> None:
-        self.write(keys.decisions_key(decisions.entry), decisions.to_text().encode())
-
-    def put_bytes(self, key: str, data: bytes) -> None:
+    def put_record(self, key: str, record: Record) -> bytes:
+        data = record.to_bytes()
         self.write(key, data)
+        return data
 
-    def read_sidecar(self, key: str, model: type[S]) -> tuple[S, bytes] | None:
-        """The parsed sidecar and its exact bytes, or None if missing or unreadable."""
+    def put_text(self, key: str, text: str) -> bool:
+        """Write a text file unless it already has exactly this content. True if written."""
+        data = text.encode()
+        try:
+            if self.storage.get(key) == data:
+                return False
+        except NotFound:
+            pass
+        self.write(key, data)
+        return True
+
+    def read_record(self, key: str, model: type[R]) -> tuple[R, bytes] | None:
+        """The parsed record and its exact bytes, or None if missing or unreadable."""
         try:
             data = self.storage.get(key)
         except NotFound:

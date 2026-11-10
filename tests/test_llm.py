@@ -17,8 +17,8 @@ from brain.core.llm.schemas import Probe
 
 LLM_CFG = {
     "base_url": "https://gateway.test/v1",
-    "chat_model": "chat-model",
-    "extract_model": "extract-model",
+    "small_model": "small-model",
+    "strong_model": "strong-model",
     "embed_model": "embed-model",
 }
 
@@ -40,9 +40,9 @@ def test_tool_mode_through_openai_client():
     fake = FakeOpenAI()
     out = make(fake, structured_output="tool").run("probe", "go", Probe)
     assert out.output == Probe(ok=True, word="ok")
-    assert out.model == "extract-model" and out.prompt.name == "probe"
+    assert out.model == "small-model" and out.prompt.name == "probe"
     body = sent_bodies(fake)[0]
-    assert body["model"] == "extract-model" and body["tools"]
+    assert body["model"] == "small-model" and body["tools"]
 
 
 def test_auto_falls_back_to_prompted_and_remembers():
@@ -66,7 +66,7 @@ def test_missing_key_and_model(monkeypatch):
     with pytest.raises(LLMError, match="BRAIN_API_KEY"):
         make(FakeOpenAI()).run("probe", "go", Probe)
     monkeypatch.setenv("BRAIN_API_KEY", "test-key")
-    with pytest.raises(LLMError, match="extract_model"):
+    with pytest.raises(LLMError, match="small_model"):
         LLM(Settings(llm={"base_url": "https://g/v1"}), transport=FakeOpenAI().transport()).run("probe", "go", Probe)
 
 
@@ -79,10 +79,23 @@ def test_embeddings_are_batched():
 
 def test_every_prompt_file_loads_with_a_stamp():
     names = [p.name.removesuffix(".md") for p in resources.files("brain.prompts").iterdir() if p.name.endswith(".md")]
-    assert set(names) >= {"extract", "resolve", "answers", "thread_summary", "brief", "ask", "probe"}
+    assert set(names) >= {"split", "classify", "names", "link", "file", "relate", "now", "summary", "check", "ask"}
     for name in names:
         p = load_prompt(name)
-        assert p.version >= 1 and len(p.sha256) == 16 and p.role in ("chat", "extract") and p.instructions
+        assert p.version >= 1 and len(p.sha256) == 16 and p.role in ("layer", "dream", "answer") and p.instructions
+
+
+def test_roles_choose_the_configured_model():
+    """Layers always use the small model; dreaming uses the strong one when set and asked for."""
+    both = LLM(Settings(llm=LLM_CFG))
+    assert both.model_name("layer") == "small-model"
+    assert both.model_name("dream") == "strong-model"
+    assert both.model_name("answer") == "small-model"
+    small_only = LLM(Settings(llm=LLM_CFG | {"strong_model": ""}))
+    assert small_only.model_name("dream") == "small-model" and not small_only.can_escalate
+    assert LLM(Settings(llm=LLM_CFG | {"dream_uses": "small"})).model_name("dream") == "small-model"
+    assert LLM(Settings(llm=LLM_CFG | {"answer_uses": "strong"})).model_name("answer") == "strong-model"
+    assert LLM(Settings(llm=LLM_CFG | {"escalate": "strong"})).can_escalate
 
 
 def test_pydantic_ai_banner_is_disabled():

@@ -1,26 +1,23 @@
-"""Step 2: vectors for the entry and its fragments. Unchanged texts keep their vectors."""
+"""Vectors for the note and its statements. Unchanged texts keep their vectors."""
 
 from __future__ import annotations
 
-from brain.core.formats.decisions import Decisions
-from brain.core.formats.entry import Entry, content_hash
-from brain.core.formats.sidecars import EmbeddingFile, EmbeddingItem, Extraction, encode_vector
+from brain.core.formats.note import Note, content_hash
+from brain.core.formats.records import EmbeddingFile, EmbeddingItem, Statement, encode_vector
 from brain.core.llm.models import LLMError
 from brain.core.pipeline.context import PipelineContext
 
 
-def needed_texts(entry: Entry, extraction: Extraction, decisions: Decisions) -> dict[str, str]:
-    texts = {entry.id: entry.body}
-    for f in extraction.fragments:
-        if not decisions.is_deleted(f.id):
-            texts[f.id] = f.text
-    return texts
+def needed_texts(note: Note, statements: list[Statement]) -> dict[str, str]:
+    return {note.id: note.body, **{s.id: s.text for s in statements}}
 
 
-def embed(
-    ctx: PipelineContext, entry: Entry, extraction: Extraction, decisions: Decisions, previous: EmbeddingFile | None
-) -> EmbeddingFile:
-    texts = needed_texts(entry, extraction, decisions)
+def is_current(previous: EmbeddingFile | None, texts: dict[str, str]) -> bool:
+    have = {i.id: i.hash for i in previous.items} if previous else {}
+    return previous is not None and all(have.get(i) == content_hash(t) for i, t in texts.items())
+
+
+def embed(ctx: PipelineContext, note: Note, texts: dict[str, str], previous: EmbeddingFile | None) -> EmbeddingFile:
     old = {}
     if previous is not None and previous.model == ctx.llm.embed_model:
         old = {i.id: i for i in previous.items}
@@ -43,9 +40,4 @@ def embed(
             raise LLMError(f"{ctx.llm.embed_model} returned vectors of inconsistent dimensions")
         for (item_id, text), vec in zip(todo, vectors, strict=True):
             items[item_id] = EmbeddingItem(id=item_id, hash=content_hash(text), vec=encode_vector(vec))
-    return EmbeddingFile(
-        entry_id=entry.id,
-        model=ctx.llm.embed_model,
-        dim=dim,
-        items=[items[i] for i in texts],
-    )
+    return EmbeddingFile(note_id=note.id, model=ctx.llm.embed_model, dim=dim, items=[items[i] for i in texts])

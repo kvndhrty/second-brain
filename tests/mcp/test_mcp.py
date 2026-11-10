@@ -12,7 +12,6 @@ from mcp.client import Client
 from mcp.client.stdio import StdioServerParameters
 
 from brain.core import keys
-from brain.core.formats.entity import Person, Thread
 from brain.core.llm.models import LLMError
 from brain.core.shared import SharedBrain
 from brain.core.storage.lease import Lease
@@ -20,10 +19,12 @@ from brain.mcp.server import build_server
 
 pytestmark = pytest.mark.anyio
 
-ENTRY = (
-    "Kicked off the [[GPU quota migration]] with Priya. We decided to move the eval cluster in December. "
+NOTE = (
+    "Kicked off the [[GPU quota migration]] with Priya Raman. We decided to move the eval cluster in December. "
     "Does the vendor support MIG on the new nodes?"
 )
+FOLLOW_UP = "Priya Raman needs to file the ticket for the [[GPU quota migration]]."
+TOOLS = {"search", "ask", "brief", "get_page", "get_note", "list_active", "jot", "get_context"}
 
 
 @pytest.fixture
@@ -46,86 +47,91 @@ async def call(client: Client, tool: str, **args):
 async def test_tools_are_listed_with_schemas_and_hints(server):
     async with Client(server) as c:
         tools = {t.name: t for t in (await c.list_tools()).tools}
-        assert set(tools) == {
-            "search",
-            "ask",
-            "brief",
-            "get_entity",
-            "get_entry",
-            "list_active",
-            "add_entry",
-            "get_context",
-        }
+        assert set(tools) == TOOLS
         for name, t in tools.items():
             assert t.description and t.output_schema, name
-            assert t.annotations.read_only_hint is (name != "add_entry"), name
-        assert "cite" in (c.instructions or "").lower()
+            assert t.annotations.read_only_hint is (name != "jot"), name
+        instructions = (c.instructions or "").lower()
+        assert "cite" in instructions and "only way to change the" in instructions
 
 
-async def test_add_entry_then_read_it_back(server, brain):
+async def test_jot_then_read_it_back(server, brain):
     async with Client(server) as c:
-        added, err = await call(c, "add_entry", text=ENTRY, title="Quota kickoff")
+        added, err = await call(c, "jot", text=NOTE, title="Quota kickoff")
         assert err is None and added["processed"] and added["error"] is None
-        assert [f["kind"] for f in added["fragments"]] == ["observation", "decision", "question"]
-        assert added["names_to_review"] == 2  # Priya, and "MIG" (the fake treats all-caps words as orgs)
-        entry, _ = await call(c, "get_entry", entry_id=added["entry_id"])
-        assert entry["text"].strip() == ENTRY and entry["title"] == "Quota kickoff" and entry["processed"]
+        assert [s["kind"] for s in added["statements"]] == ["fact", "decision", "question"]
+        assert any("New person: Priya Raman" in line for line in added["changes"])
+        await call(c, "jot", text=FOLLOW_UP)
+        note, _ = await call(c, "get_note", note_id=added["note_id"])
+        assert note["text"].strip() == NOTE and note["title"] == "Quota kickoff" and note["processed"]
+        assert note["statements"][0]["age"] == "0d" and note["today"]
 
         hits, _ = await call(c, "search", query="vendor MIG nodes")
-        assert hits["hits"][0]["type"] in ("fragment", "entry")
-        assert any(h["entry_id"] == added["entry_id"] for h in hits["hits"])
-        threads, _ = await call(c, "search", query="GPU quota", types=["thread"])
-        assert [h["id"] for h in threads["hits"]] == ["thread:gpu-quota-migration"]
+        assert any(h["note_id"] == added["note_id"] for h in hits["hits"])
+        threads, _ = await call(c, "search", query="GPU quota migration", types=["thread"])
+        assert [h["id"] for h in threads["hits"]] == ["gpu-quota-migration"]
 
         answer, _ = await call(c, "ask", question="does the vendor support MIG?")
         cited = {x for claim in answer["claims"] for x in claim["citations"]}
-        assert cited and cited <= {s["entry_id"] for s in answer["sources"]}
+        assert cited and cited <= {s["note_id"] for s in answer["sources"]}
 
         active, _ = await call(c, "list_active")
         assert [t["id"] for t in active["threads"]] == ["gpu-quota-migration"]
-        assert active["threads"][0]["summary"]
+        assert active["threads"][0]["now"] and active["threads"][0]["open_items"] == 2
 
-        entity, _ = await call(c, "get_entity", name_or_id="GPU quota migration")
-        assert entity["id"] == "thread:gpu-quota-migration" and entity["fragment_count"] == 1
+        page, _ = await call(c, "get_page", name_or_id="GPU quota migration")
+        assert page["id"] == "gpu-quota-migration" and page["type"] == "thread" and page["now"]["citations"]
+        assert [s["kind"] for s in page["open"]] == ["question", "action"]
+        person, _ = await call(c, "get_page", name_or_id="priya-raman")
+        assert person["name"] == "Priya Raman" and person["related"][0]["id"] == "gpu-quota-migration"
+
+
+async def test_a_correction_is_a_note(server, brain):
+    async with Client(server) as c:
+        await call(c, "jot", text=NOTE)
+        await call(c, "jot", text=FOLLOW_UP)
+        fixed, err = await call(c, "jot", text="This is finished.", about="GPU quota migration")
+        assert err is None and any("closed" in line for line in fixed["changes"])
+        page, _ = await call(c, "get_page", name_or_id="gpu-quota-migration")
+        assert page["status"] == "closed" and page["open"] == []
+        _, err = await call(c, "jot", text="x", about="no such page")
+        assert "no page for" in err
 
 
 async def test_brief_marks_seen_only_when_asked(server, brain):
     async with Client(server) as c:
-        await call(c, "add_entry", text=ENTRY)
-        result, err = await call(c, "brief", target="GPU quota migration")
-        assert err is None and result["type"] == "thread" and result["where_things_stand"]
+        await call(c, "jot", text=NOTE)
+        await call(c, "jot", text=FOLLOW_UP)
+        result, err = await call(c, "brief", request="GPU quota migration")
+        assert err is None and result["topics"][0]["type"] == "thread" and result["where_things_stand"]
         assert not brain.storage.exists(keys.BRIEF_STATE)
-        await call(c, "brief", target="GPU quota migration", mark_seen=True)
-        assert "thread:gpu-quota-migration" in json.loads(brain.storage.get(keys.BRIEF_STATE))["last"]
-        again, _ = await call(c, "brief", target="gpu-quota-migration")
+        await call(c, "brief", request="GPU quota migration", mark_seen=True)
+        assert "gpu-quota-migration" in json.loads(brain.storage.get(keys.BRIEF_STATE))["last"]
+        again, _ = await call(c, "brief", request="gpu-quota-migration")
         assert again["last_looked"] is not None
 
 
 async def test_errors_carry_useful_messages(server, brain, monkeypatch):
-    brain.vault.put_entity(Person(id="jane", name="Jane Doe", aliases=["Jane"]))
-    brain.vault.put_entity(Thread(id="jane", name="Jane"))
     async with Client(server) as c:
-        _, err = await call(c, "get_entity", name_or_id="Jane")
-        assert "person:jane" in err and "thread:jane" in err
-        _, err = await call(c, "get_entity", name_or_id="nobody at all")
-        assert "nothing named" in err
-        _, err = await call(c, "get_entry", entry_id="e-19990101T000000Z")
-        assert "no entry" in err
+        _, err = await call(c, "get_page", name_or_id="nobody at all")
+        assert "no page for" in err
+        _, err = await call(c, "get_note", note_id="n-19990101T000000Z")
+        assert "no note" in err
 
         def down(*a, **k):
-            raise LLMError("ask: HTTP 503 from fake-chat: overloaded")
+            raise LLMError("ask: HTTP 503 from fake-small: overloaded")
 
-        await call(c, "add_entry", text=ENTRY)
+        await call(c, "jot", text=NOTE)
         monkeypatch.setattr(brain.llm, "run", down)
         _, err = await call(c, "ask", question="anything about MIG?")
         assert "HTTP 503" in err
 
 
-async def test_add_entry_reports_lease_held_elsewhere(server, brain, local_storage):
+async def test_jot_reports_lease_held_elsewhere(server, brain, local_storage):
     local_storage.supports_conditional_writes = True
     Lease(local_storage, machine_id="laptop", ttl_seconds=900, command="brain start").acquire()
     async with Client(server) as c:
-        _, err = await call(c, "add_entry", text="hello")
+        _, err = await call(c, "jot", text="hello")
         assert "Another machine holds the write lease" in err
 
 
@@ -134,7 +140,7 @@ async def test_stdio_subprocess(tmp_path: Path):
     cfg = tmp_path / "config.toml"
     cfg.write_text(
         f'[storage]\nbackend = "local"\npath = "{tmp_path / "store"}"\n'
-        '[llm]\nbase_url = "https://fake/v1"\nchat_model = "fake-chat"\nembed_model = "fake-embed"\n'
+        '[llm]\nbase_url = "https://fake/v1"\nsmall_model = "fake-small"\nembed_model = "fake-embed"\n'
     )
     env = {k: v for k, v in os.environ.items() if not k.startswith("BRAIN_")}
     env.update(
@@ -146,18 +152,19 @@ async def test_stdio_subprocess(tmp_path: Path):
         env=env,
     )
     async with Client(params, read_timeout_seconds=60) as c:
-        assert len((await c.list_tools()).tools) == 8
+        assert len((await c.list_tools()).tools) == len(TOOLS)
         assert "Current state of the journal" in (c.instructions or "")  # injected at session start
-        added, err = await call(c, "add_entry", text=ENTRY)
+        added, err = await call(c, "jot", text=NOTE)
         assert err is None and added["processed"]
-        assert added["today"] and added["fragments"][0]["age_days"] == 0
+        assert added["today"] and added["statements"][0]["age"] == "0d"
         answer, _ = await call(c, "ask", question="when does the eval cluster move?")
         assert answer["claims"]
 
 
 async def test_context_resource_and_tool(server, brain):
     async with Client(server) as c:
-        added, err = await call(c, "add_entry", text=ENTRY)
+        await call(c, "jot", text=NOTE)
+        added, err = await call(c, "jot", text=FOLLOW_UP)
         assert err is None and added["processed"]
         assert "Current state" not in (c.instructions or "")  # only `brain mcp` puts it in the instructions
         r = await c.read_resource("brain://context")
@@ -165,5 +172,3 @@ async def test_context_resource_and_tool(server, brain):
         assert text.startswith("# brain: ") and "GPU quota migration [gpu-quota-migration]" in text
         tool = await c.call_tool("get_context", {})
         assert not tool.is_error and tool.content[0].text == text
-        active, _ = await call(c, "list_active")
-        assert active["today"] and active["threads"][0]["last_activity_age_days"] == 0

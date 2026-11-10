@@ -4,133 +4,127 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+TODAY = "today's date (YYYY-MM-DD, local); every age counts back from it"
 
-class Fragment(BaseModel):
+
+class Statement(BaseModel):
     id: str
-    entry_id: str = Field(description="entry the fragment came from; cite this")
-    date: str = Field(description="local date the entry was written (YYYY-MM-DD)")
-    age_days: int | None = Field(default=None, description="days before today")
-    kind: str = Field(description="observation, decision, question, idea, claim, or action_item")
+    note_id: str = Field(description="the note the statement came from; cite this")
+    date: str = Field(description="local date the note was written (YYYY-MM-DD)")
+    age: str = Field(description="how long before today: days d, weeks w, months mo")
+    kind: str = Field(description="fact, decision, question, action, idea, or correction")
     text: str
-    status: str = Field(description="confirmed, speculative, or overcome_by_events")
-    state: str | None = Field(default=None, description="open or closed, for questions and action items")
-    someday: bool = False
-    obe_reason: str | None = None
+    status: str = Field(description="current, superseded (a later note replaced it), answered, or repeat")
+    replaced_by: str | None = Field(default=None, description="the later statement that superseded or answered it")
+    thread: str | None = Field(default=None, description="id of the thread it is filed under")
+    thread_name: str | None = None
 
 
 class SearchHit(BaseModel):
-    id: str = Field(description="entry id, fragment id, or entity node id such as person:jane-doe")
-    type: str
+    id: str = Field(description="note id, statement id, or page id")
+    type: str = Field(description="note, statement, thread, person, org, or topic")
     label: str
     snippet: str
     date: str | None = None
-    age_days: int | None = Field(default=None, description="days before today")
-    entry_id: str | None = None
+    note_id: str | None = None
     kind: str | None = None
     status: str | None = None
 
 
 class SearchResult(BaseModel):
-    today: str = Field(description="today's date (YYYY-MM-DD, local); every age_days counts back from it")
+    today: str = Field(description=TODAY)
     hits: list[SearchHit]
 
 
 class Claim(BaseModel):
     text: str
-    citations: list[str] = Field(description="entry ids that support the claim")
+    citations: list[str] = Field(description="note ids that support the claim")
 
 
 class Source(BaseModel):
-    entry_id: str
-    date: str = Field(description="local date the entry was written (YYYY-MM-DD)")
-    age_days: int | None = Field(default=None, description="days before today")
+    note_id: str
+    date: str
     label: str
 
 
 class AskResult(BaseModel):
-    today: str = Field(description="today's date (YYYY-MM-DD, local); every age_days counts back from it")
+    today: str = Field(description=TODAY)
     claims: list[Claim]
-    insufficient: bool = Field(description="true if the journal does not answer the question")
-    sources: list[Source]
+    insufficient: bool = Field(description="true when the journal does not contain the answer")
+    sources: list[Source] = Field(description="the cited notes, oldest first")
+
+
+class Ref(BaseModel):
+    id: str
+    type: str
+    name: str
 
 
 class BriefResult(BaseModel):
-    today: str = Field(description="today's date (YYYY-MM-DD, local); every age_days counts back from it")
-    target: str = Field(
-        description="node id the brief is about, several node ids joined by ',', or text:<words> for a free-text brief"
-    )
-    label: str
-    type: str
-    last_looked: str | None = Field(default=None, description="date the user last read a brief on this, if any")
-    summary: str | None = Field(default=None, description="running thread summary, for threads")
-    summary_as_of: str | None = Field(
-        default=None, description="date of the newest entry the summary covers; it says nothing about later events"
-    )
+    today: str = Field(description=TODAY)
+    topics: list[Ref] = Field(description="the pages the brief covers; empty when it was written from a search")
+    last_looked: str | None = Field(default=None, description="when the user last read a brief on these topics")
     where_things_stand: list[Claim]
     recent_decisions: list[Claim]
     open_items: list[Claim]
     people: list[Claim]
-    speculative: list[Claim]
-    overcome_by_events: list[Claim]
+    no_longer_applies: list[Claim]
     changed_since: list[Claim]
-    open_fragments: list[Fragment] = Field(description="open questions and action items, exactly as recorded")
-    sources: list[Source]
-    notes: list[str] = Field(default_factory=list)
+    sources: list[Source] = Field(description="the cited notes, oldest first")
 
 
-class EntityResult(BaseModel):
-    today: str = Field(description="today's date (YYYY-MM-DD, local); every age_days counts back from it")
+class Cited(BaseModel):
+    text: str
+    citations: list[str] = Field(description="note ids")
+
+
+class PageResult(BaseModel):
+    today: str = Field(description=TODAY)
     id: str
-    type: str
+    type: str = Field(description="thread, person, org, or topic")
     name: str
-    aliases: list[str]
-    details: dict
-    notes: str
-    notes_as_of: str | None = Field(default=None, description="date the entity's file (and so its notes) last changed")
-    summary: str | None
-    summary_as_of: str | None = Field(default=None, description="date of the newest entry the summary covers")
-    related: dict[str, list[str]] = Field(description="linked threads, people, orgs, themes, memberships")
-    fragment_count: int
-    open_items: list[Fragment]
-    recent: list[Fragment] = Field(description="most recent linked fragments, oldest first, so the newest is last")
+    names: list[str] = Field(description="other names it has been called")
+    status: str = Field(description="active or closed")
+    profile: dict[str, str] = Field(description="for a person: role and org, when known")
+    as_of: str | None = Field(default=None, description="date of the newest note the page covers")
+    now: Cited | None = Field(default=None, description="threads only: where it stands")
+    summary: list[Cited]
+    open: list[Statement] = Field(description="open questions and things to do")
+    decided: list[Statement] = Field(description="decisions that still stand, newest first")
+    history: list[Statement] = Field(description="every statement, newest first, with what replaced it")
+    related: list[Ref]
 
 
-class EntryResult(BaseModel):
-    today: str = Field(description="today's date (YYYY-MM-DD, local); every age_days counts back from it")
+class NoteResult(BaseModel):
+    today: str = Field(description=TODAY)
     id: str
-    date: str = Field(description="local date the entry was written (YYYY-MM-DD)")
-    age_days: int | None = Field(default=None, description="days before today")
-    title: str | None
-    text: str = Field(description="the entry exactly as the user wrote it")
+    date: str
+    title: str | None = None
+    text: str = Field(description="the note exactly as the user wrote it")
     processed: bool
-    fragments: list[Fragment] = Field(description="fragments in the order they appear in the entry")
+    statements: list[Statement]
+    mentions: list[Ref]
+    changes: list[str] = Field(description="what brain did with the note")
 
 
 class ActiveThread(BaseModel):
     id: str
     name: str
-    state: str
-    pinned: bool
-    last_activity: str | None = Field(description="local date of the newest fragment in the thread")
-    last_activity_age_days: int | None = None
-    fragments: int
+    last_activity: str | None = None
     open_items: int
-    people: list[str]
-    summary: str | None
-    summary_as_of: str | None = Field(default=None, description="date of the newest entry the summary covers")
+    now: str | None = Field(default=None, description="where it stands")
 
 
 class ActiveResult(BaseModel):
-    today: str = Field(description="today's date (YYYY-MM-DD, local); every age_days counts back from it")
+    today: str = Field(description=TODAY)
     threads: list[ActiveThread]
-    inactivity_days: int = Field(description="threads with no activity for this many days are left out unless pinned")
 
 
-class AddEntryResult(BaseModel):
-    today: str = Field(description="today's date (YYYY-MM-DD, local); every age_days counts back from it")
-    entry_id: str
+class JotResult(BaseModel):
+    today: str = Field(description=TODAY)
+    note_id: str
     key: str
     processed: bool
+    statements: list[Statement] = Field(default_factory=list)
+    changes: list[str] = Field(default_factory=list, description="what brain did with the note")
     error: str | None = None
-    fragments: list[Fragment] = Field(default_factory=list)
-    names_to_review: int = Field(default=0, description="new names the user should confirm with `brain review`")

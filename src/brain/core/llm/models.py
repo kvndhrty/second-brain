@@ -27,7 +27,7 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from brain.core.config import Settings
-from brain.core.formats.sidecars import PromptStamp
+from brain.core.formats.records import PromptStamp
 from brain.core.llm import client as http
 from brain.core.llm.prompts import Prompt, Role, load_prompt
 from brain.core.tls import ssl_context
@@ -45,6 +45,10 @@ MAX_EMBED_CHARS = 8000
 
 class LLMError(Exception):
     """A model call failed. The message is meant to be shown to the user."""
+
+
+class LLMOutputError(LLMError):
+    """The model answered, but not with output that passed validation, after retries."""
 
 
 @dataclass(frozen=True)
@@ -89,9 +93,15 @@ class LLM:
         return self.cfg.embed_model
 
     def model_name(self, role: Role) -> str:
-        if role == "extract":
-            return self.cfg.extract_model or self.cfg.chat_model
-        return self.cfg.chat_model
+        """The configured model for a prompt role. Dreaming and answers use the strong model when asked to and one is set."""
+        uses = {"layer": "small", "dream": self.cfg.dream_uses, "answer": self.cfg.answer_uses}[role]
+        if uses == "strong" and self.cfg.strong_model:
+            return self.cfg.strong_model
+        return self.cfg.small_model
+
+    @property
+    def can_escalate(self) -> bool:
+        return self.cfg.escalate == "strong" and bool(self.cfg.strong_model)
 
     def _openai_model(self, prompt: Prompt, name: str) -> Model:
         key = self.cfg.api_key()
@@ -126,12 +136,17 @@ class LLM:
         *,
         validate: Callable[[T], None] | None = None,
         mode: str | None = None,
+        strong: bool = False,
     ) -> Stamped[T]:
-        """Run one prompt. `validate` raises ValueError to make the model retry with that message."""
+        """Run one prompt. `validate` raises ValueError to make the model retry with that message.
+
+        Raises LLMOutputError when the model never produced valid output, and
+        LLMError for everything else (no endpoint, HTTP errors).
+        """
         prompt = load_prompt(prompt_name)
-        name = self.model_name(prompt.role)
+        name = (self.cfg.strong_model if strong else "") or self.model_name(prompt.role)
         if not name:
-            raise LLMError(f"llm.{prompt.role}_model is not set")
+            raise LLMError("llm.small_model is not set")
         model = self._model(prompt, name)
         requested = mode or self._mode
         modes = ["tool", "prompted"] if requested == "auto" else [requested]
@@ -161,7 +176,7 @@ class LLM:
                 last = e
                 if i + 1 < len(modes):
                     continue
-                raise LLMError(f"{prompt_name}: {name} did not return valid output: {e}") from e
+                raise LLMOutputError(f"{prompt_name}: {name} did not return valid output: {e}") from e
             except ModelAPIError as e:
                 raise LLMError(f"{prompt_name}: {name}: {e}") from e
             if requested == "auto":

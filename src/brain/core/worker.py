@@ -2,13 +2,13 @@
 
 The worker has its own Brain (its own SQLite connection to the same index),
 so long model calls do not hold the lock that web requests and MCP calls use.
-It processes pending entries on startup, when woken (an entry was saved), and
+It processes pending notes on startup, when woken (a note was saved), and
 every `worker.poll_seconds`. A full listing of the store runs every
-`FULL_LIST_SECONDS` to pick up files edited outside brain.
+`FULL_LIST_SECONDS` to pick up markdown files saved into notes/ by hand.
 
-When a round processes no entry successfully and a dream pass is due
-(`[dream] nightly_at` or `after_entries`), it dreams. New entries always come
-first: a round that processed one leaves dreaming to a later round. Entries
+When a round processes no note successfully and a dream pass is due
+(`[dream] nightly_at` or `after_notes`), it dreams. New notes always come
+first: a round that processed one leaves dreaming to a later round. Notes
 that keep failing do not hold dreaming back.
 """
 
@@ -20,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from brain.core.pipeline.runner import EntryResult
+from brain.core.pipeline.runner import NoteResult
 from brain.core.services import Brain, Busy
 
 FULL_LIST_SECONDS = 600
@@ -41,7 +41,7 @@ class WorkerStatus:
 @dataclass
 class _Waiter:
     event: threading.Event = field(default_factory=threading.Event)
-    result: EntryResult | None = None
+    result: NoteResult | None = None
 
 
 class Worker:
@@ -77,23 +77,23 @@ class Worker:
         self._dream_requested = True
         self.wake()
 
-    def process_now(self, entry_id: str, timeout: float = 300.0) -> EntryResult | None:
-        """Ask the worker to process an entry and wait for it. None if it did not finish in time."""
+    def process_now(self, note_id: str, timeout: float = 300.0) -> NoteResult | None:
+        """Ask the worker to process a note and wait for it. None if it did not finish in time."""
         w = _Waiter()
         with self._waiters_lock:
-            self._waiters.setdefault(entry_id, []).append(w)
+            self._waiters.setdefault(note_id, []).append(w)
         self.wake()
         w.event.wait(timeout)
         return w.result
 
-    def _finish(self, results: list[EntryResult], brain: Brain) -> None:
+    def _finish(self, results: list[NoteResult], brain: Brain) -> None:
         with self._waiters_lock:
-            done = {r.entry_id: r for r in results}
-            pending = {r[0] for r in brain.db.conn.execute("SELECT id FROM entries WHERE next_step != 'done'")}
-            for entry_id in list(self._waiters):
-                if entry_id in done or entry_id not in pending:
-                    for w in self._waiters.pop(entry_id):
-                        w.result = done.get(entry_id) or EntryResult(entry_id)
+            done = {r.note_id: r for r in results}
+            pending = {r[0] for r in brain.db.conn.execute("SELECT id FROM notes WHERE done = 0")}
+            for note_id in list(self._waiters):
+                if note_id in done or note_id not in pending:
+                    for w in self._waiters.pop(note_id):
+                        w.result = done.get(note_id) or NoteResult(note_id)
                         w.event.set()
 
     def _run(self) -> None:
@@ -116,11 +116,11 @@ class Worker:
                             last_full = time.monotonic()
                         self.status.current = "processing"
                         report = brain.process_pending(progress=self._progress)
-                        self.status.processed += sum(1 for e in report.entries if not e.error)
+                        self.status.processed += sum(1 for e in report.notes if not e.error)
                         self.status.failed += len(report.failed)
                         self.status.last_error = report.failed[-1].error if report.failed else None
-                        self._finish(report.entries, brain)
-                        if not any(e.error is None for e in report.entries):
+                        self._finish(report.notes, brain)
+                        if not any(e.error is None for e in report.notes):
                             self._maybe_dream(brain)
                         self.status.current = "idle"
                     self.status.last_run = datetime.now(UTC).isoformat()
@@ -152,5 +152,5 @@ class Worker:
         if run.errors:
             self.status.last_error = run.errors[-1]
 
-    def _progress(self, entry_id: str, message: str) -> None:
-        self.status.current = f"{entry_id}: {message}" if entry_id else message
+    def _progress(self, note_id: str, message: str) -> None:
+        self.status.current = f"{note_id}: {message}" if note_id else message

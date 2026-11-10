@@ -15,7 +15,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 MIN_SQLITE = (3, 41, 0)
 
 
@@ -171,16 +171,15 @@ def vec_blob(values: list[float]) -> bytes:
 SNAPSHOT_QUERIES = {
     "objects": "SELECT key, etag, size, unit FROM objects",
     "problems": "SELECT key, message FROM problems",
-    "nodes": "SELECT id, type, label, created_at, updated_at, data, owner FROM nodes",
-    "entries": "SELECT * FROM entries",
-    "fragments": "SELECT * FROM fragments",
-    "threads": "SELECT * FROM threads",
-    "aliases": "SELECT * FROM aliases",
-    "edges": (
-        "SELECT src, dst, type, weight, origin, confirmed, entry_id, fragment_id, valid_from, valid_to, owner FROM edges"
-    ),
-    "review_items": "SELECT * FROM review_items",
-    "suggestions": "SELECT * FROM suggestions",
+    "notes": "SELECT * FROM notes",
+    "statements": "SELECT * FROM statements",
+    "entities": "SELECT * FROM entities",
+    "names": "SELECT * FROM names",
+    "mentions": "SELECT * FROM mentions",
+    "relations": "SELECT * FROM relations",
+    "operations": "SELECT note_id, statement_id, op, targets, name, moved, created_at, owner FROM operations",
+    "events": "SELECT at, source, seq, kind, text, entity_id, owner FROM events",
+    "pages": "SELECT * FROM pages",
     "embeddings": "SELECT owner_id, model, content_hash, owner FROM embeddings",
     "fts": "SELECT item_id, item_type, owner, title, body FROM fts",
 }

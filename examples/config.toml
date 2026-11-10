@@ -20,10 +20,12 @@ client_key = ""
 [llm]                             # any OpenAI-compatible endpoint
 base_url = "https://llm-gateway.internal/v1"
 api_key_env = "BRAIN_API_KEY"     # name of the env var that holds the key, not the key
-chat_model = ""
-extract_model = ""
+small_model = ""                  # does the per-note work (layers 1-8) and brief routing
+strong_model = ""                 # optional; used only where the three settings below say
 embed_model = ""
-doc_model = ""
+dream_uses = "strong"             # "strong" or "small"; uses the small model when strong_model is empty
+answer_uses = "small"             # which model writes `ask` and `brief` answers
+escalate = "off"                  # "strong": retry on the strong model when the small model's output fails validation
 embed_dim = 0                     # 0 means detect
 structured_output = "auto"        # "auto", "tool", "native", or "prompted"
 timeout_seconds = 120
@@ -46,10 +48,12 @@ poll_seconds = 60
 [dream]
 enabled = true                    # whether `brain start` dreams on its own; `brain dream` always works
 nightly_at = "03:00"              # local time; "" turns the nightly pass off
-after_entries = 10                # also dream after this many new entries; 0 turns it off
+after_notes = 10                  # also dream after this many new notes; 0 turns it off
 max_calls = 50                    # model calls per pass
-rebuild_after_updates = 10        # rebuild a thread summary after this many new entries
+rebuild_after_updates = 10        # rebuild a page summary after this many updates
 rebuild_after_days = 30
+stale_days = 14                   # re-check open questions and things to do older than this
+close_after_days = 60             # close a thread with nothing open after this long without activity
 
 [context]
 max_lines = 60                    # the injected context (`brain context`) stays within these

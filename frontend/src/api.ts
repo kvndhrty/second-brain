@@ -1,102 +1,86 @@
 // Typed client for the brain HTTP API (src/brain/web/app.py).
 
-export interface Fragment {
+export interface Statement {
   id: string;
-  entry_id: string;
+  note_id: string;
   date: string;
-  kind: string;
+  age: string;
+  kind: "fact" | "decision" | "question" | "action" | "idea" | "correction";
   text: string;
-  status: "confirmed" | "speculative" | "overcome_by_events";
-  state: "open" | "closed" | null;
-  someday: boolean;
-  obe_reason: string | null;
+  status: "current" | "superseded" | "answered" | "repeat" | "retracted";
+  replaced_by: string | null;
+  thread: string | null;
+  thread_name: string | null;
 }
 
-export interface Link {
+export interface Cited {
+  text: string;
+  citations: string[];
+}
+
+export interface Ref {
   id: string;
   type: string;
-  label: string;
-}
-
-export interface TimelineItem {
-  fragment: Fragment;
-  links: Link[];
-}
-
-export interface ThreadRow {
-  id: string;
   name: string;
-  description: string | null;
-  state: string;
-  pinned: boolean;
-  summary: string | null;
-  summary_as_of: string | null;
-  now_line: string | null;
-  now_as_of: string | null;
+}
+
+export interface LogEvent {
+  at: string;
+  source: string;
+  kind: string;
+  text: string;
+  entity_id: string | null;
+}
+
+export interface Page {
+  id: string;
+  type: "thread" | "person" | "org" | "topic";
+  name: string;
+  names: string[];
+  status: "active" | "closed" | "provisional";
+  profile: Record<string, string>;
+  as_of: string | null;
   last_activity: string | null;
-  fragments: number;
+  closed_at: string | null;
+  now: Cited | null;
+  summary: Cited[];
+  open: Statement[];
+  decided: Statement[];
+  history: Statement[];
+  related: Ref[];
+  note_count: number;
+  log: LogEvent[];
+}
+
+export interface PageSummary {
+  id: string;
+  type: string;
+  name: string;
+  status: string;
+  now: string | null;
+  last_activity: string | null;
   open_items: number;
-  people: string[];
+  note_count: number;
 }
 
-export interface EntityView {
-  id: string;
-  type: string;
-  name: string;
-  aliases: string[];
-  details: Record<string, unknown>;
-  notes: string;
-  summary: string | null;
-  related: Record<string, string[]>;
-  open_items: Fragment[];
-  recent: Fragment[];
-  fragment_count: number;
-}
-
-export interface EntitySummary {
-  id: string;
-  type: string;
-  name: string;
-  state: string | null;
-  fragments: number;
-  last_seen: string | null;
-  detail: string | null;
-}
-
-export interface EntrySummary {
+export interface NoteSummary {
   id: string;
   date: string;
-  title: string | null;
-  preview: string;
-  processed: boolean;
-  fragments: number;
+  label: string;
+  done: boolean;
+  statements: number;
 }
 
-export interface EntryView {
+export interface Note {
   id: string;
-  date: string;
+  created: string;
   title: string | null;
-  text: string;
-  key: string;
-  processed: boolean;
-  fragments: Fragment[];
-}
-
-export interface Candidate {
-  entity_id: string;
-  name?: string;
-  score: number;
-}
-
-export interface ReviewItem {
-  id: string;
-  kind: string;
-  entry_id: string | null;
-  payload: Record<string, any>;
-  entry_date: string | null;
-  entry_label: string | null;
-  context: string[];
-  others: number;
+  about: string | null;
+  body: string;
+  done: boolean;
+  statements: Statement[];
+  entities: Ref[];
+  events: LogEvent[];
 }
 
 export interface Hit {
@@ -105,7 +89,7 @@ export interface Hit {
   label: string;
   snippet: string;
   date: string | null;
-  entry_id: string | null;
+  note_id: string | null;
   kind: string | null;
   status: string | null;
 }
@@ -116,7 +100,7 @@ export interface Claim {
 }
 
 export interface Source {
-  entry_id: string;
+  note_id: string;
   date: string;
   label: string;
 }
@@ -129,76 +113,26 @@ export interface AskResult {
 }
 
 export interface BriefResult {
-  target: string;
-  label: string;
-  type: string;
+  request: string;
+  topics: Ref[];
   since: string | null;
-  summary: string | null;
   sections: Record<string, Claim[]>;
-  open_items: Fragment[];
   sources: Source[];
-  notes: string[];
-  fragment_count: number;
-}
-
-export interface GraphData {
-  nodes: { id: string; type: string; label: string; weight: number }[];
-  edges: { source: string; target: string; weight: number; type: string }[];
-  truncated: boolean;
 }
 
 export interface Status {
   version: string;
   store: string;
-  entries: number;
+  notes: number;
   pending: number;
-  review: number;
+  pages: number;
   llm_configured: boolean;
   failures: number;
   worker: { running: boolean; enabled: boolean; current: string | null; last_error: string | null } | null;
 }
 
-export interface FragmentPatch {
-  status?: Fragment["status"];
-  obe_reason?: string | null;
-  state?: "open" | "closed";
-  closed_note?: string | null;
-  someday?: boolean;
-}
-
-export interface ReviewDecision {
-  action: "link" | "create" | "ignore" | "accept" | "rename" | "merge" | "yes" | "no" | "drop";
-  entity_id?: string;
-  name?: string;
-  role?: string;
-  kind?: "domain" | "technique";
-  into?: string;
-  apply_to_all?: boolean;
-}
-
-export interface ThreadOp {
-  op: "rename" | "pin" | "unpin" | "archive" | "activate" | "obe" | "merge" | "split" | "move";
-  name?: string;
-  description?: string;
-  reason?: string;
-  cascade?: boolean;
-  into?: string;
-  fragment_ids?: string[];
-}
-
-export interface SweepItem {
-  kind: "stale_open" | "stale_speculative" | "quiet_thread";
-  age_days: number;
-  fragment: Fragment | null;
-  thread_id: string | null;
-  thread_name: string | null;
-  threads: string[] | null;
-  suggestion: { verdict: "still_open" | "probably_resolved" | "unclear"; evidence: string | null; reason: string } | null;
-}
-
 export interface ContextResult {
   text: string;
-  doc: { today: string; entries_through: string | null; waiting: Record<string, number> };
 }
 
 export interface DreamRun {
@@ -207,14 +141,13 @@ export interface DreamRun {
   finished_at: string | null;
   calls: number;
   budget_exhausted: boolean;
-  applied: string[];
-  proposed: string[];
+  events: { kind: string; text: string; entity: string | null }[];
   errors: string[];
 }
 
 export interface DreamStatus {
   last: DreamRun | null;
-  planned: string[];
+  planned: Record<string, unknown[]>;
   max_calls: number;
 }
 
@@ -248,34 +181,21 @@ const q = encodeURIComponent;
 
 export const api = {
   status: () => request<Status>("GET", "/api/status"),
-  active: () => request<ThreadRow[]>("GET", "/api/active"),
-  entities: (type: string) => request<EntitySummary[]>("GET", `/api/entities/${type}`),
-  entity: (nodeId: string) => request<EntityView>("GET", `/api/entity/${q(nodeId)}`),
-  timeline: (nodeId: string) => request<TimelineItem[]>("GET", `/api/entity/${q(nodeId)}/timeline`),
-  entries: (before?: string) => request<EntrySummary[]>("GET", `/api/entries${before ? `?before=${q(before)}` : ""}`),
-  entry: (id: string) => request<EntryView>("GET", `/api/entries/${q(id)}`),
-  createEntry: (text: string, title?: string) =>
-    request<{ id: string }>("POST", "/api/entries", { text, title: title || null }),
-  updateEntry: (id: string, text: string, title?: string | null) =>
-    request<{ id: string }>("PUT", `/api/entries/${q(id)}`, { text, title: title || null }),
-  someday: () => request<Fragment[]>("GET", "/api/someday"),
-  review: () => request<ReviewItem[]>("GET", "/api/review"),
-  resolve: (id: string, decision: ReviewDecision) => request<unknown>("POST", `/api/review/${q(id)}`, decision),
-  choices: (type: string, text: string) => request<Candidate[]>("GET", `/api/choices/${type}?q=${q(text)}`),
-  patchFragment: (id: string, patch: FragmentPatch) => request<unknown>("PATCH", `/api/fragments/${q(id)}`, patch),
+  active: () => request<PageSummary[]>("GET", "/api/active"),
+  pages: () => request<PageSummary[]>("GET", "/api/pages"),
+  page: (id: string) => request<Page>("GET", `/api/pages/${q(id)}`),
+  notes: (before?: string) => request<NoteSummary[]>("GET", `/api/notes${before ? `?before=${q(before)}` : ""}`),
+  note: (id: string) => request<Note>("GET", `/api/notes/${q(id)}`),
+  // The only write. `about` is the page a "This is wrong" note corrects.
+  jot: (text: string, about?: string) => request<{ id: string }>("POST", "/api/notes", { text, about: about ?? null }),
+  log: (limit = 100) => request<LogEvent[]>("GET", `/api/log?limit=${limit}`),
   search: (text: string) => request<Hit[]>("GET", `/api/search?q=${q(text)}`),
   ask: (question: string) => request<AskResult>("POST", "/api/ask", { question }),
-  brief: (target: string, since?: string) =>
-    request<BriefResult>("POST", "/api/brief", { target, since: since || null, mark_seen: true }),
-  threadOp: (threadId: string, op: ThreadOp) =>
-    request<{ id: string; cascaded?: number }>("POST", `/api/threads/${q(threadId)}`, op),
-  sweep: (days = 30) => request<SweepItem[]>("GET", `/api/sweep?days=${days}`),
+  brief: (text: string) => request<BriefResult>("POST", "/api/brief", { request: text, mark_seen: true }),
   context: () => request<ContextResult>("GET", "/api/context"),
   dreamStatus: () => request<DreamStatus>("GET", "/api/dream"),
   dreamNow: () => request<{ requested: boolean }>("POST", "/api/dream", {}),
-  graph: (center?: string) => request<GraphData>("GET", `/api/graph${center ? `?center=${q(center)}` : ""}`),
 };
 
-export function nodePath(nodeId: string): string {
-  return `/e/${q(nodeId)}`;
-}
+export const pagePath = (id: string) => `/p/${q(id)}`;
+export const notePath = (id: string) => `/notes/${q(id)}`;

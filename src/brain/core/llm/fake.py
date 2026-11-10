@@ -5,8 +5,8 @@ exercise the same client, request building, and error handling as production.
 
 FakeLLM runs the real PydanticAI agents against a FunctionModel that answers
 each prompt from a responder: by default simple rules over the prompt's input
-(sentences become fragments, capitalized names become people, `#tags` become
-themes, `[[Name]]` assigns a thread), or canned outputs a test supplies.
+(sentences become statements, capitalized names become people, `#tags` become
+topics, `[[Name]]` names a thread), or canned outputs a test supplies.
 
 Embeddings are deterministic bag-of-words vectors (feature hashing), so equal
 texts have similarity 1 and texts sharing words are close.
@@ -30,6 +30,7 @@ from brain.core.config import Settings
 from brain.core.llm.models import LLM
 from brain.core.llm.prompts import Prompt, load_prompt
 from brain.core.llm.schemas import BriefOutput
+from brain.core.pipeline.text import SENTENCE_END
 
 _WORD = re.compile(r"[a-z0-9]{3,}")
 
@@ -49,7 +50,7 @@ class FakeOpenAI:
     def __init__(
         self,
         *,
-        models: tuple[str, ...] = ("chat-model", "extract-model", "embed-model"),
+        models: tuple[str, ...] = ("small-model", "strong-model", "embed-model"),
         dim: int = 16,
         api_key: str = "test-key",
         chat_reply: str = "ok",
@@ -203,127 +204,241 @@ def _words(text: str) -> set[str]:
     return set(_WORD.findall(text.lower()))
 
 
-def heuristic_extract(user: str) -> dict[str, Any]:
-    body = re.search(r"<entry[^>]*>\n(.*?)\n</entry>", user, re.S)
-    text = body.group(1) if body else ""
-    threads = re.findall(r"^- id: (\S+) \| name: ([^|\n]+)", user, re.M)
-    fragments = []
-    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+def _blocks(user: str, tag: str) -> list[tuple[dict[str, str], str]]:
+    """(attributes, inner text) of each <tag ...>...</tag> element."""
+    return [(_attrs(a), body) for a, body in re.findall(rf"<{tag}\b([^>]*)>(.*?)</{tag}>", user, re.S)]
+
+
+def _note_body(user: str) -> str:
+    m = re.search(r"<note[^>]*>\n(.*?)\n</note>", user, re.S)
+    return m.group(1) if m else ""
+
+
+def _names_of(candidate_body: str) -> list[str]:
+    m = re.search(r"^names: (.*)$", candidate_body, re.M)
+    return [n.strip() for n in m.group(1).split(";")] if m else []
+
+
+def _plain(text: str) -> str:
+    return re.sub(r"\s*#([\w-]+)", r" \1", re.sub(r"\[\[([^\]]+)\]\]", r"\1", text)).strip()
+
+
+def heuristic_split(user: str) -> dict[str, Any]:
+    out = []
+    for sentence in SENTENCE_END.split(_note_body(user)):
         s = sentence.strip()
-        if len(s) < 3:
-            continue
-        low = s.lower()
-        if "?" in s:
-            kind = "question"
-        elif re.search(r"\b(decided|agreed|decision)\b", low):
-            kind = "decision"
-        elif re.search(r"\b(need to|todo|will|must|action)\b", low):
-            kind = "action_item"
-        elif re.search(r"\b(idea|what if|someday|could)\b", low):
-            kind = "idea"
-        elif re.search(r"\b(claims|says|said)\b", low):
-            kind = "claim"
-        else:
-            kind = "observation"
-        status = "speculative" if re.search(r"\b(maybe|might|probably|i think|rumou?r|perhaps)\b", low) else "confirmed"
-        clean = re.sub(r"\[\[([^\]]+)\]\]", r"\1", s)
-        tokens = re.findall(r"[A-Za-z][\w'-]*", re.sub(r"\[\[[^\]]+\]\]|#[\w-]+", " ", s))
-        people, orgs = [], []
+        if len(s) >= 3:
+            out.append({"text": _plain(s), "quote": s})
+    return {"statements": out}
+
+
+_CORRECTION = re.compile(
+    r"\b(same person|same as|are the same|is the same|different from|not the same|should be called|"
+    r"rename|is finished|is closed|is cancelled|close the|reopen|ignore what|ignore the|is wrong|not part of)\b",
+    re.I,
+)
+
+
+def heuristic_classify(user: str) -> dict[str, Any]:
+    s = _blocks(user, "statement")[0][1]
+    low = s.lower()
+    if _CORRECTION.search(s):
+        kind = "correction"
+    elif "?" in s:
+        kind = "question"
+    elif re.search(r"\b(decided|agreed|decision)\b", low):
+        kind = "decision"
+    elif re.search(r"\b(need to|needs to|todo|will|must|action)\b", low):
+        kind = "action"
+    elif re.search(r"\b(idea|what if|someday|could|maybe)\b", low):
+        kind = "idea"
+    else:
+        kind = "fact"
+    return {"kind": kind}
+
+
+# Capitalized words that begin a sentence in test notes without being names.
+_OPENERS = {"Met", "Talked", "Called", "Started", "Kicked", "Confirmed", "Reopen", "Ignore", "Later", "More", "One"}
+
+
+def _starts_name(tokens: list[str]) -> bool:
+    """A sentence's first word is part of a name only when another capitalized word follows it."""
+    if tokens[0].rstrip(".") in _OPENERS or len(tokens) < 2:
+        return False
+    return all(re.fullmatch(r"[A-Z][a-z]+\.?", t) and t.rstrip(".") not in _STOP for t in tokens[:2])
+
+
+def heuristic_names(user: str) -> dict[str, Any]:
+    """Capitalized words are people (orgs when they end in Team, Group, or Inc); capital-letter words and #tags are topics."""
+    body = _note_body(user)
+    found: dict[str, str] = {}
+    for sentence in SENTENCE_END.split(body):
+        for tag in re.findall(r"#([\w-]+)", sentence):
+            found.setdefault(tag, "topic")
+        tokens = re.findall(r"[A-Za-z][\w'-]*\.?", re.sub(r"\[\[[^\]]+\]\]|#[\w-]+", " ", sentence))
         i = 0
         while i < len(tokens):
-            tok = tokens[i]
-            if re.fullmatch(r"[A-Z]{2,6}", tok) and tok not in _STOP:
-                orgs.append(tok)
-            elif tok[0].isupper() and tok not in _STOP and i > 0:
+            tok = tokens[i].rstrip(".") if len(tokens[i]) > 2 else tokens[i]
+            bare = tok.rstrip(".")
+            if re.fullmatch(r"[A-Z]{2,6}", bare) and bare not in _STOP:
+                found.setdefault(bare, "topic")
+            elif bare[0].isupper() and bare not in _STOP and (i > 0 or _starts_name(tokens)):
                 name = tok
-                if i + 1 < len(tokens) and tokens[i + 1][0].isupper() and tokens[i + 1] not in _STOP:
+                while i + 1 < len(tokens) and tokens[i + 1][0].isupper() and tokens[i + 1].rstrip(".") not in _STOP:
                     name += " " + tokens[i + 1]
                     i += 1
-                people.append(name)
+                name = name.rstrip(".")
+                if name in body:
+                    found.setdefault(name, "org" if name.split()[-1] in ("Team", "Group", "Inc") else "person")
             i += 1
-        themes = [
-            {
-                "name": t.removeprefix("tech-").replace("-", " "),
-                "kind": "technique" if t.startswith("tech-") else "domain",
-            }
-            for t in re.findall(r"#([\w-]+)", s)
-        ]
-        refs = []
-        for name in re.findall(r"\[\[([^\]]+)\]\]", s):
-            match = next((tid for tid, tname in threads if tname.strip().lower() == name.lower()), None)
-            refs.append(
-                {"thread_id": match, "weight": 0.9}
-                if match
-                else {"new_name": name, "new_description": f"Work on {name}", "weight": 0.9}
-            )
-        if not refs:
-            for tid, tname in threads:
-                if _words(tname) and _words(tname) <= _words(s):
-                    refs.append({"thread_id": tid, "weight": 0.7})
-        fragments.append(
-            {
-                "kind": kind,
-                "text": re.sub(r"\s*#[\w-]+", "", clean).strip(),
-                "quote": s,
-                "status": status,
-                "someday": "someday" in low,
-                "mentions": [{"name": p, "type": "person"} for p in people]
-                + [{"name": o, "type": "org"} for o in orgs],
-                "themes": themes,
-                "threads": refs,
-            }
-        )
-    return {"fragments": fragments}
+    return {"names": [{"name": n, "type": t} for n, t in found.items()]}
 
 
-def heuristic_resolve(user: str) -> dict[str, Any]:
-    choices = []
-    for block in re.findall(r"<mention [^>]*>.*?</mention>", user, re.S):
-        key = _attrs(block.split(">", 1)[0])["key"]
-        cands = [_attrs(c) for c in re.findall(r"<candidate [^>]*>", block)]
-        if cands and float(cands[0]["score"]) >= 0.85:
-            choices.append({"key": key, "choice": cands[0]["id"], "confidence": 0.9, "reason": "close match"})
-        else:
-            choices.append({"key": key, "choice": "unsure", "confidence": 0.3, "reason": "not enough context"})
-    return {"choices": choices}
+def heuristic_link(user: str) -> dict[str, Any]:
+    """A candidate one of whose names contains every word of the name (so "Jane" matches "Jane Doe")."""
+    name = _blocks(user, "name")[0][1]
+    want = _words(name) or {name.lower()}
+    for a, body in _blocks(user, "candidate"):
+        if any(want <= (_words(n) or {n.lower()}) for n in _names_of(body)):
+            return {"choice": a["id"]}
+    return {"choice": "new"}
 
 
-def heuristic_answers(user: str) -> dict[str, Any]:
-    new = re.findall(r'<fragment id="([^"]+)"[^>]*>(.*?)</fragment>', user)
-    items = re.findall(r'<item id="([^"]+)"[^>]*>(.*?)</item>', user)
-    links = []
-    for fid, ftext in new:
-        for iid, itext in items:
-            if _overlap(ftext, itext) >= 0.3:
-                links.append({"fragment": fid, "answers": iid, "confidence": 0.8})
-    return {"links": links}
+def heuristic_file(user: str) -> dict[str, Any]:
+    """`[[Name]]` in the note names the thread; otherwise a candidate whose name appears in the statement."""
+    statement = _words(_blocks(user, "statement")[0][1])
+    cands = [(a["id"], _names_of(body)) for a, body in _blocks(user, "candidate")]
+
+    def known(name: str) -> str | None:
+        return next((cid for cid, names in cands if any(n.lower() == name.lower() for n in names)), None)
+
+    marked = re.findall(r"\[\[([^\]]+)\]\]", _note_body(user))
+    for name in marked:
+        if _words(name) <= statement:
+            return {"choice": known(name) or "new", "new_name": None if known(name) else name}
+    for cid, names in cands:
+        if any(_words(n) and _words(n) <= statement for n in names):
+            return {"choice": cid}
+    if marked:
+        return {"choice": known(marked[0]) or "new", "new_name": None if known(marked[0]) else marked[0]}
+    return {"choice": "none"}
+
+
+_CHANGE = re.compile(r"\b(now|instead|moved|changed|no longer|actually|cancel+ed|postponed|pushed)\b", re.I)
+
+
+def _overlap(a: str, b: str) -> float:
+    x, y = _words(a), _words(b)
+    return len(x & y) / len(x | y) if x and y else 0.0
+
+
+def heuristic_relate(user: str) -> dict[str, Any]:
+    (ea, earlier), (_, later) = _blocks(user, "earlier")[0], _blocks(user, "later")[0]
+    overlap = _overlap(earlier, later)
+    if overlap >= 0.9:
+        return {"relation": "repeats"}
+    if overlap >= 0.3 and ea.get("kind") in ("question", "action"):
+        return {"relation": "answers"}
+    if overlap >= 0.3 and _CHANGE.search(later) and (ea.get("kind") == "decision" or overlap >= 0.5):
+        return {"relation": "supersedes"}
+    return {"relation": "unrelated"}
+
+
+def heuristic_correction_op(user: str) -> dict[str, Any]:
+    s = _blocks(user, "instruction")[0][1].lower()
+    rules = [
+        (r"not part of", "not_part_of"),
+        (r"different|not the same", "not_same_as"),
+        (r"same person|same as|the same", "same_as"),
+        (r"should be called|rename", "rename"),
+        (r"reopen|active again", "reopen"),
+        (r"finished|closed|cancelled|close the", "close"),
+        (r"ignore|wrong|retract|disregard", "retract"),
+    ]
+    return {"op": next((op for pattern, op in rules if re.search(pattern, s)), "none")}
+
+
+def heuristic_correction_targets(user: str) -> dict[str, Any]:
+    op = _blocks(user, "operation")[0][1]
+    instruction = _blocks(user, "instruction")[0][1]
+    low = instruction.lower()
+    cands = _blocks(user, "candidate")
+    if op == "retract":
+        hits = [a["id"] for a, body in cands if _overlap(body, instruction) >= 0.25]
+        return {"targets": hits or [a["id"] for a, _ in cands[:1]]}
+    # Candidates in the order their names appear in the instruction.
+    placed = []
+    for a, body in cands:
+        at = [(low.find(n.lower()), -len(n)) for n in _names_of(body) if n.lower() in low]
+        if at:
+            placed.append((*min(at), a["id"]))
+    named = [cid for *_, cid in sorted(placed)]
+    page = re.search(r'<written_from_page id="([^"]+)"', user)
+    if not named and page:
+        named = [page.group(1)]  # "this is finished", written from that page
+    if op in ("same_as", "not_same_as", "not_part_of"):
+        return {"targets": named[:2]}
+    new_name = None
+    if op == "rename":
+        m = re.search(r"(?:should be called|renamed? to|rename it to)\s+(.+?)[.!]?$", instruction, re.I)
+        new_name = m.group(1).strip("\"' ") if m else None
+    return {"targets": named[:1], "new_name": new_name}
+
+
+def heuristic_now(user: str) -> dict[str, Any]:
+    stmts = _blocks(user, "statement")
+    if not stmts:
+        return {"text": "No recent activity.", "citations": []}
+    a, text = stmts[-1]
+    return {"text": text[:200], "citations": [a["note"]]}
 
 
 def heuristic_summary(user: str) -> dict[str, Any]:
-    prev = re.search(r"<previous_summary[^>]*>\n(.*?)\n</previous_summary>", user, re.S)
-    frags = re.findall(r'<fragment entry="([^"]+)"[^>]*>(.*?)</fragment>', user)
-    lines = [prev.group(1)] if prev else []
-    lines += [f"- {text} [{entry}]" for entry, text in frags]
-    return {"summary_md": "\n".join(lines), "citations": sorted({e for e, _ in frags})}
+    return {"sentences": [{"text": text, "citations": [a["note"]]} for a, text in _blocks(user, "statement")[-5:]]}
+
+
+def heuristic_check(user: str) -> dict[str, Any]:
+    return {"supported": "UNSUPPORTED" not in user}
+
+
+def heuristic_same(user: str) -> dict[str, Any]:
+    """Two records are the same when every word of one's name is in the other's (Jane, Jane Doe)."""
+    a, b = [[_words(n) for n in _names_of(body)] for _, body in _blocks(user, "record")[:2]]
+    return {"same": any(x and y and (x <= y or y <= x) for x in a for y in b)}
+
+
+def heuristic_stale(user: str) -> dict[str, Any]:
+    item = _blocks(user, "item")[0][1]
+    best = max(
+        ((a["id"], _overlap(item, text)) for a, text in _blocks(user, "later")), key=lambda x: x[1], default=None
+    )
+    if best and best[1] >= 0.3:
+        return {"verdict": "answered", "by": best[0]}
+    return {"verdict": "open", "by": None}
+
+
+def heuristic_profile(user: str) -> dict[str, Any]:
+    stmts = " ".join(text for _, text in _blocks(user, "statement"))
+    m = re.search(r"\bis (?:a|an|the|our) ([a-z][a-z -]{2,40}?)(?: (?:on|at|in|for)\b|[.,]|$)", stmts)
+    org = next((a["id"] for a, body in _blocks(user, "candidate") if any(n in stmts for n in _names_of(body))), None)
+    return {"role": m.group(1) if m else None, "org": org}
 
 
 def heuristic_brief(user: str) -> dict[str, Any]:
     out: dict[str, list] = {k: [] for k in BriefOutput.model_fields}
-    frags = [(_attrs(tag), text) for tag, text in re.findall(r"<fragment ([^>]*)>(.*?)</fragment>", user)]
-    for a, text in frags:
-        claim = {"text": text, "citations": [a["entry"]]}
-        if a.get("status") == "overcome_by_events":
-            out["overcome_by_events"].append(claim)
+    stmts = _blocks(user, "statement")
+    for a, text in stmts:
+        claim = {"text": text, "citations": [a["note"]]}
+        if a.get("status") == "superseded":
+            out["no_longer_applies"].append(claim)
             continue
         if a.get("kind") == "decision":
             out["recent_decisions"].append(claim)
-        if a.get("state") == "open":
+        if a.get("kind") in ("question", "action") and a.get("status") is None:
             out["open_items"].append(claim)
-        if a.get("status") == "speculative":
-            out["speculative"].append(claim)
         if a.get("new") == "yes":
             out["changed_since"].append(claim)
-    out["where_things_stand"] = [{"text": t, "citations": [a["entry"]]} for a, t in frags[-2:]]
+    out["where_things_stand"] = [{"text": t, "citations": [a["note"]]} for a, t in stmts[-2:]]
     return out
 
 
@@ -333,10 +448,8 @@ def heuristic_brief_route(user: str) -> dict[str, Any]:
     request = re.search(r"<request>(.*?)</request>", user, re.S)
     words = _words(request.group(1) if request else "")
     named = []
-    for tag, profile in re.findall(r"<candidate ([^>]*)>(.*?)</candidate>", user):
-        a = _attrs(tag)
-        fields = dict(part.split(": ", 1) for part in profile.split("; ") if ": " in part)
-        for name in [fields.get("name", ""), *fields.get("aliases", "").split(", ")]:
+    for a, body in _blocks(user, "candidate"):
+        for name in _names_of(body):
             if _words(name) and _words(name) <= words:
                 named.append((a["type"] != "thread", a["type"], name.lower(), a["id"]))
                 break
@@ -348,91 +461,33 @@ def heuristic_brief_route(user: str) -> dict[str, Any]:
 
 
 def heuristic_ask(user: str) -> dict[str, Any]:
-    excerpts = re.findall(r'<excerpt entry="([^"]+)"[^>]*>(.*?)</excerpt>', user, re.S)
-    if not excerpts:
+    stmts = [(a, t) for a, t in _blocks(user, "statement") if a.get("status") is None]
+    if not stmts:
         return {"claims": [], "insufficient": True}
     return {
-        "claims": [{"text": text.strip()[:200], "citations": [entry]} for entry, text in excerpts[:2]],
+        "claims": [{"text": text.strip()[:200], "citations": [a["note"]]} for a, text in stmts[:2]],
         "insufficient": False,
     }
 
 
-_CHANGE = re.compile(r"\b(now|instead|moved|changed|no longer|actually|cancel+ed|postponed|pushed)\b", re.I)
-
-
-def _overlap(a: str, b: str) -> float:
-    x, y = _words(a), _words(b)
-    return len(x & y) / len(x | y) if x and y else 0.0
-
-
-def heuristic_supersede(user: str) -> dict[str, Any]:
-    """A later fragment that shares most words with an earlier one and says something changed."""
-    frags = re.findall(r'<fragment id="([^"]+)"[^>]*>(.*?)</fragment>', user)
-    pairs = []
-    for i, (old_id, old) in enumerate(frags):
-        for new_id, new in frags[i + 1 :]:
-            if _CHANGE.search(new) and _overlap(old, new) >= 0.3:
-                pairs.append(
-                    {"older": old_id, "newer": new_id, "reason": "a later fragment changes it", "confidence": 0.8}
-                )
-                break
-    return {"pairs": pairs}
-
-
-def heuristic_sweep(user: str) -> dict[str, Any]:
-    items = [(_attrs(tag), text) for tag, text in re.findall(r"<item ([^>]*)>(.*?)</item>", user)]
-    later = [(_attrs(tag), text) for tag, text in re.findall(r"<later ([^>]*)>(.*?)</later>", user)]
-    checks = []
-    for a, text in items:
-        best = max(
-            ((la, _overlap(text, lt)) for la, lt in later if la.get("item") == a["id"]),
-            key=lambda x: x[1],
-            default=(None, 0.0),
-        )
-        if best[0] is not None and best[1] >= 0.3:
-            ev = best[0]
-            checks.append(
-                {
-                    "item": a["id"],
-                    "verdict": "probably_resolved",
-                    "evidence": ev["id"],
-                    "reason": "a later fragment covers it",
-                    "confidence": 0.8,
-                    "citations": [a["entry"], ev["entry"]],
-                }
-            )
-        else:
-            checks.append(
-                {
-                    "item": a["id"],
-                    "verdict": "still_open",
-                    "reason": "nothing later covers it",
-                    "citations": [a["entry"]],
-                }
-            )
-    return {"checks": checks}
-
-
-def heuristic_now(user: str) -> dict[str, Any]:
-    frags = re.findall(r'<fragment entry="([^"]+)"[^>]*>(.*?)</fragment>', user)
-    if not frags:
-        return {"line": "No recent activity.", "citations": []}
-    entry, text = frags[-1]
-    return {"line": text[:160], "citations": [entry]}
-
-
 DEFAULT_RESPONDERS: dict[str, Responder] = {
-    "extract": heuristic_extract,
-    "resolve": heuristic_resolve,
-    "answers": heuristic_answers,
-    "thread_summary": heuristic_summary,
+    "split": heuristic_split,
+    "classify": heuristic_classify,
+    "names": heuristic_names,
+    "link": heuristic_link,
+    "file": heuristic_file,
+    "relate": heuristic_relate,
+    "correction_op": heuristic_correction_op,
+    "correction_targets": heuristic_correction_targets,
+    "now": heuristic_now,
+    "summary": heuristic_summary,
+    "check": heuristic_check,
+    "dream_same": heuristic_same,
+    "dream_stale": heuristic_stale,
+    "dream_profile": heuristic_profile,
     "brief": heuristic_brief,
     "brief_route": heuristic_brief_route,
     "ask": heuristic_ask,
-    "dream_supersede": heuristic_supersede,
-    "dream_answers": heuristic_answers,
-    "dream_sweep": heuristic_sweep,
-    "dream_now": heuristic_now,
 }
 
 

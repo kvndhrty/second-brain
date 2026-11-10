@@ -1,408 +1,362 @@
-"""The full pipeline against the scripted fake LLM: no network, no model."""
+"""The layers that run when a note arrives, against the scripted fake model.
+
+The fake's rules (see brain.core.llm.fake): sentences become statements;
+capitalized words are people; `[[Name]]` names a thread; a later statement
+that shares most words with an open question answers it; one that shares
+words with a decision and says "instead", "moved", or "now" supersedes it.
+"""
 
 from __future__ import annotations
 
-import json
-from datetime import datetime, timedelta
-
-import pytest
-
-from brain.core import keys, review
-from brain.core.formats.entity import Person, Theme, Thread
-from brain.core.formats.sidecars import Extraction, ThreadSummary
+from brain.core import keys
+from brain.core.formats.records import LinksFile, SplitFile, StateFile
 from brain.core.index.db import snapshot
-from brain.core.llm.fake import heuristic_extract
 from brain.core.llm.models import LLMError
-from brain.core.pipeline.match import assign_ids
-from brain.core.pipeline.text import locate_quote
-from brain.core.services import FragmentChange
-from tests.conftest import FAKE_LLM_SETTINGS, make_brain
+from brain.core.llm.prompts import load_prompt
+from tests.conftest import FAKE_LLM_SETTINGS, entity, make_brain, set_now, statements, write
 
-FIRST = (
-    "Met Jane Doe and Mike from PT about the [[GPU quota migration]]. "
-    "We decided to move the eval cluster in December #capacity-planning. "
-    "Does the vendor support MIG on the new nodes?"
+KICKOFF = (
+    "Met Jane Doe about the [[GPU quota migration]]. We decided to migrate in December. Does MIG work on new nodes?"
 )
-SECOND = "Confirmed the vendor does support MIG on the new nodes. Talked with Mike about the [[GPU quota migration]]."
 
 
-def jot(b, text):
-    entry = b.jot(text).entry
-    report = b.process(entry.id)
-    assert not report.failed, report.failed
-    return entry.id
+def kinds(brain, note_id):
+    return [s.kind for s in statements(brain, note_id)]
 
 
-def rows(b, sql, *args):
-    return [tuple(r) for r in b.db.conn.execute(sql, args).fetchall()]
+def thread_page(brain, name="GPU quota migration"):
+    return brain.page(name)
 
 
-def review_kinds(b):
-    return sorted((i.kind, i.payload.get("surface") or i.payload.get("name") or "") for i in b.review_items())
+# --- layers 1 to 5 -------------------------------------------------------------------
 
 
-def test_full_pipeline(brain):
-    eid = jot(brain, FIRST)
-    assert rows(brain, "SELECT next_step FROM entries WHERE id = ?", eid) == [("done",)]
-    kinds = [r[0] for r in rows(brain, "SELECT kind FROM fragments WHERE entry_id = ? ORDER BY id", eid)]
-    assert kinds == ["observation", "decision", "question"]
-    assert rows(brain, "SELECT id, state FROM threads") == [("gpu-quota-migration", "proposed")]
-    assert ("theme:capacity-planning",) in rows(brain, "SELECT id FROM nodes WHERE type = 'theme'")
-    assert review_kinds(brain) == [
-        ("new_org", "MIG"),
-        ("new_org", "PT"),
-        ("new_person", "Jane Doe"),
-        ("new_person", "Mike"),
-        ("proposed_theme", "capacity planning"),
-        ("proposed_thread", "GPU quota migration"),
+def test_note_becomes_statements_names_and_a_thread(brain):
+    nid = write(brain, KICKOFF)
+    stmts = statements(brain, nid)
+    assert [s.text for s in stmts] == [
+        "Met Jane Doe about the GPU quota migration.",
+        "We decided to migrate in December.",
+        "Does MIG work on new nodes?",
     ]
-    summary = ThreadSummary.parse(brain.storage.get(keys.thread_summary_key("gpu-quota-migration")), where="x")
-    assert summary.through_entry == eid and summary.citations == [eid]
-    assert rows(brain, "SELECT summary_through, last_entry FROM threads") == [(eid, eid)]
-    assert brain.llm.prompts_called() == ["extract", "thread_summary"]
+    assert kinds(brain, nid) == ["fact", "decision", "question"]
+    assert [s.id for s in stmts] == [f"s-{nid[2:]}-0{i}" for i in (1, 2, 3)]
+    jane = entity(brain, "Jane Doe")
+    assert jane.type == "person" and jane.status == "active"  # a full name gets a page at once
+    thread = entity(brain, "GPU quota migration")
+    assert thread.type == "thread" and thread.status == "provisional"  # one note is not yet a thread
+    assert {s.thread for s in stmts} == {thread.id}
+    assert entity(brain, "MIG").status == "provisional"
+    assert brain.status()["pending"] == 0
 
 
-def test_processing_again_does_nothing(brain):
-    eid = jot(brain, FIRST)
-    calls = len(brain.llm.calls)
-    report = brain.process(eid)
-    assert report.entries[0].steps == [] and report.threads == []
-    assert len(brain.llm.calls) == calls
-    assert brain.process_pending().entries == []
+def test_every_layer_file_is_written_with_its_prompt_stamp(brain):
+    nid = write(brain, KICKOFF)
+    for layer in keys.LAYERS:
+        data = brain.storage.get(keys.layer_key(nid, layer))
+        assert b'"input_hash"' in data and b'"prompts"' in data, layer
+    split = SplitFile.parse(brain.storage.get(keys.layer_key(nid, "split")), where="split")
+    assert split.prompts == [load_prompt("split").stamp] and split.model == "fake-small"
+    assert all(s.quote in KICKOFF for s in split.statements)
 
 
-def test_failure_leaves_entry_pending_and_resumes(brain, monkeypatch):
-    entry = brain.jot(FIRST).entry
+def test_second_note_confirms_the_thread_and_gives_it_a_page(brain):
+    write(brain, KICKOFF)
+    assert not list(brain.storage.list("wiki/threads/"))
+    write(brain, "Jane Doe needs to file the quota ticket for the [[GPU quota migration]].", 1)
+    assert entity(brain, "GPU quota migration").status == "active"
+    page = brain.storage.get("wiki/threads/gpu-quota-migration.md").decode()
+    assert "# GPU quota migration" in page and "## Open" in page and "to do · Jane Doe needs to file" in page
+    assert "[[jane-doe|Jane Doe]]" in page
+    assert "GPU quota migration (thread) appeared in a second note" in " ".join(e.text for e in brain.log())
 
-    def broken(texts):
-        raise LLMError("embedding endpoint is down")
 
-    monkeypatch.setattr(brain.llm, "_embedder", broken)
-    report = brain.process(entry.id)
-    assert report.entries[0].steps == ["extract"]
-    assert "embedding endpoint is down" in report.entries[0].error
-    assert rows(brain, "SELECT next_step FROM entries") == [("embed",)]
-    assert brain.failures()[entry.id]["step"] == "embed"
-    monkeypatch.undo()
-    extract_calls = brain.llm.prompts_called().count("extract")
+def test_short_name_links_to_the_known_person(brain):
+    write(brain, "Met Jane Doe about budgets.")
+    nid = write(brain, "Then Jane sent the numbers.", 1)
+    links = LinksFile.parse(brain.storage.get(keys.layer_key(nid, "links")), where="links").links
+    assert [(ln.surface, ln.entity, ln.how) for ln in links] == [("Jane", "jane-doe", "model")]
+    assert "Jane" in brain.page("Jane Doe").names
+    assert len(brain.world().roots("person")) == 1
+    # The name is now known, so the next mention is settled by code, without a model call.
+    asked = brain.llm.prompts_called().count("link")
+    nid = write(brain, "Later Jane approved it.", 2)
+    links = LinksFile.parse(brain.storage.get(keys.layer_key(nid, "links")), where="links").links
+    assert links[0].how == "exact"
+    assert brain.llm.prompts_called().count("link") == asked
+
+
+def test_single_name_person_is_provisional_until_a_second_note(brain):
+    write(brain, "Talked with Priya today.")
+    assert entity(brain, "Priya").status == "provisional"
+    assert brain.pages("person") == []
+    write(brain, "Called Priya again.", 1)
+    assert entity(brain, "Priya").status == "active"
+    assert [p.name for p in brain.pages("person")] == ["Priya"]
+
+
+def test_statement_without_a_thread_is_left_unfiled(brain):
+    nid = write(brain, "The office is closed on Friday.")
+    assert [s.thread for s in statements(brain, nid)] == [None]
+    assert brain.world().roots("thread") == []
+
+
+# --- layer 6: later notes change earlier ones -------------------------------------------
+
+
+def test_later_note_answers_an_open_question(brain):
+    write(brain, KICKOFF)
+    assert [s.text for s in brain.world().open_items()] == ["Does MIG work on new nodes?"]
+    write(brain, "Confirmed: MIG does work on new nodes for the [[GPU quota migration]].", 2)
+    assert brain.world().open_items() == []
+    q = next(s for s in thread_page(brain).history if s.kind == "question")
+    assert q.status == "answered" and q.replaced_by.startswith("Confirmed: MIG does work")
+
+
+def test_later_note_supersedes_a_decision(brain):
+    write(brain, "We decided to migrate the [[GPU quota migration]] in December.")
+    write(brain, "We decided to migrate the [[GPU quota migration]] in January instead.", 5)
+    page = thread_page(brain)
+    assert [s.text for s in page.decided] == ["We decided to migrate the GPU quota migration in January instead."]
+    old = next(s for s in page.history if "December" in s.text)
+    assert old.status == "superseded" and "January" in old.replaced_by
+    md = brain.storage.get("wiki/threads/gpu-quota-migration.md").decode()
+    assert "~~We decided to migrate the GPU quota migration in December.~~ Replaced by:" in md
+    assert any(e.kind == "supersedes" for e in brain.log())
+
+
+def test_repeated_statement_is_recorded_once_on_the_page(brain):
+    write(brain, "The [[Vendor evaluation]] covers three storage vendors.")
+    write(brain, "The [[Vendor evaluation]] covers three storage vendors.", 1)
+    assert len(thread_page(brain, "Vendor evaluation").history) == 1
+
+
+# --- layer 6b: corrections are notes ---------------------------------------------------
+
+
+def test_same_person_note_merges_two_people(brain):
+    write(brain, "Met Dana Kim about the audit.")
+    write(brain, "Robin Kimura sent the audit report.", 1)
+    assert len(brain.world().roots("person")) == 2
+    nid = write(brain, "Dana Kim and Robin Kimura are the same person.", 2)
+    assert kinds(brain, nid) == ["correction"]
+    (person,) = brain.world().roots("person")
+    assert person.name == "Dana Kim" and "Robin Kimura" in brain.page("Dana Kim").names
+    assert len(brain.page("Robin Kimura").history) == 2  # both names lead to one page with both statements
+    assert not brain.storage.exists("wiki/people/robin-kimura.md")
+    assert brain.vault.get_entity("robin-kimura").set_by["merged_into"] == f"note:{nid}"
+
+
+def test_not_the_same_note_undoes_a_merge_and_blocks_it(brain):
+    write(brain, "Met Dana Kim about the audit.")
+    write(brain, "Robin Kimura sent the audit report.", 1)
+    write(brain, "Dana Kim and Robin Kimura are the same person.", 2)
+    write(brain, "Dana Kim is different from Robin Kimura.", 3)
+    assert sorted(p.name for p in brain.world().roots("person")) == ["Dana Kim", "Robin Kimura"]
+    assert brain.vault.get_entity("dana-kim").not_same_as == ["robin-kimura"]
+    assert [s.text for s in brain.page("Robin Kimura").history] == ["Robin Kimura sent the audit report."]
+
+
+def test_rename_note_keeps_the_old_name(brain):
+    write(brain, "Started the [[Quota thing]] today.")
+    write(brain, "More on the [[Quota thing]] today.", 1)
+    write(brain, "The Quota thing should be called GPU quota migration.", 2)
+    page = brain.page("Quota thing")
+    assert page.name == "GPU quota migration" and page.names == ["Quota thing"] and page.id == "quota-thing"
+    assert brain.vault.get_entity("quota-thing").set_by["name"].startswith("note:")
+
+
+def test_close_and_reopen_notes(brain):
+    write(brain, KICKOFF)
+    write(brain, "Jane Doe needs to file the quota ticket for the [[GPU quota migration]].", 1)
+    write(brain, "The GPU quota migration is finished.", 2)
+    page = thread_page(brain)
+    assert page.status == "closed" and page.now is None and page.open == []
+    assert brain.active_threads() == [] and brain.world().open_items() == []
+    assert "Everything below is history" in brain.storage.get("wiki/threads/gpu-quota-migration.md").decode()
+    # A thread a note closed stays closed when new statements arrive.
+    write(brain, "One more remark on the [[GPU quota migration]].", 3)
+    assert thread_page(brain).status == "closed"
+    write(brain, "Reopen the GPU quota migration.", 4)
+    assert thread_page(brain).status == "active"
+
+
+def test_retract_note_hides_statements_but_keeps_the_note(brain):
+    wrong = write(brain, "The [[Outage review]] found the cause was a bad disk.")
+    write(brain, "The [[Outage review]] meets again on Monday.", 1)
+    nid = write(brain, "Ignore what I wrote: the cause was a bad disk is wrong.", 2)
+    state = StateFile.parse(brain.storage.get(keys.layer_key(nid, "state")), where="state")
+    assert [op.op for op in state.operations] == ["retract"]
+    assert [s.text for s in brain.page("Outage review").history] == ["The Outage review meets again on Monday."]
+    assert "bad disk" not in brain.storage.get("wiki/threads/outage-review.md").decode()
+    assert brain.note(wrong).body.startswith("The [[Outage review]] found")  # the note itself is untouched
+    assert brain.note(wrong).statements[0].status == "retracted"
+    answer = brain.ask("What was the cause of the outage?")
+    assert all("bad disk" not in c.text for c in answer.claims)
+
+
+def test_retracting_the_retraction_restores_the_statements(brain):
+    write(brain, "The [[Outage review]] found the cause was a bad disk.")
+    write(brain, "The [[Outage review]] meets again on Monday.", 1)
+    write(brain, "Ignore what I wrote: the cause was a bad disk is wrong.", 2)
+    write(brain, "Ignore the note that said ignore what I wrote the cause was a bad disk is wrong.", 3)
+    assert any("bad disk" in s.text for s in brain.page("Outage review").history)
+
+
+def test_not_part_of_note_moves_statements_to_their_own_thread(brain):
+    write(brain, "The [[GPU quota migration]] needs the #labels work first.")
+    write(brain, "The #labels schema for the [[GPU quota migration]] is drafted.", 1)
+    write(brain, "The quota request for the [[GPU quota migration]] went in.", 2)
+    write(brain, "The labels are not part of the GPU quota migration.", 3)
+    assert [s.text for s in brain.page("GPU quota migration").history] == [
+        "The quota request for the GPU quota migration went in."
+    ]
+    labels = [p for p in brain.pages("thread") if p.name == "labels"]
+    assert labels and len(brain.page(labels[0].id).history) == 2
+
+
+def test_this_is_wrong_note_is_read_as_a_correction_to_that_page(brain):
+    write(brain, KICKOFF)
+    write(brain, "Jane Doe needs to file the quota ticket for the [[GPU quota migration]].", 1)
+    nid = write(brain, "This is finished.", 2, about="gpu-quota-migration")
+    assert brain.note(nid).about == "gpu-quota-migration"
+    assert thread_page(brain).status == "closed"
+
+
+def test_a_correction_nobody_can_place_is_logged_not_applied(brain):
+    write(brain, "Reopen the thing we talked about.")
+    assert any(e.kind == "ignored" for e in brain.log())
+
+
+# --- reliability ---------------------------------------------------------------------
+
+
+def test_running_again_calls_no_model(brain):
+    nid = write(brain, KICKOFF)
+    before = len(brain.llm.calls)
+    result = brain.process(nid).notes[0]
+    assert result.layers == [] and result.error is None
+    assert len(brain.llm.calls) == before
+
+
+def test_invalid_model_output_falls_back_and_does_not_block_the_note(local_storage, state, tmp_path):
+    bad = {
+        "split": {"statements": [{"text": "Invented.", "quote": "words that are not in the note"}]},
+        "classify": {"kind": "nonsense"},
+        "names": {"names": [{"name": "Nobody Mentioned", "type": "person"}]},
+        "file": {"choice": "not-a-candidate"},
+    }
+    b = make_brain(local_storage, state, tmp_path, fake_llm=True, responders=bad, llm=FAKE_LLM_SETTINGS)
+    set_now(b)
+    nid = write(b, "Budget review is on Friday. Send the numbers before then.")
+    stmts = statements(b, nid)
+    # Split fell back to one statement per sentence; classify to "fact"; names to none; filing to unfiled.
+    assert [s.text for s in stmts] == ["Budget review is on Friday.", "Send the numbers before then."]
+    assert {s.kind for s in stmts} == {"fact"} and {s.thread for s in stmts} == {None}
+    assert b.world().roots() == []
+    assert b.status()["pending"] == 0 and b.failures() == {}
+    assert sum(e.kind == "fallback" for e in b.log()) >= 4
+    b.close()
+
+
+def test_escalation_retries_on_the_strong_model(local_storage, state, tmp_path):
+    seen = []
+
+    def classify(user: str) -> dict:
+        seen.append(user)
+        return {"kind": "nonsense"}
+
+    cfg = FAKE_LLM_SETTINGS | {"strong_model": "fake-strong", "escalate": "strong"}
+    b = make_brain(local_storage, state, tmp_path, fake_llm=True, responders={"classify": classify}, llm=cfg)
+    set_now(b)
+    write(b, "Budget review is on Friday.")
+    models = {m for (_, m) in b.llm._models}  # (role, model name) of every model the run used
+    assert "fake-strong" in models and "fake-small" in models
+    b.close()
+
+
+def test_endpoint_failure_leaves_the_note_pending(local_storage, state, tmp_path):
+    def down(_user: str) -> dict:
+        raise LLMError("gateway is down")
+
+    b = make_brain(local_storage, state, tmp_path, fake_llm=True, responders={"classify": down}, llm=FAKE_LLM_SETTINGS)
+    set_now(b)
+    nid = b.jot("Budget review is on Friday.").note.id
+    result = b.process(nid).notes[0]
+    assert result.error and result.error.startswith("classify:")
+    assert b.status()["pending"] == 1 and nid in b.failures()
+    b.llm.responders.pop("classify")
+    from brain.core.llm.fake import DEFAULT_RESPONDERS
+
+    b.llm.responders["classify"] = DEFAULT_RESPONDERS["classify"]
+    assert b.process_pending().failed == []
+    assert b.status()["pending"] == 0 and b.failures() == {}
+    b.close()
+
+
+def test_page_sentence_that_fails_the_check_is_dropped(local_storage, state, tmp_path):
+    responders = {"now": {"text": "UNSUPPORTED claim about Mars.", "citations": []}}
+
+    def now(user: str) -> dict:
+        import re
+
+        note = re.search(r'note="([^"]+)"', user).group(1)
+        return {"text": "UNSUPPORTED claim about Mars.", "citations": [note]}
+
+    responders["now"] = now
+    b = make_brain(local_storage, state, tmp_path, fake_llm=True, responders=responders, llm=FAKE_LLM_SETTINGS)
+    set_now(b)
+    write(b, KICKOFF)
+    write(b, "Jane Doe needs to file the quota ticket for the [[GPU quota migration]].", 1)
+    assert b.page("GPU quota migration").now is None  # the check layer rejected it, so nothing was written
+    b.close()
+
+
+# --- the wiki and the index ------------------------------------------------------------
+
+
+def test_wiki_index_and_log_are_written(brain):
+    write(brain, KICKOFF)
+    write(brain, "Jane Doe needs to file the quota ticket for the [[GPU quota migration]].", 1)
+    index = brain.storage.get(keys.WIKI_INDEX).decode()
+    assert "[[gpu-quota-migration|GPU quota migration]]: " in index and "[[jane-doe|Jane Doe]]" in index
+    log = brain.storage.get(keys.WIKI_LOG).decode()
+    assert "New person: Jane Doe" in log and "## 2026-10-02" in log
+    person = brain.storage.get("wiki/people/jane-doe.md").decode()
+    assert person.startswith("---\nid: jane-doe\ntype: person\n")
+
+
+def test_markdown_file_saved_into_notes_becomes_a_note(brain):
+    brain.storage.put("notes/standup monday.md", b"Jane Doe is out this week.\n")
     report = brain.process_pending()
-    assert report.entries[0].steps == ["embed", "resolve"]
-    assert brain.llm.prompts_called().count("extract") == extract_calls  # not extracted twice
-    assert brain.failures() == {}
+    assert len(report.notes) == 1 and report.failed == []
+    (note,) = brain.recent_notes()
+    assert note.label == "standup monday" and note.done
+    assert brain.note(note.id).body == "Jane Doe is out this week.\n"
+    assert not brain.storage.exists("notes/standup monday.md")
+    assert entity(brain, "Jane Doe")
 
 
-def test_edit_keeps_fragment_ids_and_decisions(brain):
-    eid = jot(brain, FIRST)
-    question = f"f-{eid}-03"
-    brain.set_fragment(question, FragmentChange(status="overcome_by_events", obe_reason="vendor left"))
-    entry, key = brain.vault.get_entry(eid)
-    entry.body = entry.body.replace("Met Jane Doe", "Met with Jane Doe") + "\nWe will revisit quotas in January."
-    brain.vault.update_entry(entry, key)
-    assert rows(brain, "SELECT next_step FROM entries") == [("extract",)]
-    report = brain.process(eid)
-    assert report.entries[0].steps == ["extract", "embed", "resolve"]
-    frags = dict(rows(brain, "SELECT id, text FROM fragments WHERE entry_id = ?", eid))
-    assert set(frags) == {f"f-{eid}-01", f"f-{eid}-02", question, f"f-{eid}-04"}
-    assert "Met with Jane Doe" in frags[f"f-{eid}-01"]
-    assert rows(brain, "SELECT status, obe_reason FROM fragments WHERE id = ?", question) == [
-        ("overcome_by_events", "vendor left")
-    ]
-    assert not [i for i in brain.review_items() if i.kind == "orphaned_decision"]
-
-
-def test_reextract_reuses_ids_and_reports_orphans(brain):
-    eid = jot(brain, FIRST)
-    brain.set_fragment(f"f-{eid}-02", FragmentChange(someday=True))
-    before = sorted(r[0] for r in rows(brain, "SELECT id FROM fragments"))
-    brain.reextract([eid])
-    assert sorted(r[0] for r in rows(brain, "SELECT id FROM fragments")) == before
-    assert rows(brain, "SELECT someday FROM fragments WHERE id = ?", f"f-{eid}-02") == [(1,)]
-    # A model that now finds nothing: the decision has no fragment to apply to.
-    brain.llm.responders["extract"] = {"fragments": []}
-    brain.reextract([eid])
-    assert [i.payload["fragment"] for i in brain.review_items() if i.kind == "orphaned_decision"] == [f"f-{eid}-02"]
-
-
-def test_known_alias_links_without_review(brain):
-    brain.vault.put_entity(Person(id="jane-doe", name="Jane Doe", aliases=["Jane"]))
-    eid = jot(brain, "Talked with Jane about the rollout.")
-    assert rows(brain, "SELECT dst, origin, confirmed FROM edges WHERE type = 'mentions'") == [
-        ("person:jane-doe", "llm", 0)
-    ]
-    assert not [i for i in brain.review_items() if i.entry_id == eid]
-    assert "resolve" not in brain.llm.prompts_called()  # an exact alias needs no model call
-
-
-def test_shared_first_name_goes_to_review(brain):
-    brain.vault.put_entity(Person(id="mike-chen", name="Mike Chen"))
-    brain.vault.put_entity(Person(id="mike-ross", name="Mike Ross"))
-    jot(brain, "Paired with Mike on the flaky test.")
-    assert "resolve" in brain.llm.prompts_called()
-    (item,) = [i for i in brain.review_items() if i.kind == "ambiguous_mention"]
-    assert {c["entity_id"] for c in item.payload["candidates"]} == {"mike-chen", "mike-ross"}
-    assert not rows(brain, "SELECT * FROM edges WHERE type = 'mentions'")
-
-
-def test_model_must_pick_top_candidate_confidently(local_storage, state, tmp_path):
-    def picks_second(user):
-        return {"choices": [{"key": "m1", "choice": "mike-ross", "confidence": 0.99, "reason": "?"}]}
-
-    b = make_brain(
-        local_storage, state, tmp_path, fake_llm=True, responders={"resolve": picks_second}, llm=FAKE_LLM_SETTINGS
-    )
-    try:
-        b.vault.put_entity(Person(id="mike-chen", name="Mike Chen", aliases=["Mikey"]))
-        b.vault.put_entity(Person(id="mike-ross", name="Mike Ross"))
-        jot(b, "Paired with Mikey C on the flaky test.")
-        res = json.loads(b.storage.get(keys.resolution_key(b.db.conn.execute("SELECT id FROM entries").fetchone()[0])))
-        decisions = {(m["surface"], m["decision"]) for m in res["mentions"]}
-        assert ("Mikey", "pending") in decisions or ("Mikey C", "pending") in decisions
-    finally:
-        b.close()
-
-
-def test_create_person_applies_to_all_entries_and_teaches_alias(brain):
-    e1 = jot(brain, "Lunch with Zed about the cache.")
-    e2 = jot(brain, "Reviewed the cache design with Zed.")
-    item = next(i for i in brain.review_items() if i.payload.get("surface") == "Zed")
-    assert item.others == 1
-    brain.resolve_review(item.id, review.CreateEntity("Zed Shaw", role="Staff engineer"))
-    person = brain.vault.get_entity("person", "zed-shaw")
-    assert person.aliases == ["Zed"] and person.role == "Staff engineer"
-    assert not [i for i in brain.review_items() if i.payload.get("surface") == "Zed"]
-    assert {r[0] for r in rows(brain, "SELECT entry_id FROM edges WHERE dst = 'person:zed-shaw'")} == {e1, e2}
-    jot(brain, "Zed fixed it.  Then Zed shipped.")
-    assert len(rows(brain, "SELECT * FROM edges WHERE dst = 'person:zed-shaw'")) == 3  # new entry auto-links
-
-
-def test_ignore_mention(brain):
-    jot(brain, "Spoke with Nobody about it.")
-    item = next(i for i in brain.review_items() if i.payload.get("surface") == "Nobody")
-    brain.resolve_review(item.id, review.IgnoreMention())
-    assert not [i for i in brain.review_items() if i.payload.get("surface") == "Nobody"]
-    d = brain.vault.get_decisions(item.entry_id)
-    assert d.mentions["person"] == {"Nobody": None}
-
-
-def test_proposed_thread_merge_and_brief_follows_merge(brain):
-    jot(brain, "Started the [[Quota work]] today.")
-    jot(brain, "More progress on [[GPU quotas]].")
-    items = {i.payload["name"]: i for i in brain.review_items() if i.kind == "proposed_thread"}
-    brain.resolve_review(items["GPU quotas"].id, review.AcceptProposed(rename="GPU quota migration"))
-    brain.resolve_review(items["Quota work"].id, review.MergeProposed("gpu-quotas"))
-    target = brain.vault.get_entity("thread", "gpu-quotas")
-    assert target.name == "GPU quota migration" and "Quota work" in target.aliases and target.state == "active"
-    assert brain.vault.get_entity("thread", "quota-work").state == "merged"
-    b = brain.brief("GPU quota migration")
-    assert b.target == "thread:gpu-quotas" and b.fragment_count == 2
-    assert [t.id for t in brain.active_threads()] == ["gpu-quotas"]
-
-
-def test_answer_proposal_accept_closes_question(brain):
-    jot(brain, FIRST)
-    e2 = jot(brain, SECOND)
-    (item,) = [i for i in brain.review_items() if i.kind == "proposed_answer"]
-    assert item.entry_id == e2
-    brain.resolve_review(item.id, review.AnswerDecision(accept=True))
-    q = item.payload["answers"]
-    assert rows(brain, "SELECT state FROM fragments WHERE id = ?", q) == [("closed",)]
-    assert rows(brain, "SELECT type, origin FROM edges WHERE dst = ? AND type != 'contains'", f"frag:{q}") == [
-        ("answers", "user")
-    ]
-    assert not [i for i in brain.review_items() if i.kind == "proposed_answer"]
-
-
-def test_reject_answer_is_not_asked_again(brain):
-    jot(brain, FIRST)
-    jot(brain, SECOND)
-    (item,) = [i for i in brain.review_items() if i.kind == "proposed_answer"]
-    brain.resolve_review(item.id, review.AnswerDecision(accept=False))
-    assert not [i for i in brain.review_items() if i.kind == "proposed_answer"]
-    assert rows(brain, "SELECT state FROM fragments WHERE id = ?", item.payload["answers"]) == [("open",)]
-
-
-def test_status_changes_survive_reindex(brain):
-    eid = jot(brain, FIRST)
-    brain.set_fragment(f"f-{eid}-03", FragmentChange(state="closed", closed_note="asked the vendor"))
-    brain.set_fragment(f"f-{eid}-02", FragmentChange(status="speculative"))
+def test_reindex_gives_the_same_index(brain):
+    write(brain, KICKOFF)
+    write(brain, "Confirmed: MIG does work on new nodes for the [[GPU quota migration]].", 2)
+    write(brain, "The GPU quota migration is finished.", 3)
     before = snapshot(brain.db)
     brain.reindex()
     assert snapshot(brain.db) == before
-    assert rows(brain, "SELECT state, closed_note FROM fragments WHERE id = ?", f"f-{eid}-03") == [
-        ("closed", "asked the vendor")
-    ]
 
 
-def test_reindex_after_pipeline_needs_no_model(brain):
-    jot(brain, FIRST)
-    jot(brain, SECOND)
-    before = snapshot(brain.db)
-    calls = len(brain.llm.calls), len(brain.llm.embed_calls)
-    brain.reindex()
-    assert snapshot(brain.db) == before
-    assert (len(brain.llm.calls), len(brain.llm.embed_calls)) == calls
-
-
-def test_extract_retries_on_unknown_thread_id(local_storage, state, tmp_path):
-    attempts = []
-
-    def flaky(user):
-        attempts.append(user)
-        out = heuristic_extract(user)
-        if len(attempts) == 1:
-            out["fragments"][0]["threads"] = [{"thread_id": "no-such-thread", "weight": 0.5}]
-        return out
-
-    b = make_brain(local_storage, state, tmp_path, fake_llm=True, responders={"extract": flaky}, llm=FAKE_LLM_SETTINGS)
-    try:
-        jot(b, "Something happened.")
-        assert len(attempts) == 2
-    finally:
-        b.close()
-
-
-def test_ask_cites_sources_and_rejects_invented_citations(local_storage, state, tmp_path):
-    b = make_brain(local_storage, state, tmp_path, fake_llm=True, llm=FAKE_LLM_SETTINGS)
-    try:
-        e1 = jot(b, FIRST)
-        answer = b.ask("does the vendor support MIG?")
-        assert answer.claims and all(c.citations for c in answer.claims)
-        assert e1 in answer.sources and answer.sources[e1].date
-        b.llm.responders["ask"] = {"claims": [{"text": "made up", "citations": ["e-bogus"]}]}
-        with pytest.raises(LLMError):
-            b.ask("does the vendor support MIG?")
-    finally:
-        b.close()
-
-
-def test_brief_records_time_and_marks_new_fragments(brain):
-    jot(brain, FIRST)
-    first = brain.brief("GPU quota migration")
-    assert first.since is None and first.recorded
-    later = datetime.now().astimezone() + timedelta(minutes=5)
-    brain.vault.clock = lambda: later  # the second entry is written after the first brief
-    jot(brain, SECOND)
-    second = brain.brief("gpu-quota-migration")
-    assert second.since is not None
-    sent = brain.llm.calls[-1][1]
-    assert 'new="yes"' in sent and 'new="no"' in sent
-    assert second.output.changed_since
-
-
-def test_brief_on_person_and_ambiguous_target(brain):
-    brain.vault.put_entity(Person(id="jane-doe", name="Jane Doe", aliases=["Jane"]))
-    brain.vault.put_entity(Thread(id="jane", name="Jane"))
-    jot(brain, "Talked with Jane Doe about evals.")
-    from brain.core.answers import AmbiguousTarget
-
-    with pytest.raises(AmbiguousTarget) as e:
-        brain.brief("Jane")
-    assert e.value.question == "Which jane do you mean?"
-    assert "person:jane-doe" in str(e.value) and "thread:jane" in str(e.value)
-    b = brain.brief("person:jane-doe")
-    assert b.type == "person" and b.fragment_count == 1
-
-
-def test_a_theme_named_like_its_thread_resolves_to_the_thread(brain):
-    brain.vault.put_entity(Thread(id="gpu-quota-migration", name="GPU quota migration"))
-    brain.vault.put_entity(Theme(id="gpu-quota-migration", name="GPU quota migration", kind="domain"))
-    jot(brain, "Paired on the [[GPU quota migration]] alerts.")
-    for text in ("gpu-quota-migration", "GPU quota migration"):
-        (match,) = brain.find_targets(text)
-        assert match.node_id == "thread:gpu-quota-migration"
-    assert brain.brief("gpu-quota-migration").type == "thread"
-    assert len(brain.find_targets("theme:gpu-quota-migration")) == 1
-
-
-def test_themes_that_repeat_the_thread_name_are_dropped(brain):
-    jot(brain, "Kicked off the [[Billing migration]] #billing-migration #dual-write.")
-    jot(brain, "More [[Billing migration]] planning #billing-migration.")
-    themes = {r[0] for r in brain.db.conn.execute("SELECT label FROM nodes WHERE type = 'theme'")}
-    assert themes == {"dual write"}
-
-
-def test_pending_names_are_offered_and_linkable_once_created(brain):
-    first = jot(brain, "Paired with Priya Raman on the rollout.")
-    jot(brain, "Today Priya reviewed the rollout doc.")
-    (_, sent) = [c for c in brain.llm.calls if c[0] == "extract"][-1]
-    assert "names awaiting review (not yet confirmed): Priya Raman (person)" in sent
-
-    (full,) = [i for i in brain.review_items() if i.payload.get("surface") == "Priya Raman"]
-    assert full.entry_id == first
-    brain.resolve_review(full.id, review.CreateEntity("Priya Raman"))
-    (short,) = [i for i in brain.review_items() if i.payload.get("surface") == "Priya"]
-    assert [c["entity_id"] for c in short.payload["candidates"]] == ["priya-raman"]
-
-
-def _routes(brain):
-    return [user for name, user in brain.llm.calls if name == "brief_route"]
-
-
-def test_a_request_in_plain_words_is_routed_to_its_thread(brain):
-    jot(brain, "We decided the [[Billing migration]] cutover is in March.")
-    jot(brain, "Paired on the [[GPU quota migration]] alerts.")
-    b = brain.brief("where are we on the billing migration?")
-    assert [t.node_id for t in b.topics] == ["thread:billing-migration"] and b.type == "thread"
-    assert len(_routes(brain)) == 1
-    sent = brain.llm.calls[-1][1]
-    assert "<request>where are we on the billing migration?</request>" in sent
-    brain.brief("billing-migration")  # names one thing: no routing call
-    assert len(_routes(brain)) == 1
-
-
-def test_a_request_about_several_things_briefs_them_together(brain):
-    a = jot(brain, "We decided the [[Billing migration]] cutover is in March.")
-    g = jot(brain, "Paired on the [[GPU quota migration]] alerts.")
-    b = brain.brief("the billing migration and the GPU quota migration")
-    assert b.type == "several" and b.target == "thread:billing-migration,thread:gpu-quota-migration"
-    assert b.label == "Billing migration + GPU quota migration"
-    sent = brain.llm.calls[-1][1]
-    assert sent.count("<topic ") == 2 and a in sent and g in sent
-    last = json.loads(brain.storage.get(keys.BRIEF_STATE))["last"]
-    assert {"thread:billing-migration", "thread:gpu-quota-migration"} <= set(last)
-
-
-def test_active_threads_decay_unless_pinned(brain):
-    jot(brain, "Started [[Old work]].")
-    (t,) = brain.active_threads()
-    later = datetime.fromisoformat(t.last_activity) + timedelta(days=30)
-    assert brain.active_threads(now=later) == []
-    thread = brain.vault.get_entity("thread", "old-work")
-    thread.pinned = True
-    brain.vault.put_entity(thread)
-    assert [x.id for x in brain.active_threads(now=later)] == ["old-work"]
-
-
-def test_free_text_brief(brain):
-    jot(brain, FIRST)
-    b = brain.brief("vendor nodes support")
-    assert b.type == "text" and b.fragment_count >= 1
-
-
-def test_locate_quote_and_assign_ids():
-    body = "We decided to move the eval cluster in December."
-    assert locate_quote(body, "move the eval cluster") == (14, 35)
-    assert locate_quote(body, "Move The Eval cluster") == (14, 35)
-    assert locate_quote(body, "we decidd to move the eval cluster") is not None
-    assert locate_quote(body, "nothing like it at all") is None
-    prev = Extraction(
-        entry_id="e-1",
-        entry_hash="h",
-        model="m",
-        prompt={"name": "x", "version": 1, "sha256": "s"},
-        created_at="2026-10-30T00:00:00Z",
-        fragments=[
-            {"id": "f-e-1-01", "kind": "decision", "text": "Move the cluster in December."},
-            {"id": "f-e-1-07", "kind": "question", "text": "Does MIG work?"},
-        ],
-    )
-    ids = assign_ids(
-        "e-1",
-        [
-            ("question", "Does MIG work on new nodes?", None),
-            ("decision", "Move the cluster in December.", None),
-            ("idea", "A portal.", None),
-        ],
-        prev,
-    )
-    assert ids == ["f-e-1-07", "f-e-1-01", "f-e-1-08"]
+def test_rebuild_replays_every_note_and_keeps_page_ids(brain):
+    write(brain, "Met Dana Kim about the audit.")
+    write(brain, "Robin Kimura sent the audit report.", 1)
+    write(brain, "Dana Kim and Robin Kimura are the same person.", 2)
+    write(brain, KICKOFF, 3)
+    write(brain, "Confirmed: MIG does work on new nodes for the [[GPU quota migration]].", 4)
+    pages_before = sorted((p.id, p.name, p.status) for p in brain.pages())
+    open_before = [s.text for s in brain.world().open_items()]
+    report = brain.rebuild()
+    assert report.notes == 5 and report.failed == [] and report.calls > 0
+    assert sorted((p.id, p.name, p.status) for p in brain.pages()) == pages_before
+    assert [s.text for s in brain.world().open_items()] == open_before
+    assert len(brain.world().roots("person")) == 2  # Dana Kim (merged with Robin Kimura) and Jane Doe
+    assert brain.storage.exists("wiki/people/dana-kim.md")

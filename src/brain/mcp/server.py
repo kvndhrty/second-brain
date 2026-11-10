@@ -1,8 +1,8 @@
 """MCP server exposing the journal to agents such as Claude Code.
 
-The same tools are served over stdio (`brain mcp`) and, from milestone 4,
-over streamable HTTP inside `brain start`. Tools call the Brain façade; they
-add no behaviour of their own beyond converting results and errors.
+The same tools are served over stdio (`brain mcp`) and over streamable HTTP
+inside `brain start`. Tools call the Brain façade; they add no behaviour of
+their own beyond converting results and errors.
 
 Sync tools run on worker threads; the shared Brain (core/shared.py) lets one
 call use it at a time.
@@ -24,40 +24,40 @@ from brain.core.answers import AmbiguousTarget
 from brain.core.formats.yamlio import FormatError
 from brain.core.index.db import IndexError_
 from brain.core.llm.models import LLMError
-from brain.core.pipeline.runner import EntryResult
-from brain.core.review import MENTION_KINDS, ReviewError
+from brain.core.pipeline.runner import NoteResult
 from brain.core.services import Brain, Busy, JotFailed
 from brain.core.shared import SharedBrain
 from brain.core.storage.base import StorageError
 from brain.core.storage.lease import LeaseError
-from brain.core.temporal import age_days, iso_day, local_date
-from brain.core.views import fragment_view
+from brain.core.temporal import iso_day, local_date
+from brain.core.views import NoSuchPage
 from brain.mcp import schemas as s
 
 INSTRUCTIONS = """\
-brain is the user's work journal, turned into a knowledge graph. Entries are
-dated free text the user wrote. Each entry is split into fragments
-(observations, decisions, questions, ideas, claims, action items) linked to
-people, orgs (teams, offices, companies), themes (what the work is about, and
-techniques used), and threads (workstreams).
+brain is the user's work journal. The user only writes notes: dated free
+text. Models turn the notes into a wiki: each note is split into statements
+(facts, decisions, questions, actions, ideas), and the statements are linked
+to pages for threads (ongoing pieces of work), people, orgs, and topics.
 
-- brief: get up to speed on a thread, person, org, theme, or topic. Best first
-  call when the user returns to something after time away.
+- get_context: a short, dated summary of current state. Read it first.
+- brief: get up to speed on a thread, person, org, or topic. Best first call
+  when the user returns to something after time away.
 - ask: answer a specific question from the journal.
-- search: find entries, fragments, and entities by words or meaning.
-- get_entry: read a cited entry in full.
-- get_entity: details on one person, org, theme, or thread.
-- list_active: the user's current workstreams.
-- add_entry: record something in the journal. Only when the user asks you to;
-  write it as the user would, in plain text.
+- search: find pages, statements, and notes by words or meaning.
+- get_page: one wiki page: where it stands, summary, open items, decisions,
+  history.
+- get_note: read a cited note in full.
+- list_active: the user's current threads.
+- jot: add a note. Only when the user asks you to record something; write it
+  as the user would, in plain text. Notes are the only way to change the
+  wiki: to correct it, jot what is wrong ("Jane Doe and J. Doe are the same
+  person", "the vendor evaluation is finished", "ignore the note about the
+  outage cause").
 
-- get_context: a short, dated summary of current state.
-
-Results cite entry ids (e-YYYYMMDDTHHMMSSZ). Cite them when you report facts.
-Fragments with status "speculative" are unconfirmed; "overcome_by_events" no
-longer apply. Every result has today's date and an age for each dated item:
-newer entries supersede older ones, and a summary's as-of date says how
-current it is.
+Results cite note ids (n-YYYYMMDDTHHMMSSZ). Cite them when you report facts.
+A statement with status "superseded" was replaced by a later note and no
+longer holds. Every result has today's date and a date and age for each
+item: newer notes replace older ones on the same point.
 """
 
 READ = ToolAnnotations(read_only_hint=True, open_world_hint=False)
@@ -71,7 +71,7 @@ EXPECTED = (
     FormatError,
     IndexError_,
     AmbiguousTarget,
-    ReviewError,
+    NoSuchPage,
     Busy,
     JotFailed,
     KeyError,
@@ -83,18 +83,17 @@ def _today() -> date:
     return local_date(datetime.now(UTC))
 
 
-def _age(value: str | None, today: date) -> int | None:
-    return age_days(value, today) if value else None
+def _statements(lines) -> list[s.Statement]:
+    return [s.Statement(**dataclasses.asdict(ln)) for ln in lines]
 
 
-def _fragment(f, today: date) -> s.Fragment:
-    return s.Fragment(**dataclasses.asdict(f), age_days=_age(f.date, today))
+def _refs(refs) -> list[s.Ref]:
+    return [s.Ref(id=r.id, type=r.type, name=r.name) for r in refs]
 
 
-def _sources(sources: dict, today: date) -> list[s.Source]:
+def _sources(sources: dict) -> list[s.Source]:
     """Oldest first, so the newest source is last."""
-    ordered = sorted(sources.values(), key=lambda x: x.date)
-    return [s.Source(entry_id=x.entry_id, date=x.date, age_days=_age(x.date, today), label=x.label) for x in ordered]
+    return [s.Source(**dataclasses.asdict(x)) for x in sorted(sources.values(), key=lambda x: x.date)]
 
 
 def _claims(claims) -> list[s.Claim]:
@@ -115,12 +114,12 @@ class ToolBrain:
             raise ToolError(str(message)) from e
 
 
-# Runs the pipeline for a saved entry. In `brain mcp` it runs inline; inside
-# `brain start` it hands the entry to the background worker and waits.
-ProcessEntry = Callable[[str], EntryResult | None]
+# Runs the layers for a saved note. In `brain mcp` it runs inline; inside
+# `brain start` it hands the note to the background worker and waits.
+ProcessNote = Callable[[str], NoteResult | None]
 
 
-EntityKind = Literal["entry", "fragment", "person", "org", "theme", "thread"]
+HitType = Literal["note", "statement", "person", "org", "topic", "thread"]
 
 
 def _with_context(shared: SharedBrain) -> str:
@@ -133,7 +132,7 @@ def _with_context(shared: SharedBrain) -> str:
 
 
 def build_server(
-    shared: SharedBrain, *, process_entry: ProcessEntry | None = None, context_in_instructions: bool = False
+    shared: SharedBrain, *, process_note: ProcessNote | None = None, context_in_instructions: bool = False
 ) -> MCPServer:
     """context_in_instructions: put the injected context in the server instructions. Only for
     `brain mcp`, which starts once per agent session; `brain start` runs for days, so its MCP
@@ -157,146 +156,139 @@ def build_server(
     @srv.tool(annotations=READ)
     def get_context() -> str:
         """A short, dated summary of current state: active threads and where each stands, the newest open
-        items, recent decisions and things that no longer hold, and what waits on the user. Read it first
-        in a session if it was not already provided."""
+        questions and things to do, and recent changes. Read it first in a session if it was not already
+        provided."""
         return handle.call(lambda b: b.context_text())
 
     @srv.tool(annotations=READ)
-    def search(query: str, limit: int = 10, types: list[EntityKind] | None = None) -> s.SearchResult:
-        """Find entries, fragments, people, orgs, themes, and threads by words or meaning."""
+    def search(query: str, limit: int = 10, types: list[HitType] | None = None) -> s.SearchResult:
+        """Find wiki pages (threads, people, orgs, topics), statements, and notes by words or meaning."""
         hits = handle.call(
             lambda b: b.search(query, limit=max(1, min(limit, 50)), types=tuple(types) if types else None)
         )
-        today = _today()
-        return s.SearchResult(
-            today=today.isoformat(),
-            hits=[s.SearchHit(**dataclasses.asdict(h), age_days=_age(h.date, today)) for h in hits],
-        )
+        return s.SearchResult(today=_today().isoformat(), hits=[s.SearchHit(**dataclasses.asdict(h)) for h in hits])
 
     @srv.tool(annotations=READ)
     def ask(question: str) -> s.AskResult:
-        """Answer a question from the journal. Every claim cites the entries it comes from."""
+        """Answer a question from the journal. Every claim cites the notes it comes from."""
         a = handle.call(lambda b: b.ask(question))
-        today = _today()
         return s.AskResult(
-            today=today.isoformat(),
+            today=_today().isoformat(),
             claims=_claims(a.claims),
             insufficient=a.insufficient,
-            sources=_sources(a.sources, today),
+            sources=_sources(a.sources),
         )
 
     @srv.tool(annotations=READ)
-    def brief(target: str, since: str | None = None, mark_seen: bool = False) -> s.BriefResult:
-        """Re-entry brief on a thread, person, org, or theme (name or id), or on a request in plain words
+    def brief(request: str, since: str | None = None, mark_seen: bool = False) -> s.BriefResult:
+        """Re-entry brief on a thread, person, org, or topic (name or id), or on a request in plain words
         ("where are we on the billing move and what does Dana owe us"), which may cover several of them:
-        where things stand, recent decisions, open items, people, what is speculative or overcome by events, and what
-        changed since `since` (YYYY-MM-DD; default: when the user last read a brief on it). Set mark_seen
-        only if you are showing this brief to the user, so their "last looked" date moves forward."""
+        where things stand, recent decisions, open items, people, what no longer applies, and what changed
+        since `since` (YYYY-MM-DD; default: when the user last read a brief on it). Set mark_seen only if
+        you are showing this brief to the user, so their "last looked" date moves forward."""
         when = datetime.fromisoformat(since).astimezone() if since else None
-        r = handle.call(lambda b: b.brief(target, since=when, record=mark_seen))
+        r = handle.call(lambda b: b.brief(request, since=when, record=mark_seen))
         o = r.output
-        today = _today()
         return s.BriefResult(
-            today=today.isoformat(),
-            target=r.target,
-            label=r.label,
-            type=r.type,
+            today=_today().isoformat(),
+            topics=_refs(r.topics),
             last_looked=r.since.date().isoformat() if r.since else None,
-            summary=r.summary,
-            summary_as_of=iso_day(r.summary_as_of) if r.summary_as_of else None,
             where_things_stand=_claims(o.where_things_stand),
             recent_decisions=_claims(o.recent_decisions),
             open_items=_claims(o.open_items),
             people=_claims(o.people),
-            speculative=_claims(o.speculative),
-            overcome_by_events=_claims(o.overcome_by_events),
+            no_longer_applies=_claims(o.no_longer_applies),
             changed_since=_claims(o.changed_since),
-            open_fragments=[_fragment(fragment_view(f), today) for f in r.open_items],
-            sources=_sources(r.sources, today),
-            notes=r.notes,
+            sources=_sources(r.sources),
         )
 
     @srv.tool(annotations=READ)
-    def get_entity(name_or_id: str) -> s.EntityResult:
-        """One person, org, theme, or thread: details, notes, related nodes, open items, recent fragments."""
-        e = handle.call(lambda b: b.entity(name_or_id))
-        today = _today()
-        data = dataclasses.asdict(e)
-        data["open_items"] = [s.Fragment(**f, age_days=_age(f["date"], today)) for f in data["open_items"]]
-        data["recent"] = [s.Fragment(**f, age_days=_age(f["date"], today)) for f in reversed(data["recent"])]
-        return s.EntityResult(today=today.isoformat(), **data)
+    def get_page(name_or_id: str) -> s.PageResult:
+        """One wiki page: a thread, person, org, or topic. Where it stands, its summary, open questions and
+        things to do, decisions that stand, the history of statements, and related pages."""
+        p = handle.call(lambda b: b.page(name_or_id))
+        return s.PageResult(
+            today=_today().isoformat(),
+            id=p.id,
+            type=p.type,
+            name=p.name,
+            names=p.names,
+            status=p.status,
+            profile=p.profile,
+            as_of=p.as_of,
+            now=s.Cited(text=p.now.text, citations=p.now.citations) if p.now else None,
+            summary=[s.Cited(text=c.text, citations=c.citations) for c in p.summary],
+            open=_statements(p.open),
+            decided=_statements(p.decided),
+            history=_statements(p.history[:60]),
+            related=_refs(p.related),
+        )
+
+    def _note(b: Brain, note_id: str) -> s.NoteResult:
+        n = b.note(note_id)
+        return s.NoteResult(
+            today=_today().isoformat(),
+            id=n.id,
+            date=iso_day(n.created),
+            title=n.title,
+            text=n.body,
+            processed=n.done,
+            statements=_statements(n.statements),
+            mentions=_refs(n.entities),
+            changes=[ev.text for ev in n.events],
+        )
 
     @srv.tool(annotations=READ)
-    def get_entry(entry_id: str) -> s.EntryResult:
-        """The full text of one entry, as the user wrote it, with the fragments extracted from it."""
-        e = handle.call(lambda b: b.entry(entry_id))
-        today = _today()
-        return s.EntryResult(
-            today=today.isoformat(),
-            id=e.id,
-            date=e.date,
-            age_days=_age(e.date, today),
-            title=e.title,
-            text=e.text,
-            processed=e.processed,
-            fragments=[_fragment(f, today) for f in e.fragments],
-        )
+    def get_note(note_id: str) -> s.NoteResult:
+        """The full text of one note, as the user wrote it, with the statements made from it."""
+        return handle.call(lambda b: _note(b, note_id))
 
     @srv.tool(annotations=READ)
     def list_active() -> s.ActiveResult:
-        """Threads (workstreams) with recent activity, plus pinned ones, most recent first."""
+        """Threads (ongoing pieces of work) with recent activity or open items, most recent first."""
 
         def run(b: Brain) -> s.ActiveResult:
-            today = _today()
             threads = [
                 s.ActiveThread(
                     id=t.id,
                     name=t.name,
-                    state=t.state,
-                    pinned=t.pinned,
                     last_activity=iso_day(t.last_activity) if t.last_activity else None,
-                    last_activity_age_days=_age(t.last_activity, today),
-                    fragments=t.fragments,
                     open_items=t.open_items,
-                    people=t.people,
-                    summary=t.summary,
-                    summary_as_of=iso_day(t.summary_as_of) if t.summary_as_of else None,
+                    now=t.now,
                 )
                 for t in b.active_threads()
             ]
-            return s.ActiveResult(
-                today=today.isoformat(), threads=threads, inactivity_days=b.settings.threads.inactivity_days
-            )
+            return s.ActiveResult(today=_today().isoformat(), threads=threads)
 
         return handle.call(run)
 
     @srv.tool(annotations=WRITE)
-    def add_entry(text: str, title: str | None = None) -> s.AddEntryResult:
-        """Save a new journal entry and process it. Only when the user asks to record something."""
+    def jot(text: str, title: str | None = None, about: str | None = None) -> s.JotResult:
+        """Save a new note and process it. Only when the user asks to record something. To correct the
+        wiki, write what is wrong as a note; `about` may name the page (id or name) the correction is for."""
 
         def save(b: Brain):
-            return b.jot(text, title=title), b.llm.configured
+            page = b.page(about).id if about else None
+            return b.jot(text, title=title, about=page), b.llm.configured
 
         saved, configured = handle.call(save)
-        result = s.AddEntryResult(today=_today().isoformat(), entry_id=saved.entry.id, key=saved.key, processed=False)
+        result = s.JotResult(today=_today().isoformat(), note_id=saved.note.id, key=saved.key, processed=False)
         if not configured:
-            result.error = "no model endpoint configured; the entry is saved and will be processed later"
+            result.error = "no model endpoint configured; the note is saved and will be processed later"
             return result
-        if process_entry is not None:
-            outcome = process_entry(saved.entry.id)
+        if process_note is not None:
+            outcome = process_note(saved.note.id)
         else:
-            outcome = handle.call(lambda b: b.process(saved.entry.id).entries[0], sync=False)
+            outcome = handle.call(lambda b: b.process(saved.note.id).notes[0], sync=False)
         if outcome is None:
-            result.error = "still processing in the background; check later with get_entry"
+            result.error = "still processing in the background; check later with get_note"
             return result
         result.error = outcome.error
         result.processed = outcome.error is None
 
-        def details(b: Brain) -> s.AddEntryResult:
-            result.fragments = [_fragment(f, _today()) for f in b.entry(saved.entry.id).fragments]
-            result.names_to_review = sum(
-                1 for i in b.review_items() if i.entry_id == saved.entry.id and i.kind in MENTION_KINDS
-            )
+        def details(b: Brain) -> s.JotResult:
+            n = _note(b, saved.note.id)
+            result.statements, result.changes = n.statements, n.changes
             return result
 
         return handle.call(details)

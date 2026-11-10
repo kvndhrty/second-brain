@@ -30,7 +30,7 @@ from brain.core.storage.base import StorageError
 from brain.core.storage.lease import LeaseError
 
 app = typer.Typer(
-    no_args_is_help=True, add_completion=False, help="A work journal that builds its own knowledge graph."
+    no_args_is_help=True, add_completion=False, help="A work journal: you write notes, and the model keeps the wiki."
 )
 out = Console(soft_wrap=True)
 err = Console(stderr=True, soft_wrap=True)
@@ -120,16 +120,20 @@ def _from_editor(drafts: Path) -> str:
 
 @app.command()
 def jot(
-    message: Annotated[str | None, typer.Option("--message", "-m", help="Entry text.")] = None,
-    file: Annotated[Path | None, typer.Option("--file", "-f", help="Read the entry from a file.")] = None,
+    message: Annotated[str | None, typer.Option("--message", "-m", help="Note text.")] = None,
+    file: Annotated[Path | None, typer.Option("--file", "-f", help="Read the note from a file.")] = None,
     title: Annotated[str | None, typer.Option("--title", "-t", help="Optional title.")] = None,
-    tag: Annotated[list[str] | None, typer.Option("--tag", help="Tag (repeatable).")] = None,
+    about: Annotated[str | None, typer.Option("--about", help="A wiki page (id or name) this note corrects.")] = None,
     force: Annotated[
         bool, typer.Option("--force", help="Take the write lease even if another machine holds it.")
     ] = False,
-    process: Annotated[bool, typer.Option("--process/--no-process", help="Run extraction right after saving.")] = True,
+    process: Annotated[bool, typer.Option("--process/--no-process", help="Run the layers right after saving.")] = True,
 ) -> None:
-    """Write a journal entry: -m TEXT, --file, stdin, or $EDITOR."""
+    """Write a note: -m TEXT, --file, stdin, or $EDITOR.
+
+    Notes are the only input. To correct the wiki, write a note that says what
+    is wrong ("Jane Doe and J. Doe are the same person", "the vendor evaluation
+    is finished", "ignore what I wrote about the outage cause")."""
     if message is not None:
         text = message
     elif file is not None:
@@ -139,30 +143,41 @@ def jot(
     else:
         text = _from_editor(LocalState().drafts_dir)
     if not text.strip():
-        raise _fail("empty entry; nothing saved")
-    with _brain("brain jot", force=force) as b:
+        raise _fail("empty note; nothing saved")
+    with _brain("brain jot", force=force, sync=about is not None) as b:
+        if about is not None:
+            about = _page_id(b, about)
         try:
-            result = b.jot(text, title=title, tags=tag)
+            result = b.jot(text, title=title, about=about)
         except JotFailed as e:
             raise _fail(str(e), 3 if isinstance(e.cause, LeaseError) else 1) from None
-        out.print(f"saved [bold]{result.entry.id}[/bold] → {result.key}")
+        out.print(f"saved [bold]{result.note.id}[/bold] → {result.key}")
         if file is not None and file.parent == b.state.drafts_dir:
             file.unlink(missing_ok=True)
         drafts = b.pending_drafts()
         if drafts:
             out.print(f"[yellow]{len(drafts)} unsent draft(s) in {drafts[0].parent}[/yellow]")
-        if process and _hand_to_server(b, result.entry.id):
+        if process and _hand_to_server(b, result.note.id):
             return
         if process and b.llm.configured:
             from brain.cli.render import run_processing
 
-            run_processing(out, lambda progress: b.process(result.entry.id, progress=progress), b)
+            run_processing(out, lambda progress: b.process(result.note.id, progress=progress))
         elif process:
-            out.print("[dim]no model endpoint configured; extraction is pending (see `brain doctor`)[/dim]")
+            out.print("[dim]no model endpoint configured; the note is saved and pending (see `brain doctor`)[/dim]")
 
 
-def _hand_to_server(b: Brain, entry_id: str) -> bool:
-    """If `brain start` is running for this store, let its worker process the entry."""
+def _page_id(b: Brain, text: str) -> str:
+    from brain.core import views
+
+    try:
+        return views.resolve(b.world(), text).id
+    except views.NoSuchPage as e:
+        raise _fail(str(e), 2) from None
+
+
+def _hand_to_server(b: Brain, note_id: str) -> bool:
+    """If `brain start` is running for this store, let its worker process the note."""
     import httpx2
 
     from brain.core import runtime
@@ -172,7 +187,7 @@ def _hand_to_server(b: Brain, entry_id: str) -> bool:
         return False
     try:
         # trust_env=False: a localhost request must never go through HTTPS_PROXY.
-        r = httpx2.post(f"{info.url}/api/worker/wake", json={"entry": entry_id}, timeout=3, trust_env=False)
+        r = httpx2.post(f"{info.url}/api/worker/wake", json={"note": note_id}, timeout=3, trust_env=False)
         r.raise_for_status()
     except httpx2.HTTPError:
         return False
@@ -285,10 +300,9 @@ def init() -> None:
     s.llm.base_url = _ask("Base URL, e.g. https://gateway/v1 (blank to skip)")
     if s.llm.base_url:
         s.llm.api_key_env = _ask("Environment variable holding the API key", "BRAIN_API_KEY")
-        s.llm.chat_model = _ask("Chat model")
-        s.llm.extract_model = _ask("Extraction model", s.llm.chat_model)
+        s.llm.small_model = _ask("Small model (does the per-note work)")
+        s.llm.strong_model = _ask("Strong model for dreaming (blank to use the small model)")
         s.llm.embed_model = _ask("Embedding model")
-        s.llm.doc_model = _ask("Document-extraction model (blank for none)")
 
     try:
         validated = cfgmod.Settings.model_validate(s.model_dump())
@@ -314,53 +328,37 @@ def _parse_date(value: str | None) -> datetime | None:
         raise _fail(f"not a date: {value} (use YYYY-MM-DD)", 2) from None
 
 
-def _entry_progress(status_line):
-    return lambda entry_id, msg: status_line(f"{entry_id}: {msg}" if entry_id else msg)
+def _note_progress(status_line):
+    return lambda note_id, msg: status_line(f"{note_id}: {msg}" if note_id else msg)
 
 
 @app.command()
 def process() -> None:
-    """Run extraction for every entry that still needs it, and update stale thread summaries."""
+    """Run the layers for every note that still needs them, including files saved into notes/ by hand."""
     from brain.cli.render import run_processing
 
     with _brain("brain process") as b:
-        run_processing(out, lambda progress: b.process_pending(_entry_progress(progress)), b)
+        run_processing(out, lambda progress: b.process_pending(_note_progress(progress)))
 
 
 @app.command()
-def reextract(
-    entry_ids: Annotated[list[str] | None, typer.Argument(help="Entry ids (default: all, or --since).")] = None,
-    since: Annotated[str | None, typer.Option(help="Only entries on or after this date (YYYY-MM-DD).")] = None,
-    stale_prompts: Annotated[
-        bool, typer.Option("--stale-prompts", help="Only entries extracted with an older prompt version.")
-    ] = False,
+def rebuild(
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Do not ask for confirmation.")] = False,
 ) -> None:
-    """Re-run extraction after a model or prompt change. Your decisions are kept."""
-    from brain.cli.render import run_processing
+    """Discard the wiki and everything generated, and run every note again in date order.
 
-    with _brain("brain reextract") as b:
-        b.sync()
-        if not entry_ids and not since and not stale_prompts and not yes:
-            n = b.db.conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
-            if not typer.confirm(f"Re-extract all {n} entries? This calls the model for each one.", default=False):
-                raise typer.Exit()
-        run_processing(
-            out,
-            lambda progress: b.reextract(
-                entry_ids, since=_parse_date(since), stale_prompts=stale_prompts, progress=_entry_progress(progress)
-            ),
-            b,
-        )
-
-
-@app.command()
-def review() -> None:
-    """Confirm new people, organizations, themes, threads, and proposed answers."""
-    from brain.cli.review import run_review
-
-    with _brain("brain review", sync=True) as b:
-        run_review(out, b)
+    Use after a prompt or model change. Notes are not touched; pages keep their ids."""
+    with _brain("brain rebuild", sync=True) as b:
+        n = b.status()["notes"]
+        if not yes and not typer.confirm(f"Run all {n} note(s) through the model again?", default=False):
+            raise typer.Exit()
+        with out.status("rebuilding") as status:
+            report = b.rebuild(_note_progress(lambda msg: status.update(msg)))
+        out.print(f"rebuilt from {report.notes} note(s) with {report.calls} model call(s)")
+        for line in report.failed:
+            out.print(f"[red]✗[/red] {escape(line)}")
+        if report.failed:
+            raise typer.Exit(1)
 
 
 # --- reading -----------------------------------------------------------------
@@ -368,18 +366,54 @@ def review() -> None:
 
 @app.command()
 def active() -> None:
-    """Threads with recent activity, plus pinned ones."""
-    from brain.cli.render import print_active
+    """Threads with recent activity or open items, and where each stands."""
+    from brain.cli.render import print_threads
 
     with _brain("brain active", sync=True) as b:
-        now = datetime.now().astimezone()
-        print_active(out, b.active_threads(now=now), now)
+        print_threads(out, b.active_threads())
+
+
+@app.command()
+def wiki(
+    page: Annotated[str | None, typer.Argument(help="A page: its id or exact name. Omit to list pages.")] = None,
+    kind: Annotated[str | None, typer.Option("--type", help="List only: thread, person, org, or topic.")] = None,
+) -> None:
+    """Show a wiki page, or list the pages. The same pages are files under wiki/ in the store."""
+    from brain.cli.render import print_pages
+    from brain.core import views
+
+    if kind and kind not in ("thread", "person", "org", "topic"):
+        raise _fail("--type must be thread, person, org, or topic", 2)
+    with _brain("brain wiki", sync=True) as b:
+        if page is None:
+            print_pages(out, b.pages(kind))
+            return
+        try:
+            print(b.page_markdown(page), end="")
+        except views.NoSuchPage as e:
+            raise _fail(str(e), 2) from None
+
+
+@app.command()
+def log(
+    limit: Annotated[int, typer.Option("--limit", "-n", help="How many lines.")] = 40,
+) -> None:
+    """What brain did after each note and in each dream pass, newest first."""
+    from brain.core.temporal import iso_day
+
+    with _brain("brain log", sync=True) as b:
+        events = b.log(limit=limit)
+        if not events:
+            out.print("nothing yet")
+        for ev in events:
+            source = "dream" if ev.source.startswith("dream:") else ev.source
+            out.print(f"{iso_day(ev.at)}  {escape(ev.text)}  [dim]{source}[/dim]")
 
 
 @app.command()
 def brief(
-    target: Annotated[
-        str, typer.Argument(help="A thread, person, org, or theme (name or id), or a request in plain words.")
+    request: Annotated[
+        str, typer.Argument(help="A thread, person, org, or topic (name or id), or a request in plain words.")
     ],
     since: Annotated[
         str | None, typer.Option(help="Report changes since this date (default: your last brief).")
@@ -392,7 +426,7 @@ def brief(
     with _brain("brain brief", sync=True) as b:
         try:
             with out.status("writing brief"):
-                result = b.brief(target, since=_parse_date(since))
+                result = b.brief(request, since=_parse_date(since))
         except AmbiguousTarget as e:
             raise _fail(str(e), 2) from None
         print_brief(out, result)
@@ -400,7 +434,7 @@ def brief(
 
 @app.command()
 def ask(question: Annotated[str, typer.Argument(help="Your question.")]) -> None:
-    """Answer a question from the journal, citing dated entries."""
+    """Answer a question from the journal, citing dated notes."""
     from brain.cli.render import print_answer
 
     with _brain("brain ask", sync=True) as b, out.status("searching"):
@@ -409,94 +443,41 @@ def ask(question: Annotated[str, typer.Argument(help="Your question.")]) -> None
 
 
 @app.command()
-def show(entry_id: Annotated[str, typer.Argument(help="Entry id, or 'latest'.")] = "latest") -> None:
-    """Show an entry's fragments with their ids, status, and pipeline state."""
-    from brain.cli.render import print_fragments
-    from brain.core.index import queries
+def search(
+    query: Annotated[str, typer.Argument(help="Words to look for.")],
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
+) -> None:
+    """Find pages, statements, and notes."""
+    with _brain("brain search", sync=True) as b:
+        hits = b.search(query, limit=limit)
+        if not hits:
+            out.print("nothing found")
+        for h in hits:
+            where = f"{h.date}  " if h.date else ""
+            text = h.snippet or h.label
+            label = f"[bold]{escape(h.label)}[/bold]  " if h.type not in ("statement",) else ""
+            out.print(f"{where}{label}{escape(text)}  [dim]{h.type} · {h.note_id or h.id}[/dim]")
+
+
+@app.command()
+def show(note_id: Annotated[str, typer.Argument(help="Note id, or 'latest'.")] = "latest") -> None:
+    """Show what the layers made of a note: its statements, where they were filed, and what changed."""
+    from brain.cli.render import print_note
+    from brain.core import views
 
     with _brain("brain show", sync=True) as b:
-        c = b.db.conn
-        row = (
-            c.execute("SELECT id, created_at, title, next_step FROM entries ORDER BY created_at DESC, id DESC LIMIT 1")
-            if entry_id == "latest"
-            else c.execute("SELECT id, created_at, title, next_step FROM entries WHERE id = ?", (entry_id,))
-        ).fetchone()
-        if row is None:
-            raise _fail(f"no entry {entry_id}")
-        eid, created, title, next_step = row
-        state = "processed" if next_step == "done" else f"pending ({next_step})"
-        out.print(f"[bold]{escape(title or eid)}[/bold]  [dim]{created[:16]} · {eid} · {state}[/dim]")
-        frag_ids = [r[0] for r in c.execute("SELECT id FROM fragments WHERE entry_id = ? ORDER BY id", (eid,))]
-        print_fragments(out, list(queries.fragments_by_id(c, frag_ids).values()))
-        failure = b.failures().get(eid)
+        if note_id == "latest":
+            recent = b.recent_notes(limit=1)
+            if not recent:
+                raise _fail("no notes yet")
+            note_id = recent[0].id
+        try:
+            print_note(out, b.note(note_id))
+        except views.NoSuchPage as e:
+            raise _fail(str(e)) from None
+        failure = b.failures().get(note_id)
         if failure:
             out.print(f"[red]last error in {failure['step']}: {escape(failure['error'])}[/red]")
-
-
-@app.command()
-def status(
-    fragment_id: Annotated[str, typer.Argument(help="Fragment id (see `brain show`).")],
-    confirmed: Annotated[bool, typer.Option("--confirmed", help="Mark as confirmed.")] = False,
-    speculative: Annotated[bool, typer.Option("--speculative", help="Mark as speculative.")] = False,
-    obe: Annotated[bool, typer.Option("--obe", help="Mark as overcome by events.")] = False,
-    reason: Annotated[str | None, typer.Option(help="Why it was overcome by events.")] = None,
-    on: Annotated[str | None, typer.Option("--date", help="When it was overcome (default today).")] = None,
-    open_: Annotated[bool, typer.Option("--open", help="Reopen a question or action item.")] = False,
-    closed: Annotated[bool, typer.Option("--closed", help="Close a question or action item.")] = False,
-    note: Annotated[str | None, typer.Option(help="Note on closing.")] = None,
-    someday: Annotated[
-        bool | None,
-        typer.Option("--someday/--not-someday", help="Mark or unmark as someday: a big idea not tied to current work."),
-    ] = None,
-) -> None:
-    """Change a fragment's status. Stored in the entry's decisions file, so it survives re-extraction."""
-    from brain.core.services import FragmentChange
-
-    if sum([confirmed, speculative, obe]) > 1 or (open_ and closed):
-        raise _fail("choose one status and at most one of --open/--closed", 2)
-    status_value = "confirmed" if confirmed else "speculative" if speculative else "overcome_by_events" if obe else None
-    when = _parse_date(on)
-    change = FragmentChange(
-        status=status_value,  # type: ignore[arg-type]
-        obe_reason=reason,
-        obe_date=when.date() if when else None,
-        state="open" if open_ else "closed" if closed else None,
-        closed_note=note,
-        someday=someday,
-    )
-    if change == FragmentChange():
-        raise _fail("nothing to change; see `brain status --help`", 2)
-    with _brain("brain status", sync=True) as b:
-        try:
-            b.set_fragment(fragment_id, change)
-        except KeyError as e:
-            raise _fail(str(e.args[0])) from None
-        out.print(f"updated {fragment_id}")
-
-
-# --- threads and the OBE sweep -------------------------------------------------
-
-
-def _register_thread_commands() -> None:
-    from brain.cli.threads import thread_app
-
-    app.add_typer(thread_app, name="thread")
-
-
-_register_thread_commands()
-
-
-@app.command()
-def sweep(
-    days: Annotated[int, typer.Option(help="Open or speculative items older than this many days.")] = 30,
-    quiet_days: Annotated[int, typer.Option(help="Threads with no activity for this many days.")] = 60,
-) -> None:
-    """Go through items that may be overcome by events: old open questions and action items,
-    old speculation, and threads that have gone quiet."""
-    from brain.cli.threads import run_sweep
-
-    with _brain("brain sweep", sync=True) as b:
-        run_sweep(b, days=days, quiet_days=quiet_days)
 
 
 # --- injected context and dreaming --------------------------------------------
@@ -524,44 +505,40 @@ def context(
 @app.command()
 def dream(
     dry_run: Annotated[
-        bool, typer.Option("--dry-run", help="Show what a pass would do, without calling a model.")
+        bool, typer.Option("--dry-run", help="Show what a pass would look at, without calling a model.")
     ] = False,
-    thread: Annotated[str | None, typer.Option(help="Only this thread (id).")] = None,
 ) -> None:
-    """Offline consolidation: rebuild stale thread summaries, propose items that later entries have
-    overcome or answered, check old items in the sweep, and write each thread's Now line.
-
-    Proposals go to `brain review` and `brain sweep`; nothing you wrote is changed."""
+    """Dreaming: an offline pass across all notes. Merges duplicate people and things, settles old
+    open items that later notes answered, closes quiet threads, fills in people's roles, and rebuilds
+    worn summaries. Everything it does is in `brain log`; a note can reverse any of it."""
     with _brain("brain dream") as b:
-        try:
-            _run_dream(b, dry_run=dry_run, thread=thread)
-        except KeyError as e:  # an unknown --thread
-            raise _fail(str(e.args[0])) from None
-
-
-def _run_dream(b: Brain, *, dry_run: bool, thread: str | None) -> None:
-    if dry_run:
-        plan = b.dream_plan(thread=thread)
-        if not plan.jobs:
-            out.print("nothing to do: no thread has changed since the last pass")
+        if dry_run:
+            plan = b.dream_plan()
+            if plan.empty:
+                out.print("nothing to do")
+                return
+            for label, items in (
+                ("pair(s) of possible duplicates to compare", plan.duplicates),
+                ("old open item(s) to check", plan.stale),
+                ("quiet thread(s) to close", plan.close),
+                ("profile(s) to fill in", plan.profiles),
+                ("summary(ies) to rebuild", plan.rebuilds),
+            ):
+                if items:
+                    out.print(f"  • {len(items)} {label}")
+            out.print(rf"a pass stops after {b.settings.dream.max_calls} model calls (\[dream] max_calls)")
             return
-        for job in plan.jobs:
-            out.print(f"  • {escape(job.label)}")
-        out.print(rf"{plan.calls} model call(s); a pass stops after {b.settings.dream.max_calls} (\[dream] max_calls)")
-        return
-    run = b.dream(thread=thread, progress=lambda msg: err.print(f"[dim]{escape(msg)}[/dim]"))
-    for line in run.applied:
-        out.print(f"[green]✓[/green] {escape(line)}")
-    if run.proposed:
-        out.print(f"{len(run.proposed)} proposal(s): run `brain review` and `brain sweep`")
-    for e in run.errors:
-        out.print(f"[red]✗[/red] {escape(e)}")
-    if run.budget_exhausted:
-        out.print(
-            rf"[yellow]stopped after {run.calls} model calls (\[dream] max_calls); run again to continue[/yellow]"
-        )
-    if not (run.applied or run.proposed or run.errors):
-        out.print("nothing to do: no thread has changed since the last pass")
+        run = b.dream(progress=lambda msg: err.print(f"[dim]{escape(msg)}[/dim]"))
+        for ev in run.events:
+            out.print(f"[green]✓[/green] {escape(ev.text)}")
+        for e in run.errors:
+            out.print(f"[red]✗[/red] {escape(e)}")
+        if run.budget_exhausted:
+            out.print(
+                rf"[yellow]stopped after {run.calls} model calls (\[dream] max_calls); run again to continue[/yellow]"
+            )
+        if not (run.events or run.errors):
+            out.print(f"nothing changed ({run.calls} model call(s))")
 
 
 # --- agents -----------------------------------------------------------------
@@ -615,7 +592,7 @@ def start(
         shared.close()
         raise _fail(f"`brain start` is already running for this store (pid {running.pid}, {running.url})")
     worker = Worker(lambda: open_brain("brain start (worker)"), poll_seconds=settings.worker.poll_seconds)
-    mcp_server = build_server(shared, process_entry=lambda entry_id: worker.process_now(entry_id, timeout=300))
+    mcp_server = build_server(shared, process_note=lambda note_id: worker.process_now(note_id, timeout=300))
     stopped = False
 
     def shutdown() -> None:

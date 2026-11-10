@@ -7,6 +7,7 @@ import subprocess
 import time
 import uuid
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import boto3
@@ -184,12 +185,46 @@ def make_brain(
     return Brain(loaded, command="pytest", storage=storage, state=state, llm=llm)
 
 
-FAKE_LLM_SETTINGS = {"base_url": "https://fake/v1", "chat_model": "fake-chat", "embed_model": "fake-embed"}
+FAKE_LLM_SETTINGS = {"base_url": "https://fake/v1", "small_model": "fake-small", "embed_model": "fake-embed"}
+
+
+T0 = datetime(2026, 10, 1, 9, 0, tzinfo=UTC)
+
+
+def set_now(brain: Brain, day: float = 0, seconds: int = 0) -> datetime:
+    """Set the brain's clock to T0 plus `day` days."""
+    now = T0 + timedelta(days=day, seconds=seconds)
+    brain.clock = lambda: now  # type: ignore[method-assign]
+    brain.vault.clock = lambda: now
+    return now
+
+
+def write(brain: Brain, text: str, day: float = 0, *, about: str | None = None, process: bool = True) -> str:
+    """Save a note dated T0 + `day` days and run the layers. Returns the note id."""
+    brain._seq = getattr(brain, "_seq", 0) + 1  # type: ignore[attr-defined]
+    set_now(brain, day, brain._seq)  # type: ignore[attr-defined]
+    note = brain.jot(text, about=about).note
+    if process:
+        result = brain.process(note.id).notes[0]
+        assert result.error is None, result.error
+    return note.id
+
+
+def statements(brain: Brain, note_id: str | None = None) -> list:
+    world = brain.world()
+    return world.of_note(note_id) if note_id else world.select(content=False)
+
+
+def entity(brain: Brain, name: str):
+    """The surviving entity with this name."""
+    (found,) = brain.world().by_name(name)
+    return found
 
 
 @pytest.fixture
 def brain(local_storage, state, tmp_path):
-    """A Brain on local storage with the scripted fake LLM."""
+    """A Brain on local storage with the scripted fake LLM, its clock at T0."""
     b = make_brain(local_storage, state, tmp_path, fake_llm=True, llm=FAKE_LLM_SETTINGS)
+    set_now(b)
     yield b
     b.close()

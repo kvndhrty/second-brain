@@ -1,422 +1,331 @@
-"""Read-only queries over the index, shared by the pipeline and the services."""
+"""Reads over the index.
+
+The index stores what each layer wrote. What is true now is computed when
+read, by `World`: merges are followed to the surviving entity, statements
+moved by a correction note are counted in their new thread, and each statement
+gets a status from the relations and retractions that apply to it.
+"""
 
 from __future__ import annotations
 
 import difflib
 import json
 import sqlite3
-from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass
+from functools import cached_property
 
-from brain.core.index.build import norm_alias
-from brain.core.temporal import age, iso_day
+from brain.core.formats.records import OPEN_KINDS, EntityRecord, norm_name
 
-
-@dataclass
-class ThreadRow:
-    id: str
-    name: str
-    description: str | None
-    state: str
-    pinned: bool
-    summary: str | None
-    summary_through: str | None
-    last_activity: str | None
-    last_entry: str | None
-    summary_as_of: str | None = None  # created_at of the entry the summary runs through
-    now_line: str | None = None  # dreaming's one line on where the thread stands
-    now_through: str | None = None
-    now_as_of: str | None = None
-    fragments: int = 0
-    open_items: int = 0
-    people: list[str] = field(default_factory=list)
-
-    @property
-    def summary_stale(self) -> bool:
-        return self.last_entry is not None and self.last_entry != self.summary_through
-
-
-def _thread(r: sqlite3.Row) -> ThreadRow:
-    return ThreadRow(
-        id=r["id"],
-        name=r["name"],
-        description=r["description"],
-        state=r["state"],
-        pinned=bool(r["pinned"]),
-        summary=r["summary"],
-        summary_through=r["summary_through"],
-        last_activity=r["last_activity"],
-        last_entry=r["last_entry"],
-        summary_as_of=r["summary_as_of"],
-        now_line=r["now_line"],
-        now_through=r["now_through"],
-        now_as_of=r["now_as_of"],
-    )
-
-
-THREAD_SELECT = (
-    "SELECT t.*, (SELECT created_at FROM entries WHERE id = t.summary_through) AS summary_as_of, "
-    "(SELECT created_at FROM entries WHERE id = t.now_through) AS now_as_of FROM threads t"
-)
-
-
-def threads(
-    conn: sqlite3.Connection, *, states: tuple[str, ...] = ("active", "proposed"), limit: int | None = None
-) -> list[ThreadRow]:
-    sql = (
-        f"{THREAD_SELECT} WHERE t.state IN ({','.join('?' * len(states))}) "
-        "ORDER BY pinned DESC, last_activity IS NULL, last_activity DESC, name"
-    )
-    params: list[object] = list(states)
-    if limit:
-        sql += " LIMIT ?"
-        params.append(limit)
-    return [_thread(r) for r in conn.execute(sql, params)]
-
-
-def thread(conn: sqlite3.Connection, thread_id: str) -> ThreadRow | None:
-    r = conn.execute(f"{THREAD_SELECT} WHERE t.id = ?", (thread_id,)).fetchone()
-    return _thread(r) if r else None
-
-
-def node_family(conn: sqlite3.Connection, node_id: str) -> list[str]:
-    """The node plus every node merged into it, directly or indirectly (node ids)."""
-    rows = conn.execute(
-        """
-        WITH RECURSIVE fam(id) AS (
-          SELECT ? UNION SELECT e.src FROM edges e JOIN fam ON e.dst = fam.id AND e.type = 'merged_into'
-        ) SELECT id FROM fam
-        """,
-        (node_id,),
-    ).fetchall()
-    return [r[0] for r in rows]
-
-
-LINK_EDGES = ("in_thread", "mentions", "about")  # fragment -> thread, person or org, theme
-LINK_EDGES_SQL = "(" + ", ".join(f"'{e}'" for e in LINK_EDGES) + ")"  # for IN clauses
-
-
-def edge_for(node_type: str) -> str:
-    """The edge type that links a fragment to a node of this type."""
-    return {"thread": "in_thread", "theme": "about"}.get(node_type, "mentions")
-
-
-def thread_nodes(conn: sqlite3.Connection, thread_id: str) -> list[str]:
-    """Node ids of the thread plus every thread merged into it."""
-    return node_family(conn, f"thread:{thread_id}")
-
-
-def thread_family(conn: sqlite3.Connection, thread_id: str) -> list[str]:
-    """Thread ids: the thread plus every thread merged into it."""
-    return [n.split(":", 1)[1] for n in thread_nodes(conn, thread_id)]
-
-
-def thread_fragments(conn: sqlite3.Connection, thread_id: str, *, limit: int = 150) -> list[FragmentRow]:
-    """Fragments in the thread or any thread merged into it, newest `limit`, oldest first."""
-    return fragments_linked_to(conn, thread_nodes(conn, thread_id), ("in_thread",), limit=limit)
-
-
-def node_fragments(conn: sqlite3.Connection, node_id: str, *, limit: int = 150) -> list[FragmentRow]:
-    """Fragments linked to a node or any node merged into it, newest `limit`, oldest first."""
-    return fragments_linked_to(conn, node_family(conn, node_id), (edge_for(node_id.split(":", 1)[0]),), limit=limit)
-
-
-def linked_nodes(conn: sqlite3.Connection, fragment_ids: list[str]) -> list[str]:
-    """Node ids these fragments link to, once per link (a node linked from three fragments appears three times)."""
-    if not fragment_ids:
-        return []
-    src = [f"frag:{i}" for i in fragment_ids]
-    rows = conn.execute(
-        f"SELECT dst FROM edges WHERE src IN ({','.join('?' * len(src))}) AND type IN {LINK_EDGES_SQL}", src
-    )
-    return [r[0] for r in rows]
-
-
-def active_threads(conn: sqlite3.Connection, *, now: datetime, inactivity_days: int) -> list[ThreadRow]:
-    cutoff = (now - timedelta(days=inactivity_days)).isoformat()
-    out = []
-    for t in threads(conn, states=("active", "proposed")):
-        if not (t.pinned or (t.last_activity and t.last_activity >= cutoff)):
-            continue
-        nodes = thread_nodes(conn, t.id)
-        ph = ",".join("?" * len(nodes))
-        t.fragments, t.open_items = conn.execute(
-            f"""
-            SELECT COUNT(DISTINCT f.id), COUNT(DISTINCT CASE
-              WHEN f.state = 'open' AND f.status != 'overcome_by_events' AND f.someday = 0 THEN f.id END)
-            FROM edges e JOIN fragments f ON e.src = 'frag:' || f.id
-            WHERE e.type = 'in_thread' AND e.dst IN ({ph})
-            """,
-            nodes,
-        ).fetchone()
-        t.people = [
-            r[0]
-            for r in conn.execute(
-                f"""
-            SELECT n.label, COUNT(*) c FROM edges e
-            JOIN edges m ON m.src = e.src AND m.type = 'mentions'
-            JOIN nodes n ON n.id = m.dst AND n.type = 'person'
-            WHERE e.type = 'in_thread' AND e.dst IN ({ph})
-            GROUP BY n.label ORDER BY c DESC, n.label LIMIT 3
-            """,
-                nodes,
-            )
-        ]
-        out.append(t)
-    return out
-
-
-def stale_threads(conn: sqlite3.Connection) -> list[ThreadRow]:
-    return [t for t in threads(conn, states=("active", "proposed", "archived", "obe")) if t.summary_stale]
-
-
-def pending_entries(conn: sqlite3.Connection) -> list[tuple[str, str, str]]:
-    """(entry_id, key, next_step) for entries the pipeline has not finished, oldest first."""
-    return [
-        tuple(r)
-        for r in conn.execute(
-            "SELECT id, key, next_step FROM entries WHERE next_step != 'done' ORDER BY created_at, id"
-        )
-    ]
-
-
-def entry_key(conn: sqlite3.Connection, entry_id: str) -> str | None:
-    r = conn.execute("SELECT key FROM entries WHERE id = ?", (entry_id,)).fetchone()
-    return r[0] if r else None
-
-
-def entity_names(conn: sqlite3.Connection, etype: str, *, limit: int = 150) -> list[tuple[str, str, list[str]]]:
-    """(id, name, aliases) for entities of a type, most recently mentioned first."""
-    rows = conn.execute(
-        """
-        SELECT n.id, n.label, MAX(f.created_at) last
-        FROM nodes n
-        LEFT JOIN edges e ON e.dst = n.id AND e.type IN ('mentions', 'about')
-        LEFT JOIN fragments f ON e.src = 'frag:' || f.id
-        WHERE n.type = ? GROUP BY n.id ORDER BY last IS NULL, last DESC, n.label LIMIT ?
-        """,
-        (etype, limit),
-    ).fetchall()
-    out = []
-    for nid, label, _ in rows:
-        aliases = [
-            r[0]
-            for r in conn.execute("SELECT alias FROM aliases WHERE node_id = ?", (nid,))
-            if r[0] != norm_alias(label)
-        ]
-        out.append((nid.split(":", 1)[1], label, aliases))
-    return out
+# Statements shown on pages and given to models as knowledge. Corrections are
+# instructions about the wiki, not knowledge.
+CONTENT_KINDS = ("fact", "decision", "question", "action", "idea")
 
 
 @dataclass(frozen=True)
-class Candidate:
-    entity_id: str
+class Ent:
+    id: str
+    type: str
     name: str
-    score: float
+    status: str
+    merged_into: str | None
+    created_at: str
+    data: str
 
-
-def alias_matches(conn: sqlite3.Connection, etype: str, surface: str) -> list[str]:
-    return [
-        r[0].split(":", 1)[1]
-        for r in conn.execute(
-            "SELECT DISTINCT a.node_id FROM aliases a JOIN nodes n ON n.id = a.node_id "
-            "WHERE a.alias = ? AND n.type = ? ORDER BY a.node_id",
-            (norm_alias(surface), etype),
-        )
-    ]
-
-
-def fuzzy_candidates(conn: sqlite3.Connection, etype: str, surface: str, *, limit: int = 5) -> list[Candidate]:
-    """Name-based candidates: exact alias, close spelling, and (for people) first/last-name matches."""
-    target = norm_alias(surface)
-    target_tokens = target.split()
-    scores: dict[str, tuple[float, str]] = {}
-    rows = conn.execute(
-        "SELECT a.alias, a.node_id, n.label FROM aliases a JOIN nodes n ON n.id = a.node_id WHERE n.type = ?",
-        (etype,),
-    ).fetchall()
-    for alias, nid, label in rows:
-        score = 1.0 if alias == target else difflib.SequenceMatcher(None, alias, target).ratio()
-        tokens = alias.split()
-        if etype == "person" and len(target_tokens) == 1 and len(tokens) > 1 and target_tokens[0] in tokens:
-            score = max(score, 0.7)  # "Mike" vs "Mike Chen"
-        if etype == "org" and target.replace(" ", "") == "".join(t[0] for t in tokens):
-            score = max(score, 0.75)  # acronym
-        eid = nid.split(":", 1)[1]
-        if score > scores.get(eid, (0.0, ""))[0]:
-            scores[eid] = (score, label)
-    ranked = sorted(((s, eid, label) for eid, (s, label) in scores.items() if s >= 0.6), reverse=True)
-    return [Candidate(eid, label, round(s, 3)) for s, eid, label in ranked[:limit]]
-
-
-def pending_names(conn: sqlite3.Connection, *, limit: int = 50) -> list[str]:
-    """Names of people and orgs proposed as new and still in review, most recent first."""
-    rows = conn.execute(
-        "SELECT payload FROM review_items WHERE kind IN ('new_person', 'new_org') ORDER BY created_at DESC, id"
-    ).fetchall()
-    names: list[str] = []
-    for (payload,) in rows:
-        p = json.loads(payload)
-        name = f"{p['surface']} ({p['type']})"
-        if name not in names:
-            names.append(name)
-    return names[:limit]
-
-
-def last_mention(conn: sqlite3.Connection, node_id: str) -> str | None:
-    """created_at of the newest fragment that mentions or is about this node."""
-    r = conn.execute(
-        "SELECT MAX(f.created_at) FROM edges e JOIN fragments f ON e.src = 'frag:' || f.id "
-        "WHERE e.dst = ? AND e.type IN ('mentions', 'about')",
-        (node_id,),
-    ).fetchone()
-    return r[0] if r else None
-
-
-def entity_profile(conn: sqlite3.Connection, node_id: str, *, today: date, recent: int = 3) -> str:
-    """One-line description of an entity for prompts: details and recent mentions, newest first, dated."""
-    r = conn.execute("SELECT label, data FROM nodes WHERE id = ?", (node_id,)).fetchone()
-    if r is None:
-        return node_id
-    data = json.loads(r["data"])
-    parts = [f"name: {r['label']}"]
-    aliases = [a[0] for a in conn.execute("SELECT alias FROM aliases WHERE node_id = ?", (node_id,))]
-    if aliases:
-        parts.append("aliases: " + ", ".join(aliases))
-    for key in ("role", "kind", "description"):
-        if data.get(key):
-            parts.append(f"{key}: {data[key]}")
-    orgs = [
-        o[0]
-        for o in conn.execute(
-            "SELECT n.label FROM edges e JOIN nodes n ON n.id = e.dst WHERE e.src = ? AND e.type = 'member_of' "
-            "AND e.valid_to IS NULL",
-            (node_id,),
-        )
-    ]
-    if orgs:
-        parts.append("org: " + ", ".join(orgs))
-    if data.get("works_on"):
-        parts.append("works on: " + ", ".join(data["works_on"]))
-    mentions = [
-        f"{iso_day(m[1])} ({age(m[1], today)}): {m[0]}"
-        for m in conn.execute(
-            "SELECT f.text, f.created_at FROM edges e JOIN fragments f ON e.src = 'frag:' || f.id WHERE e.dst = ? "
-            "ORDER BY f.created_at DESC LIMIT ?",
-            (node_id, recent),
-        )
-    ]
-    if mentions:
-        parts.append("recently: " + " / ".join(mentions))
-    return "; ".join(parts)
+    @cached_property
+    def record(self) -> EntityRecord:
+        return EntityRecord.model_validate_json(self.data)
 
 
 @dataclass
-class FragmentRow:
+class Stmt:
     id: str
-    entry_id: str
-    kind: str
+    note_id: str
+    seq: int
     text: str
-    status: str
-    state: str | None
-    someday: bool
-    obe_date: str | None
-    obe_reason: str | None
+    kind: str
     created_at: str
+    thread: str | None  # the surviving thread it counts toward
+    status: str = "current"  # current|superseded|answered|repeat|retracted
+    by: str | None = None  # the statement that superseded, answered, or is repeated by this one
 
     @property
     def is_open(self) -> bool:
-        """An open question or action item that has not been overcome by events."""
-        return self.state == "open" and self.status != "overcome_by_events"
+        return self.kind in OPEN_KINDS and self.status == "current"
+
+    @property
+    def is_current(self) -> bool:
+        return self.status == "current"
 
 
-def _frag(r: sqlite3.Row) -> FragmentRow:
-    return FragmentRow(
-        r["id"],
-        r["entry_id"],
-        r["kind"],
-        r["text"],
-        r["status"],
-        r["state"],
-        bool(r["someday"]),
-        r["obe_date"],
-        r["obe_reason"],
-        r["created_at"],
-    )
+@dataclass(frozen=True)
+class LogEvent:
+    at: str
+    source: str
+    kind: str
+    text: str
+    entity_id: str | None
 
 
-FRAGMENT_COLS = "f.id, f.entry_id, f.kind, f.text, f.status, f.state, f.someday, f.obe_date, f.obe_reason, f.created_at"
+class World:
+    """A consistent reading of the index. Build one per operation; it caches what it loads."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+        self.entities: dict[str, Ent] = {
+            r["id"]: Ent(*r)
+            for r in conn.execute("SELECT id, type, name, status, merged_into, created_at, data FROM entities")
+        }
+        self._load_effects()
+
+    # --- entities ----------------------------------------------------------
+
+    def root(self, entity_id: str | None) -> str | None:
+        seen: set[str] = set()
+        while entity_id in self.entities and entity_id not in seen:
+            seen.add(entity_id)
+            nxt = self.entities[entity_id].merged_into
+            if not nxt or nxt not in self.entities:
+                return entity_id
+            entity_id = nxt
+        return entity_id if entity_id in self.entities else None
+
+    def get(self, entity_id: str | None) -> Ent | None:
+        r = self.root(entity_id)
+        return self.entities[r] if r else None
+
+    @cached_property
+    def _members(self) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        for eid in self.entities:
+            r = self.root(eid)
+            if r:
+                out.setdefault(r, []).append(eid)
+        return out
+
+    def members(self, root_id: str) -> list[str]:
+        return self._members.get(root_id, [])
+
+    def roots(self, etype: str | None = None, *, with_provisional: bool = True) -> list[Ent]:
+        out = [self.entities[r] for r in self._members]
+        if etype:
+            out = [e for e in out if e.type == etype]
+        if not with_provisional:
+            out = [e for e in out if e.status != "provisional"]
+        return sorted(out, key=lambda e: e.name.casefold())
+
+    def names_of(self, root_id: str) -> list[str]:
+        seen: dict[str, str] = {}
+        for m in [root_id, *[x for x in self.members(root_id) if x != root_id]]:
+            for n in self.entities[m].record.all_names():
+                seen.setdefault(norm_name(n), n)
+        return list(seen.values())
+
+    def by_name(self, name: str, etype: str | None = None) -> list[Ent]:
+        """Surviving entities one of whose names is exactly this."""
+        rows = self.conn.execute("SELECT entity_id FROM names WHERE name = ?", (norm_name(name),)).fetchall()
+        roots = {self.root(r[0]) for r in rows}
+        out = [self.entities[r] for r in roots if r]
+        return sorted((e for e in out if etype is None or e.type == etype), key=lambda e: e.id)
+
+    def similar(self, name: str, etype: str | None = None, *, limit: int = 8, floor: float = 0.55) -> list[Ent]:
+        """Surviving entities with a name close to this one: similar spelling, or sharing a whole word."""
+        target = norm_name(name)
+        words = set(target.split())
+        scored: dict[str, float] = {}
+        for e in self.roots(etype):
+            best = 0.0
+            for n in self.names_of(e.id):
+                nn = norm_name(n)
+                score = difflib.SequenceMatcher(None, target, nn).ratio()
+                shared = words & set(nn.split())
+                if shared and any(len(w) > 2 for w in shared):
+                    score = max(score, 0.6 + 0.1 * len(shared))
+                best = max(best, score)
+            if best >= floor:
+                scored[e.id] = best
+        ranked = sorted(scored, key=lambda i: (-scored[i], i))[:limit]
+        return [self.entities[i] for i in ranked]
+
+    # --- effects -----------------------------------------------------------
+
+    def _load_effects(self) -> None:
+        c = self.conn
+        self.retracted: set[str] = set()
+        self.moves: dict[str, str] = {}
+        ops = c.execute(
+            "SELECT statement_id, op, targets, moved FROM operations ORDER BY created_at DESC, id DESC"
+        ).fetchall()
+        for sid, op, targets, _ in ops:  # newest first: a retraction that was itself retracted does nothing
+            if op == "retract" and sid not in self.retracted:
+                self.retracted.update(json.loads(targets))
+        for sid, op, targets, moved in reversed(ops):  # oldest first: the latest move wins
+            if op == "not_part_of" and sid not in self.retracted:
+                t = json.loads(targets)
+                for m in json.loads(moved):
+                    self.moves[m] = t[0]
+        self.by_rel: dict[str, dict[str, str]] = {"supersedes": {}, "answers": {}, "repeats": {}}
+        for src, dst, rel in c.execute("SELECT src, dst, rel FROM relations ORDER BY src"):
+            if src in self.retracted:
+                continue
+            if rel == "repeats":
+                self.by_rel["repeats"][src] = dst
+            else:
+                self.by_rel[rel][dst] = src
+
+    def _stmt(self, r: sqlite3.Row) -> Stmt:
+        sid = r["id"]
+        s = Stmt(
+            sid,
+            r["note_id"],
+            r["seq"],
+            r["text"],
+            r["kind"],
+            r["created_at"],
+            self.root(self.moves.get(sid, r["thread_id"])),
+        )
+        if sid in self.retracted:
+            s.status = "retracted"
+        elif sid in self.by_rel["supersedes"]:
+            s.status, s.by = "superseded", self.by_rel["supersedes"][sid]
+        elif sid in self.by_rel["answers"]:
+            s.status, s.by = "answered", self.by_rel["answers"][sid]
+        elif sid in self.by_rel["repeats"]:
+            s.status, s.by = "repeat", self.by_rel["repeats"][sid]
+        return s
+
+    # --- statements --------------------------------------------------------
+
+    def select(self, where: str = "1", params: tuple | list = (), *, content: bool = True) -> list[Stmt]:
+        rows = self.conn.execute(
+            f"SELECT id, note_id, seq, text, kind, thread_id, created_at FROM statements s WHERE {where} "
+            "ORDER BY created_at, note_id, seq",
+            list(params),
+        ).fetchall()
+        out = [self._stmt(r) for r in rows]
+        return [s for s in out if s.kind in CONTENT_KINDS] if content else out
+
+    def by_id(self, ids: list[str] | set[str]) -> dict[str, Stmt]:
+        ids = list(ids)
+        if not ids:
+            return {}
+        return {s.id: s for s in self.select(f"id IN ({','.join('?' * len(ids))})", ids, content=False)}
+
+    def of_note(self, note_id: str) -> list[Stmt]:
+        return self.select("note_id = ?", (note_id,), content=False)
+
+    def of_entity(self, root_id: str) -> list[Stmt]:
+        """Every content statement that counts toward an entity, oldest first, whatever its status."""
+        e = self.entities.get(root_id)
+        if e is None:
+            return []
+        members = self.members(root_id)
+        marks = ",".join("?" * len(members))
+        if e.type == "thread":
+            moved_in = [sid for sid, t in self.moves.items() if self.root(t) == root_id]
+            where = f"thread_id IN ({marks})"
+            params: list = list(members)
+            if moved_in:
+                where = f"({where} OR id IN ({','.join('?' * len(moved_in))}))"
+                params += moved_in
+            return [s for s in self.select(where, params) if s.thread == root_id]
+        return self.select(f"id IN (SELECT statement_id FROM mentions WHERE entity_id IN ({marks}))", members)
+
+    def entities_of(self, statement_ids: list[str]) -> dict[str, list[str]]:
+        """Surviving entities each statement mentions."""
+        out: dict[str, list[str]] = {s: [] for s in statement_ids}
+        if not statement_ids:
+            return out
+        marks = ",".join("?" * len(statement_ids))
+        for sid, eid in self.conn.execute(
+            f"SELECT statement_id, entity_id FROM mentions WHERE statement_id IN ({marks})", statement_ids
+        ):
+            r = self.root(eid)
+            if r and r not in out[sid]:
+                out[sid].append(r)
+        return out
+
+    def open_items(self) -> list[Stmt]:
+        closed = {e.id for e in self.entities.values() if e.status == "closed"}
+        items = self.select("kind IN ('question', 'action')")
+        return [s for s in items if s.is_open and s.thread not in closed]
+
+    def last_activity(self, root_id: str) -> str | None:
+        members = self.members(root_id)
+        if not members:
+            return None
+        marks = ",".join("?" * len(members))
+        e = self.entities[root_id]
+        if e.type == "thread":
+            stmts = [s for s in self.of_entity(root_id) if s.status != "retracted"]
+            return stmts[-1].created_at if stmts else None
+        row = self.conn.execute(
+            f"SELECT MAX(created_at) FROM mentions WHERE entity_id IN ({marks})", members
+        ).fetchone()
+        return row[0]
+
+    def note_count(self, root_id: str) -> int:
+        members = self.members(root_id)
+        marks = ",".join("?" * len(members))
+        e = self.entities[root_id]
+        if e.type == "thread":
+            return len({s.note_id for s in self.of_entity(root_id)})
+        return self.conn.execute(
+            f"SELECT COUNT(DISTINCT note_id) FROM mentions WHERE entity_id IN ({marks})", members
+        ).fetchone()[0]
+
+    def related(self, root_id: str, *, limit: int = 12) -> list[Ent]:
+        """Other entities that appear in the same statements, most frequent first."""
+        counts: dict[str, int] = {}
+        stmts = self.of_entity(root_id)
+        for ents in self.entities_of([s.id for s in stmts]).values():
+            for e in ents:
+                counts[e] = counts.get(e, 0) + 1
+        for s in stmts:
+            if s.thread:
+                counts[s.thread] = counts.get(s.thread, 0) + 1
+        counts.pop(root_id, None)
+        ranked = sorted(counts, key=lambda i: (-counts[i], i))[:limit]
+        return [self.entities[i] for i in ranked if self.entities[i].status != "provisional"]
 
 
-def fragments_linked_to(
-    conn: sqlite3.Connection, node_ids: list[str], edge_types: tuple[str, ...], *, limit: int = 150
-) -> list[FragmentRow]:
-    """Fragments with an edge of these types to any of these nodes, newest `limit`, returned oldest first."""
-    if not node_ids:
-        return []
-    rows = conn.execute(
-        f"""
-        SELECT DISTINCT {FRAGMENT_COLS} FROM edges e JOIN fragments f ON e.src = 'frag:' || f.id
-        WHERE e.dst IN ({",".join("?" * len(node_ids))}) AND e.type IN ({",".join("?" * len(edge_types))})
-        ORDER BY f.created_at DESC, f.id DESC LIMIT ?
-        """,
-        [*node_ids, *edge_types, limit],
-    ).fetchall()
-    return list(reversed([_frag(r) for r in rows]))
+def pending_notes(conn: sqlite3.Connection) -> list[str]:
+    return [r[0] for r in conn.execute("SELECT id FROM notes WHERE done = 0 ORDER BY created_at, id")]
 
 
-# SQL condition, for fragments aliased `f`: the fragment is in an archived or OBE thread.
-IN_RETIRED_THREAD = (
-    "EXISTS (SELECT 1 FROM edges e JOIN threads t ON e.dst = 'thread:' || t.id "
-    "WHERE e.src = 'frag:' || f.id AND e.type = 'in_thread' AND t.state IN ('archived', 'obe'))"
-)
+def note_key(conn: sqlite3.Connection, note_id: str) -> str | None:
+    row = conn.execute("SELECT key FROM notes WHERE id = ?", (note_id,)).fetchone()
+    return row[0] if row else None
 
 
-def select_fragments(conn: sqlite3.Connection, where: str, params: tuple | list = ()) -> list[FragmentRow]:
-    """Fragments matching a WHERE clause (and any ORDER BY or LIMIT after it), with the table aliased `f`."""
-    return [_frag(r) for r in conn.execute(f"SELECT {FRAGMENT_COLS} FROM fragments f WHERE {where}", params)]
-
-
-def fragments_by_id(conn: sqlite3.Connection, ids: list[str]) -> dict[str, FragmentRow]:
+def note_dates(conn: sqlite3.Connection, ids: list[str] | set[str]) -> dict[str, tuple[str, str]]:
+    """Note id -> (created_at, label)."""
+    ids = list(ids)
     if not ids:
         return {}
-    rows = conn.execute(f"SELECT {FRAGMENT_COLS} FROM fragments f WHERE f.id IN ({','.join('?' * len(ids))})", ids)
-    return {r["id"]: _frag(r) for r in rows}
-
-
-def open_items(conn: sqlite3.Connection, *, exclude_entry: str | None = None) -> dict[str, FragmentRow]:
     rows = conn.execute(
-        f"SELECT {FRAGMENT_COLS} FROM fragments f WHERE f.state = 'open' AND f.status != 'overcome_by_events' "
-        "AND f.entry_id != ? ORDER BY f.created_at",
-        (exclude_entry or "",),
-    )
-    return {r["id"]: _frag(r) for r in rows}
-
-
-def entry_dates(conn: sqlite3.Connection, ids: list[str]) -> dict[str, tuple[str, str]]:
-    """entry id -> (created_at, label)"""
-    if not ids:
-        return {}
-    rows = conn.execute(
-        f"SELECT e.id, e.created_at, n.label FROM entries e JOIN nodes n ON n.id = 'entry:' || e.id "
-        f"WHERE e.id IN ({','.join('?' * len(ids))})",
+        f"SELECT id, created_at, COALESCE(title, substr(body, 1, 80)) FROM notes WHERE id IN ({','.join('?' * len(ids))})",
         ids,
-    )
-    return {r[0]: (r[1], r[2]) for r in rows}
-
-
-def neighbors(conn: sqlite3.Connection, node_id: str, *, depth: int = 2) -> list[str]:
-    """Node ids within `depth` hops, ignoring entry->fragment structure edges."""
-    rows = conn.execute(
-        """
-        WITH RECURSIVE walk(id, d) AS (
-          SELECT ?, 0
-          UNION
-          SELECT CASE WHEN e.src = w.id THEN e.dst ELSE e.src END, w.d + 1
-          FROM edges e JOIN walk w ON w.id IN (e.src, e.dst)
-          WHERE w.d < ? AND e.type != 'contains'
-        ) SELECT DISTINCT id FROM walk WHERE id != ?
-        """,
-        (node_id, depth, node_id),
     ).fetchall()
-    return [r[0] for r in rows]
+    return {r[0]: (r[1], r[2].strip().splitlines()[0] if r[2].strip() else r[0]) for r in rows}
+
+
+def events(conn: sqlite3.Connection, *, limit: int = 200, entity: list[str] | None = None) -> list[LogEvent]:
+    sql = "SELECT at, source, kind, text, entity_id FROM events"
+    params: list = []
+    if entity:
+        sql += f" WHERE entity_id IN ({','.join('?' * len(entity))})"
+        params += entity
+    sql += " ORDER BY at DESC, source DESC, seq LIMIT ?"
+    params.append(limit)
+    return [LogEvent(*r) for r in conn.execute(sql, params)]
+
+
+def vectors(conn: sqlite3.Connection, ids: list[str]) -> dict[str, bytes]:
+    if not ids:
+        return {}
+    rows = conn.execute(
+        f"SELECT e.owner_id, v.embedding FROM embeddings e JOIN vec_items v ON v.rowid = e.rowid "
+        f"WHERE e.owner_id IN ({','.join('?' * len(ids))})",
+        ids,
+    ).fetchall()
+    return {r[0]: bytes(r[1]) for r in rows}

@@ -1,175 +1,74 @@
+"""Format 2: notes, generated records, and the keys they are stored under."""
+
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime
 
 import pytest
 
-from brain.core.formats.decisions import Decisions, FragmentDecision
-from brain.core.formats.entity import Person, Thread, parse_entity
-from brain.core.formats.entry import Entry, content_hash
-from brain.core.formats.sidecars import (
-    EmbeddingFile,
-    EmbeddingItem,
-    ExtractedFragment,
-    Extraction,
-    ThreadRef,
-    encode_vector,
-)
-from brain.core.formats.yamlio import FormatError, UnsupportedFormat
+from brain.core import keys
+from brain.core.formats.note import Note
+from brain.core.formats.records import EntityRecord, SplitFile, Statement
+from brain.core.formats.yamlio import FORMAT_VERSION, FormatError, UnsupportedFormat
 
-EST = timezone(timedelta(hours=-4))
+NOW = datetime(2026, 11, 9, 14, 32, 5, tzinfo=UTC)
 
 
-def test_entry_roundtrip_keeps_offset_and_body():
-    e = Entry(
-        id="e-20261030T183205Z",
-        created=datetime(2026, 10, 30, 14, 32, 5, tzinfo=EST),
-        updated=datetime(2026, 10, 30, 14, 32, 5, tzinfo=EST),
-        title="Vendor call",
-        body="Line one.\n\n- a bullet: with colon\n---\nnot frontmatter\n",
-    )
-    text = e.to_text()
-    back = Entry.parse(text)
-    assert back.created == e.created and back.created.utcoffset() == timedelta(hours=-4)
-    assert back.body == e.body
-    assert back.title == "Vendor call"
-    assert back.content_hash == e.content_hash
-    assert Entry.parse(back.to_text()).to_text() == text
+def test_note_round_trips_and_keeps_the_body_exactly():
+    note = Note(id="n-20261109T143205Z", created=NOW, title="Vendor call", body="Line one.\n\n- a list\n")
+    text = note.to_text()
+    assert text.startswith("---\nformat: 2\nid: n-20261109T143205Z\n")
+    back = Note.parse(text)
+    assert back.body == "Line one.\n\n- a list\n" and back.title == "Vendor call" and back.about is None
+    assert back.content_hash == note.content_hash and back.to_text() == text
 
 
-def test_entry_hand_edits_keep_comments_and_unknown_keys():
-    text = (
-        "---\nformat: 1\nid: e-1  # my id\ncreated: 2026-10-30T09:00:00-04:00\n"
-        "updated: 2026-10-30T09:00:00-04:00\nmood: tired\n---\nBody\n"
-    )
-    e = Entry.parse(text)
-    e.title = "Added later"
-    out = e.to_text()
-    assert "# my id" in out and "mood: tired" in out and "title: Added later" in out
+def test_note_about_a_page_changes_its_hash():
+    plain = Note(id="n-1", created=NOW, body="This is finished.")
+    about = Note(id="n-1", created=NOW, body="This is finished.", about="gpu-quota-migration")
+    assert plain.content_hash != about.content_hash
+    assert "about: gpu-quota-migration" in about.to_text()
 
 
-def test_naive_timestamp_is_taken_as_local_time():
-    e = Entry.parse("---\nid: e-1\ncreated: 2026-10-30 09:00:00\nupdated: 2026-10-30 09:00:00\n---\nx\n")
-    assert e.created.tzinfo is not None
-
-
-def test_content_hash_ignores_line_endings_and_trailing_newlines():
-    assert content_hash("a\r\nb\n\n") == content_hash("a\nb")
-
-
-@pytest.mark.parametrize("text", ["no frontmatter", "---\nid: x\nno close", "---\n- list\n---\n"])
-def test_entry_parse_errors(text):
-    with pytest.raises(FormatError):
-        Entry.parse(text)
-
-
-def test_newer_format_is_refused():
+def test_note_from_a_newer_format_is_refused():
     with pytest.raises(UnsupportedFormat, match="Upgrade brain"):
-        Entry.parse("---\nformat: 2\nid: e-1\ncreated: 2026-10-30T09:00:00Z\nupdated: 2026-10-30T09:00:00Z\n---\nx\n")
+        Note.parse(f"---\nformat: {FORMAT_VERSION + 1}\nid: n-1\ncreated: 2026-11-09T14:32:05Z\n---\nx\n")
+    with pytest.raises(FormatError, match="frontmatter"):
+        Note.parse("no frontmatter here")
 
 
-def test_person_roundtrip_preserves_comments_and_custom_keys():
-    text = (
-        "---\nformat: 1\nid: jane-doe\ntype: person\nname: Jane Doe\n"
-        "aliases: [Jane, JD]  # how people refer to her\nrole: PM\nfavorite_tool: vim\n"
-        "memberships:\n  - org: platform-team\n    from: 2025-03\n    to:\n---\nLikes written agendas.\n"
+def test_keys_and_ids():
+    nid = keys.note_id_for(NOW)
+    assert nid == "n-20261109T143205Z" and keys.note_id_for(NOW, 2) == "n-20261109T143205Z-2"
+    assert keys.note_key(NOW, nid, "vendor-call") == "notes/2026/11/09/20261109T143205Z-vendor-call.md"
+    sid = keys.statement_id(nid, 3)
+    assert sid == "s-20261109T143205Z-03" and keys.note_of_statement(sid) == nid
+    assert keys.wiki_key("person", "jane-doe") == "wiki/people/jane-doe.md"
+    assert keys.classify(keys.layer_key(nid, "split")) == keys.KeyInfo("layer", f"note:{nid}", layer="split")
+    assert keys.classify(keys.entity_key("jane-doe")).unit == "entity:jane-doe"
+    assert keys.classify(keys.page_key("jane-doe")).unit == "entity:jane-doe"
+    assert keys.classify(keys.embedding_key("bge/small", nid)) == keys.KeyInfo(
+        "embedding", f"note:{nid}", model_slug="bge_small"
     )
-    p = parse_entity(text, where="people/jane-doe.md")
-    assert isinstance(p, Person)
-    assert p.memberships[0].from_ == "2025-03"
-    assert p.extra_fields() == {"favorite_tool": "vim"}
-    p.aliases.append("J. Doe")
-    out = p.to_text()
-    assert "favorite_tool: vim" in out
-    assert "Likes written agendas." in out
-    assert "J. Doe" in out
-    again = parse_entity(out, where="x")
-    assert again.aliases == ["Jane", "JD", "J. Doe"]
+    assert keys.classify(keys.dream_run_key("20261109T030000Z")).unit == "dream:20261109T030000Z"
+    for ignored in ("wiki/index.md", "wiki/people/jane-doe.md", keys.BRIEF_STATE, keys.LEASE, keys.DREAM_STATE):
+        assert keys.classify(ignored) is None, ignored
 
 
-def test_unchanged_list_keeps_its_comment():
-    text = "---\nid: jane\ntype: person\nname: Jane\naliases: [Jane, JD]  # keep me\n---\n"
-    p = parse_entity(text, where="x")
-    p.role = "PM"
-    assert "# keep me" in p.to_text()
-
-
-def test_bare_year_membership_and_type_from_directory():
-    p = parse_entity(
-        "---\nid: bob\nname: Bob\nmemberships:\n  - org: x\n    from: 2024\n---\n",
-        where="people/bob.md",
-        default_type="person",
+def test_records_round_trip_and_reject_unknown_fields():
+    split = SplitFile(
+        note_id="n-1", input_hash="sha256:x", created_at=NOW, statements=[Statement(id="s-1-01", text="A.", quote="A.")]
     )
-    assert p.type == "person" and p.memberships[0].from_ == "2024"
+    assert SplitFile.parse(split.to_bytes(), where="split") == split
+    with pytest.raises(FormatError, match="Extra inputs"):
+        SplitFile.parse(split.to_bytes().replace(b'"note_id"', b'"surprise": 1, "note_id"'), where="split")
+    with pytest.raises(FormatError, match="invalid JSON"):
+        SplitFile.parse(b"{", where="split")
 
 
-def test_new_entity_text_is_readable():
-    t = Thread(id="gpu-quota", name="GPU quota migration")
-    text = t.to_text()
-    assert text.startswith("---\nformat: 1\nid: gpu-quota\ntype: thread\nname: GPU quota migration\n")
-    assert parse_entity(text, where="threads/gpu-quota.md").name == "GPU quota migration"
-
-
-def test_entity_validation_error_names_the_file():
-    with pytest.raises(FormatError, match="themes/x.md"):
-        parse_entity("---\nid: x\ntype: theme\nname: X\nkind: vibes\n---\n", where="themes/x.md")
-
-
-def test_decisions_roundtrip_and_typo_rejected():
-    d = Decisions(entry="e-1")
-    d.fragments["f-1"] = FragmentDecision(status="overcome_by_events", obe={"date": "2026-11-04", "reason": "gone"})
-    d.mentions["person"] = {"Mike": "mike-chen", "the vendor": None}
-    text = d.to_text()
-    back = Decisions.parse(text)
-    assert back.fragments["f-1"].obe.reason == "gone"
-    assert back.mention_target("person", "the vendor") == (True, None)
-    assert back.mention_target("person", "Sam") == (False, None)
-    with pytest.raises(FormatError):
-        Decisions.parse("entry: e-1\nfragments:\n  f-1:\n    stauts: confirmed\n")
-
-
-def test_decisions_edit_keeps_comments():
-    d = Decisions.parse("entry: e-1  # the standup\nfragments:\n  f-1:\n    someday: true  # big idea\n")
-    d.fragments["f-2"] = FragmentDecision(state="closed")
-    out = d.to_text()
-    assert "# the standup" in out and "# big idea" in out and "state: closed" in out
-
-
-def test_thread_ref_requires_exactly_one_target():
-    with pytest.raises(ValueError):
-        ThreadRef(weight=0.5)
-    with pytest.raises(ValueError):
-        ThreadRef(thread="a", new={"name": "b"})
-
-
-def test_embedding_vectors_roundtrip_and_dim_checked():
-    vec = [0.5, -0.25, 1.0]
-    f = EmbeddingFile(
-        entry_id="e-1", model="m", dim=3, items=[EmbeddingItem(id="e-1", hash="h", vec=encode_vector(vec))]
-    )
-    back = EmbeddingFile.parse(f.to_bytes(), where="x")
-    assert back.items[0].vector() == vec
-    with pytest.raises(FormatError):
-        EmbeddingFile.parse(f.to_bytes().replace(b'"dim": 3', b'"dim": 4'), where="x")
-
-
-def test_extraction_parse():
-    x = Extraction(
-        entry_id="e-1",
-        entry_hash="sha256:x",
-        model="m",
-        prompt={"name": "extract", "version": 1, "sha256": "s"},
-        created_at=datetime.now(UTC),
-        fragments=[{"id": "f-1", "kind": "question", "text": "When?", "threads": [{"new": {"name": "T"}}]}],
-    )
-    back = Extraction.parse(x.to_bytes(), where="x")
-    assert back.fragments[0].threads[0].surface == "T"
-
-
-def test_old_dream_key_is_read_as_someday():
-    # The flag was called `dream` before 0.1.0; files written then must still load.
-    d = Decisions.parse("entry: e-1\nfragments:\n  f-1:\n    dream: true  # big idea\n")
-    assert d.fragments["f-1"].someday is True
-    assert "dream" not in d.to_text() and "someday: true" in d.to_text()
-    frag = ExtractedFragment.model_validate({"id": "f-1", "kind": "idea", "text": "x", "dream": True})
-    assert frag.someday is True
+def test_entity_names():
+    e = EntityRecord(id="jane-doe", type="person", name="Jane Doe", created_at=NOW)
+    assert e.add_name("JD") and not e.add_name("jane  doe") and not e.add_name("jd")
+    assert e.all_names() == ["Jane Doe", "JD"]
+    e.set_by["status"] = "note:n-1"
+    assert e.note_set("status") and not e.note_set("name")

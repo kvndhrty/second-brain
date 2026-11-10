@@ -23,16 +23,14 @@ from pydantic import BaseModel
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from brain import __version__
-from brain.core import review as rv
 from brain.core.answers import AmbiguousTarget
 from brain.core.formats.yamlio import FormatError
 from brain.core.llm.models import LLMError
-from brain.core.services import Brain, Busy, FragmentChange, JotFailed
+from brain.core.services import Brain, Busy, JotFailed
 from brain.core.shared import SharedBrain
 from brain.core.storage.base import StorageError
 from brain.core.storage.lease import LeaseError
-from brain.core.threads import ThreadError
-from brain.core.views import fragment_view
+from brain.core.views import NoSuchPage
 from brain.core.worker import Worker
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -40,17 +38,10 @@ LOCAL_HOSTS = ["127.0.0.1", "localhost"]
 T = TypeVar("T")
 
 
-class EntryIn(BaseModel):
+class NoteIn(BaseModel):
     text: str
     title: str | None = None
-
-
-class FragmentPatch(BaseModel):
-    status: Literal["confirmed", "speculative", "overcome_by_events"] | None = None
-    obe_reason: str | None = None
-    state: Literal["open", "closed"] | None = None
-    closed_note: str | None = None
-    someday: bool | None = None
+    about: str | None = None  # id of the wiki page the note corrects ("This is wrong")
 
 
 class AskIn(BaseModel):
@@ -58,57 +49,9 @@ class AskIn(BaseModel):
 
 
 class BriefIn(BaseModel):
-    target: str
+    request: str
     since: str | None = None
     mark_seen: bool = True
-
-
-class ThreadOpIn(BaseModel):
-    op: Literal["rename", "pin", "unpin", "archive", "activate", "obe", "merge", "split", "move"]
-    name: str | None = None
-    description: str | None = None
-    reason: str | None = None
-    cascade: bool = False
-    into: str | None = None  # merge target, or move destination
-    fragment_ids: list[str] = []
-
-
-class ReviewIn(BaseModel):
-    action: Literal["link", "create", "ignore", "accept", "rename", "merge", "yes", "no", "drop"]
-    entity_id: str | None = None
-    name: str | None = None
-    role: str | None = None
-    org: str | None = None
-    kind: Literal["domain", "technique"] = "domain"
-    into: str | None = None
-    apply_to_all: bool = True
-
-
-def _decision(body: ReviewIn) -> rv.ReviewDecision:
-    def need(value: str | None, field: str) -> str:
-        if not value:
-            raise ValueError(f"'{body.action}' needs '{field}'")
-        return value
-
-    match body.action:
-        case "link":
-            return rv.LinkMention(need(body.entity_id, "entity_id"), apply_to_all=body.apply_to_all)
-        case "create":
-            return rv.CreateEntity(
-                need(body.name, "name"), role=body.role, org=body.org, kind=body.kind, apply_to_all=body.apply_to_all
-            )
-        case "ignore":
-            return rv.IgnoreMention(apply_to_all=body.apply_to_all)
-        case "accept":
-            return rv.AcceptProposed()
-        case "rename":
-            return rv.AcceptProposed(rename=need(body.name, "name"))
-        case "merge":
-            return rv.MergeProposed(need(body.into, "into"))
-        case "yes" | "no":
-            return rv.AnswerDecision(accept=body.action == "yes")
-        case _:
-            return rv.DropDecision()
 
 
 def _data(obj: Any) -> Any:
@@ -172,9 +115,9 @@ def create_app(
         return await call_next(request)
 
     errors: list[tuple[type[BaseException] | tuple[type[BaseException], ...], int]] = [
-        (KeyError, 404),
+        ((KeyError, NoSuchPage), 404),
         (AmbiguousTarget, 409),
-        ((ValueError, rv.ReviewError, ThreadError, FormatError), 400),
+        ((ValueError, FormatError), 400),
         ((LeaseError, Busy), 409),
         (LLMError, 502),
         ((StorageError, JotFailed), 503),
@@ -186,7 +129,7 @@ def create_app(
                 detail = err.args[0] if isinstance(err, KeyError) and err.args else str(err)
                 body: dict[str, Any] = {"detail": str(detail)}
                 if isinstance(err, AmbiguousTarget):
-                    body["matches"] = [dataclasses.asdict(m) for m in err.matches]
+                    body["matches"] = [{"id": m.id, "type": m.type, "name": m.name} for m in err.matches]
                 return JSONResponse(body, status_code=code)
 
             app.add_exception_handler(e, handler)  # type: ignore[arg-type]
@@ -211,45 +154,29 @@ def create_app(
     def active() -> Any:
         return _data(call(lambda b: b.active_threads()))
 
-    @app.get("/api/entities/{etype}")
-    def entities(etype: Literal["person", "org", "theme", "thread"]) -> Any:
-        return _data(call(lambda b: b.entities(etype)))
+    @app.get("/api/pages")
+    def pages(type: Literal["person", "org", "topic", "thread"] | None = None) -> Any:
+        return _data(call(lambda b: b.pages(type)))
 
-    @app.get("/api/entity/{node_id}")
-    def entity(node_id: str) -> Any:
-        return _data(call(lambda b: b.entity(node_id)))
+    @app.get("/api/pages/{entity_id}")
+    def page(entity_id: str) -> Any:
+        return _data(call(lambda b: b.page(entity_id)))
 
-    @app.get("/api/entity/{node_id}/timeline")
-    def timeline(node_id: str) -> Any:
-        return _data(call(lambda b: b.timeline(node_id)))
+    @app.get("/api/notes")
+    def notes(limit: int = 50, before: str | None = None) -> Any:
+        return _data(call(lambda b: b.recent_notes(limit=min(max(limit, 1), 200), before=before)))
 
-    @app.get("/api/entries")
-    def entries(limit: int = 50, before: str | None = None) -> Any:
-        return _data(call(lambda b: b.recent_entries(limit=min(max(limit, 1), 200), before=before)))
+    @app.get("/api/notes/{note_id}")
+    def note(note_id: str) -> Any:
+        return _data(call(lambda b: b.note(note_id)))
 
-    @app.get("/api/entries/{entry_id}")
-    def entry(entry_id: str) -> Any:
-        return _data(call(lambda b: b.entry(entry_id)))
-
-    @app.get("/api/someday")
-    def someday() -> Any:
-        return _data(call(lambda b: b.someday()))
-
-    @app.get("/api/review")
-    def review_items() -> Any:
-        return _data(call(lambda b: b.review_items()))
-
-    @app.get("/api/choices/{etype}")
-    def choices(etype: Literal["person", "org", "theme", "thread"], q: str) -> Any:
-        return _data(call(lambda b: b.entity_choices(etype, q)))
+    @app.get("/api/log")
+    def log(limit: int = 100) -> Any:
+        return _data(call(lambda b: b.log(limit=min(max(limit, 1), 500))))
 
     @app.get("/api/search")
     def search(q: str, limit: int = 20) -> Any:
         return _data(call(lambda b: b.search(q, limit=min(max(limit, 1), 50))))
-
-    @app.get("/api/graph")
-    def graph(center: str | None = None, depth: int = 2, limit: int = 250) -> Any:
-        return _data(call(lambda b: b.graph(center=center, depth=min(max(depth, 1), 4), limit=min(limit, 1000))))
 
     @app.post("/api/ask")
     def ask(body: AskIn) -> Any:
@@ -264,73 +191,28 @@ def create_app(
     @app.post("/api/brief")
     def brief(body: BriefIn) -> Any:
         since = datetime.fromisoformat(body.since).astimezone() if body.since else None
-        r = call(lambda b: b.brief(body.target, since=since, record=body.mark_seen))
+        r = call(lambda b: b.brief(body.request, since=since, record=body.mark_seen))
         return {
-            "target": r.target,
-            "label": r.label,
-            "type": r.type,
+            "request": r.request,
+            "topics": _data(r.topics),
             "since": r.since.isoformat() if r.since else None,
-            "summary": r.summary,
             "sections": r.output.model_dump(),
-            "open_items": [dataclasses.asdict(fragment_view(f)) for f in r.open_items],
             "sources": [dataclasses.asdict(s) for s in r.sources.values()],
-            "notes": r.notes,
-            "fragment_count": r.fragment_count,
         }
 
     # --- write -----------------------------------------------------------------
 
-    @app.post("/api/entries")
-    def create_entry(body: EntryIn) -> Any:
-        saved = call(lambda b: b.jot(body.text, title=body.title))
-        wake()
-        return {"id": saved.entry.id, "key": saved.key}
-
-    @app.put("/api/entries/{entry_id}")
-    def update_entry(entry_id: str, body: EntryIn) -> Any:
-        call(lambda b: b.update_entry(entry_id, body.text, title=body.title))
-        wake()
-        return {"id": entry_id}
-
-    @app.patch("/api/fragments/{fragment_id}")
-    def patch_fragment(fragment_id: str, body: FragmentPatch) -> Any:
-        call(lambda b: b.set_fragment(fragment_id, FragmentChange(**body.model_dump())))
-        return {"id": fragment_id}
-
-    @app.post("/api/review/{item_id}")
-    def resolve(item_id: str, body: ReviewIn) -> Any:
-        decision = _decision(body)
-        call(lambda b: b.resolve_review(item_id, decision))
-        return {"id": item_id}
-
-    @app.post("/api/threads/{thread_id}")
-    def thread_op(thread_id: str, body: ThreadOpIn) -> Any:
-        def need(value: str | None, field: str) -> str:
-            if not value:
-                raise ValueError(f"'{body.op}' needs '{field}'")
-            return value
+    @app.post("/api/notes")
+    def create_note(body: NoteIn) -> Any:
+        """Save a note. This is the only write: corrections to the wiki are notes too."""
 
         def run(b: Brain) -> Any:
-            t = b.threads
-            match body.op:
-                case "rename":
-                    t.rename(thread_id, need(body.name, "name"))
-                case "pin" | "unpin":
-                    t.pin(thread_id, body.op == "pin")
-                case "archive" | "activate":
-                    t.set_state(thread_id, "archived" if body.op == "archive" else "active")
-                case "obe":
-                    return {"id": thread_id, "cascaded": t.obe(thread_id, reason=body.reason, cascade=body.cascade)}
-                case "merge":
-                    t.merge(thread_id, need(body.into, "into"))
-                    return {"id": need(body.into, "into")}
-                case "split":
-                    return {"id": t.split(thread_id, body.fragment_ids, need(body.name, "name"), body.description).id}
-                case "move":
-                    t.move(body.fragment_ids, thread_id, need(body.into, "into"))
-            return {"id": thread_id}
+            about = b.page(body.about).id if body.about else None
+            return b.jot(body.text, title=body.title, about=about)
 
-        return call(run)
+        saved = call(run)
+        wake()
+        return {"id": saved.note.id, "key": saved.key}
 
     @app.get("/api/context")
     def context() -> Any:
@@ -343,10 +225,9 @@ def create_app(
     def dream_status() -> Any:
         def run(b):
             last = b.last_dream()
-            plan = b.dream_plan()
             return {
                 "last": last.model_dump(mode="json") if last else None,
-                "planned": [j.label for j in plan.jobs],
+                "planned": dataclasses.asdict(b.dream_plan()),
                 "max_calls": b.settings.dream.max_calls,
             }
 
@@ -359,10 +240,6 @@ def create_app(
             raise HTTPException(409, "background processing is not running; use `brain dream`")
         worker.request_dream()
         return {"requested": True}
-
-    @app.get("/api/sweep")
-    def sweep(days: int = 30, quiet_days: int = 60) -> Any:
-        return _data(call(lambda b: b.sweep(days=max(days, 0), quiet_days=max(quiet_days, 0))))
 
     @app.post("/api/worker/wake")
     def wake_worker() -> Any:

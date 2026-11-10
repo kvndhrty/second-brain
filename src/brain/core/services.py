@@ -7,29 +7,26 @@ import secrets
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
 
 from brain.core import answers, dream, injected, keys, paths, views
 from brain.core.config import LoadedSettings, Settings
-from brain.core.formats.decisions import FragmentDecision, OpenState, Status
-from brain.core.formats.entity import ObeInfo
-from brain.core.formats.entry import Entry
+from brain.core.formats.note import Note
 from brain.core.index import queries
 from brain.core.index.db import IndexDB
+from brain.core.index.queries import World
 from brain.core.index.sync import Syncer, SyncReport
 from brain.core.llm.models import LLM, LLMError
 from brain.core.localstate import LocalState
+from brain.core.pipeline import wiki
 from brain.core.pipeline.context import PipelineContext
-from brain.core.pipeline.runner import Pipeline, ProcessReport
-from brain.core.review import Review, ReviewDecision, ReviewItem
+from brain.core.pipeline.runner import FAILURES, Pipeline, ProcessReport
 from brain.core.storage import Storage, open_storage
 from brain.core.storage.base import ObjectInfo
 from brain.core.storage.lease import Lease
 from brain.core.storage.probe import ensure_probed
-from brain.core.sweep import SweepItem, sweep_items
-from brain.core.threads import ThreadOps
 from brain.core.vault import Vault
 
 
@@ -42,7 +39,7 @@ class JotFailed(Exception):
 
 @dataclass(frozen=True)
 class JotResult:
-    entry: Entry
+    note: Note
     key: str
 
 
@@ -50,14 +47,11 @@ class Busy(Exception):
     """Another brain process on this machine is already running the pipeline."""
 
 
-@dataclass(frozen=True)
-class FragmentChange:
-    status: Status | None = None
-    obe_reason: str | None = None
-    obe_date: date | None = None
-    state: OpenState | None = None
-    closed_note: str | None = None
-    someday: bool | None = None
+@dataclass
+class RebuildReport:
+    notes: int
+    failed: list[str]
+    calls: int
 
 
 def index_path(settings: Settings, storage: Storage) -> Path:
@@ -130,23 +124,32 @@ class Brain:
         self.syncer = Syncer(self.db, self.storage, embed_model=self.settings.llm.embed_model)
         return self.syncer.sync(full=True)
 
-    # --- entries -------------------------------------------------------------
+    # --- notes ----------------------------------------------------------------
 
-    def jot(self, text: str, *, title: str | None = None, tags: list[str] | None = None) -> JotResult:
-        """Save an entry. The text is kept in a local draft until the store confirms the write."""
+    def jot(self, text: str, *, title: str | None = None, about: str | None = None) -> JotResult:
+        """Save a note. The text is kept in a local draft until the store confirms the write.
+
+        `about` is the id of the wiki page the note was written from (the
+        "This is wrong" button); the note is then read as a correction to it.
+        """
         if not text.strip():
-            raise ValueError("entry is empty")
+            raise ValueError("note is empty")
         draft = self.state.drafts_dir / f"draft-{secrets.token_hex(4)}.md"
         draft.write_text(text, encoding="utf-8")
         try:
-            entry, key = self.vault.save_entry(text, title=title, tags=tags)
+            note, key = self.vault.save_note(text, title=title, about=about)
         except Exception as e:
             raise JotFailed(draft, e) from e
         draft.unlink(missing_ok=True)
-        return JotResult(entry, key)
+        return JotResult(note, key)
 
     def pending_drafts(self) -> list[Path]:
         return sorted(self.state.drafts_dir.glob("draft-*.md"))
+
+    def adopt(self) -> list[Note]:
+        """Turn markdown files saved into notes/ by hand into notes."""
+        self.sync()
+        return self.vault.adopt_bare_notes()
 
     # --- models and pipeline -------------------------------------------------
 
@@ -157,7 +160,10 @@ class Brain:
         return self._llm
 
     def _ctx(self) -> PipelineContext:
-        return PipelineContext(self.settings, self.vault, self.db, self.llm)
+        return PipelineContext(self.settings, self.vault, self.db, self.llm, clock=self.clock)
+
+    def clock(self) -> datetime:
+        return datetime.now(UTC)
 
     def _require_llm(self) -> None:
         if not self.llm.configured:
@@ -176,196 +182,129 @@ class Brain:
         return Pipeline(self._ctx(), self.state)
 
     def process(
-        self, entry_id: str, *, force: bool = False, progress: Callable[[str], None] | None = None
+        self, note_id: str, *, force: bool = False, progress: Callable[[str], None] | None = None
     ) -> ProcessReport:
-        """Run the pipeline for one entry, then update the summaries of its threads."""
-        with self._processing("another brain process is processing entries; it will pick this one up"):
-            return self._pipeline().process(entry_id, force=force, progress=progress)
+        """Run the layers for one note and update the pages it touches."""
+        with self._processing("another brain process is processing notes; it will pick this one up"):
+            return ProcessReport([self._pipeline().run_note(note_id, force=force, progress=progress)])
 
     def process_pending(self, progress: Callable[[str, str], None] | None = None) -> ProcessReport:
         self.sync()
-        with self._processing("another brain process is already processing entries"):
+        with self._processing("another brain process is already processing notes"):
+            self.vault.adopt_bare_notes()
             return self._pipeline().process_pending(progress)
 
-    def reextract(
-        self,
-        entry_ids: list[str] | None = None,
-        *,
-        since: datetime | None = None,
-        stale_prompts: bool = False,
-        progress: Callable[[str, str], None] | None = None,
-    ) -> ProcessReport:
-        """Re-run extraction even for entries that are current (after a model or prompt change)."""
-        self.sync()
-        ids = entry_ids or self._select_entries(since=since, stale_prompts=stale_prompts)
-        with self._processing("another brain process is already processing entries"):
+    def rebuild(self, progress: Callable[[str, str], None] | None = None) -> RebuildReport:
+        """Discard everything generated except entity ids, and run every note again in date order.
+
+        This is how an improved prompt reaches old notes. Entity records are
+        reset to how they were created (names, status, and merges are learned
+        again from the notes) but keep their ids, so page paths and links stay
+        the same. An entity no note leads to any more stays provisional, with
+        no page.
+        """
+        self.sync(full=True)
+        with self._processing("another brain process is processing notes or dreaming"):
             pipeline = self._pipeline()
-            report = ProcessReport()
-            for eid in ids:
-                say = (lambda msg, e=eid: progress(e, msg)) if progress else None
-                report.entries.append(pipeline.run_entry(eid, force=True, progress=say))
-            report.threads, report.thread_errors = pipeline.summarize_stale(
-                progress=(lambda msg: progress("", msg)) if progress else None
-            )
-            return report
-
-    def _select_entries(self, *, since: datetime | None, stale_prompts: bool) -> list[str]:
-        rows = self.db.conn.execute(
-            "SELECT id, created_at FROM entries WHERE created_at >= ? ORDER BY created_at, id",
-            ((since or datetime(1970, 1, 1, tzinfo=UTC)).isoformat(),),
-        ).fetchall()
-        ids = [r[0] for r in rows]
-        if not stale_prompts:
-            return ids
-        from brain.core.formats.sidecars import Extraction
-        from brain.core.llm.prompts import load_prompt
-
-        current = load_prompt("extract").stamp
-        stale = []
-        for eid in ids:
-            found = self.vault.read_sidecar(keys.extraction_key(eid), Extraction)
-            if found is None or found[0].prompt != current:
-                stale.append(eid)  # missing, unreadable, or from another prompt version
-        return stale
+            for o in list(self.storage.list(keys.GENERATED)):
+                if not o.key.startswith(keys.ENTITIES):
+                    self.vault.delete(o.key)
+            for o in list(self.storage.list(keys.WIKI)):
+                self.vault.delete(o.key)
+            for e in self.world().entities.values():
+                self.vault.put_entity(e.record.reset())
+            ids = [r[0] for r in self.db.conn.execute("SELECT id FROM notes ORDER BY created_at, id")]
+            failed, calls = [], 0
+            for note_id in ids:
+                say = (lambda msg, n=note_id: progress(n, msg)) if progress else None
+                result = pipeline.run_note(note_id, force=True, progress=say)
+                calls += result.calls
+                if result.error:
+                    failed.append(f"{note_id}: {result.error}")
+            wiki.write(pipeline.ctx, [], self.clock(), everything=True)
+            return RebuildReport(len(ids), failed, calls)
 
     def failures(self) -> dict[str, dict]:
-        from brain.core.pipeline.runner import FAILURES
-
         return self.state.read_json(FAILURES)
-
-    # --- review --------------------------------------------------------------
-
-    def review_items(self) -> list[ReviewItem]:
-        return Review(self.vault, self.db.conn).items()
-
-    def resolve_review(self, item_id: str, decision: ReviewDecision) -> None:
-        Review(self.vault, self.db.conn).resolve(item_id, decision)
-
-    def entity_choices(self, etype: str, text: str, *, limit: int = 8) -> list[queries.Candidate]:
-        """Existing entities of a type whose names are close to `text` (for linking in review)."""
-        return queries.fuzzy_candidates(self.db.conn, etype, text, limit=limit)
-
-    # --- fragments -----------------------------------------------------------
-
-    def set_fragment(self, fragment_id: str, change: FragmentChange) -> None:
-        row = self.db.conn.execute("SELECT entry_id FROM fragments WHERE id = ?", (fragment_id,)).fetchone()
-        if row is None:
-            raise KeyError(f"no fragment {fragment_id}")
-        d = self.vault.get_decisions(row[0])
-        fd = d.fragments.get(fragment_id) or FragmentDecision()
-        if change.status is not None:
-            fd.status = change.status
-            if change.status == "overcome_by_events":
-                fd.obe = ObeInfo(date=change.obe_date or datetime.now().date(), reason=change.obe_reason)
-            else:
-                fd.obe = None
-        if change.state is not None:
-            fd.state = change.state
-            fd.closed_note = change.closed_note if change.state == "closed" else None
-        if change.someday is not None:
-            fd.someday = change.someday
-        d.fragments[fragment_id] = fd
-        self.vault.put_decisions(d)
 
     # --- reading ---------------------------------------------------------------
 
-    def active_threads(self, *, now: datetime | None = None) -> list[queries.ThreadRow]:
-        return queries.active_threads(
-            self.db.conn, now=now or datetime.now(UTC), inactivity_days=self.settings.threads.inactivity_days
+    def world(self) -> World:
+        return World(self.db.conn)
+
+    def active_threads(self, *, now: datetime | None = None) -> list[views.EntitySummary]:
+        return views.active_threads(
+            self.db.conn, now=now or self.clock(), inactivity_days=self.settings.threads.inactivity_days
         )
 
     def ask(self, question: str) -> answers.Answer:
-        return answers.ask(self.db.conn, self.llm, question)
+        self._require_llm()
+        return answers.ask(self.db.conn, self.llm, question, now=self.clock())
 
-    def brief(self, target: str, *, since: datetime | None = None, record: bool = True) -> answers.Brief:
-        return answers.brief(self.db.conn, self.llm, self.vault, target, since=since, record=record)
+    def brief(self, request: str, *, since: datetime | None = None, record: bool = True) -> answers.Brief:
+        self._require_llm()
+        return answers.brief(self.db.conn, self.llm, self.vault, request, now=self.clock(), since=since, record=record)
 
     def search(self, query: str, *, limit: int = 10, types: tuple[str, ...] | None = None) -> list[views.Hit]:
         llm = self.llm if self.llm.configured and self.llm.embed_model else None
         return views.search_all(self.db.conn, llm, query, limit=limit, types=types)
 
-    def entity(self, text: str) -> views.EntityView:
-        return views.entity_view(self.db.conn, text)
+    def page(self, entity: str) -> views.PageData:
+        """A wiki page by id or exact name. Raises views.NoSuchPage."""
+        return views.page(self.db.conn, entity, now=self.clock())
 
-    def entry(self, entry_id: str) -> views.EntryView:
-        return views.entry_view(self.db.conn, entry_id)
+    def page_markdown(self, entity: str) -> str:
+        e = views.resolve(self.world(), entity)
+        return wiki.Renderer(self._ctx(), self.clock()).page(e.id)
 
-    def entities(self, etype: str) -> list[views.EntitySummary]:
+    def pages(self, etype: str | None = None) -> list[views.EntitySummary]:
         return views.entity_list(self.db.conn, etype)
 
-    def recent_entries(self, *, limit: int = 50, before: str | None = None) -> list[views.EntrySummary]:
-        return views.recent_entries(self.db.conn, limit=limit, before=before)
+    def note(self, note_id: str) -> views.NoteView:
+        return views.note(self.db.conn, note_id, now=self.clock())
 
-    def someday(self) -> list[views.FragmentView]:
-        return views.someday(self.db.conn)
+    def recent_notes(self, *, limit: int = 50, before: str | None = None) -> list[views.NoteSummary]:
+        return views.recent_notes(self.db.conn, limit=limit, before=before)
 
-    def timeline(self, node_id: str) -> list[views.TimelineFragment]:
-        return views.node_timeline(self.db.conn, node_id)
-
-    def graph(self, *, center: str | None = None, depth: int = 2, limit: int = 250) -> views.Graph:
-        return views.entity_graph(self.db.conn, center=center, depth=depth, limit=limit)
-
-    def update_entry(self, entry_id: str, text: str, *, title: str | None = None) -> Entry:
-        """Replace an entry's text (your edit). Extraction runs again on the next processing pass."""
-        if not text.strip():
-            raise ValueError("entry is empty")
-        entry, key = self.vault.get_entry(entry_id, queries.entry_key(self.db.conn, entry_id))
-        entry.body = text
-        entry.title = title or None
-        return self.vault.update_entry(entry, key)
+    def log(self, *, limit: int = 100) -> list[queries.LogEvent]:
+        return queries.events(self.db.conn, limit=limit)
 
     def status(self) -> dict:
         c = self.db.conn
         return {
             "store": self.storage.describe(),
-            "entries": c.execute("SELECT COUNT(*) FROM entries").fetchone()[0],
-            "pending": c.execute("SELECT COUNT(*) FROM entries WHERE next_step != 'done'").fetchone()[0],
-            "review": c.execute("SELECT COUNT(*) FROM review_items").fetchone()[0],
+            "notes": c.execute("SELECT COUNT(*) FROM notes").fetchone()[0],
+            "pending": c.execute("SELECT COUNT(*) FROM notes WHERE done = 0").fetchone()[0],
+            "pages": c.execute(
+                "SELECT COUNT(*) FROM entities WHERE merged_into IS NULL AND status != 'provisional'"
+            ).fetchone()[0],
             "llm_configured": self.llm.configured,
             "failures": len(self.failures()),
         }
 
-    # --- threads and the OBE sweep --------------------------------------------
-
-    @property
-    def threads(self) -> ThreadOps:
-        return ThreadOps(self.vault, self.db.conn)
-
-    def sweep(self, *, days: int = 30, quiet_days: int = 60, now: datetime | None = None) -> list[SweepItem]:
-        items = sweep_items(self.db.conn, now=now or datetime.now(UTC), days=days, quiet_days=quiet_days)
-        verdicts = dream.suggestions(self.db.conn)
-        for item in items:
-            if item.fragment is not None:
-                item.suggestion = verdicts.get(item.fragment.id)
-        return items
-
-    def find_targets(self, text: str) -> list[answers.NodeMatch]:
-        return answers.find_targets(self.db.conn, text)
-
     # --- injected context and dreaming ------------------------------------------
 
     def context(self, *, now: datetime | None = None) -> injected.ContextDoc:
-        return injected.build(self.db.conn, self.settings, now=now or datetime.now(UTC))
+        return injected.build(self.db.conn, self.settings, now=now or self.clock())
 
     def context_text(self, *, now: datetime | None = None) -> str:
         cfg = self.settings.context
         return injected.render_markdown(self.context(now=now), max_lines=cfg.max_lines, max_bytes=cfg.max_bytes)
 
-    def dream_plan(self, *, thread: str | None = None) -> dream.DreamPlan:
-        """What a dream pass would do, without calling a model."""
+    def dream_plan(self) -> dream.DreamPlan:
+        """What a dream pass would look at, without calling a model."""
         self.sync()
-        return dream.Dreamer(self._ctx(), self.settings.dream).plan(thread=thread)
+        return dream.Dreamer(self._ctx(), self.settings.dream).plan()
 
-    def dream(self, *, thread: str | None = None, progress: Callable[[str], None] | None = None):
+    def dream(self, *, progress: Callable[[str], None] | None = None) -> dream.DreamRun:
         """Run one dream pass. Holds the processing lock so it never overlaps the pipeline."""
         self._require_llm()
         self.sync()
-        with self._processing("another brain process is processing entries or dreaming"):
-            dreamer = dream.Dreamer(self._ctx(), self.settings.dream)
-            return dreamer.run(dreamer.plan(thread=thread), progress=progress)
+        with self._processing("another brain process is processing notes or dreaming"):
+            return dream.Dreamer(self._ctx(), self.settings.dream).run(progress=progress)
 
     def dream_due(self, *, now: datetime | None = None) -> str | None:
-        return dream.is_due(self._ctx(), self.settings.dream, now=now or datetime.now(UTC))
+        return dream.is_due(self._ctx(), self.settings.dream, now=now or self.clock())
 
-    def last_dream(self):
+    def last_dream(self) -> dream.DreamRun | None:
         return dream.last_run(self._ctx())

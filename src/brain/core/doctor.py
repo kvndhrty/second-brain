@@ -296,7 +296,7 @@ class Doctor:
 
         def models() -> str:
             ids = llm.list_models(c)
-            wanted = [m for m in (cfg.chat_model, cfg.extract_model, cfg.embed_model) if m]
+            wanted = [m for m in (cfg.small_model, cfg.strong_model, cfg.embed_model) if m]
             missing = [m for m in wanted if m not in ids]
             if missing:
                 raise LookupError(f"gateway lists {len(ids)} models but not: {', '.join(missing)}")
@@ -317,12 +317,15 @@ class Doctor:
                 f"cannot list models: {msg}",
                 "Some gateways do not implement /models; the checks below still test each model directly.",
             )
-        for role, model in (("chat", cfg.chat_model), ("extract", cfg.extract_model)):
+        for role, model in (("small model", cfg.small_model), ("strong model", cfg.strong_model)):
             if not model:
-                self.add(role, "skip", f"llm.{role}_model is not set")
+                missing = (
+                    "llm.small_model is not set" if role == "small model" else "not set; dreaming uses the small model"
+                )
+                self.add(role, "skip", missing)
                 continue
-            if role == "extract" and model == cfg.chat_model:
-                self.add(role, "ok", f"{model} (same as chat model)")
+            if role == "strong model" and model == cfg.small_model:
+                self.add(role, "ok", f"{model} (same as the small model)")
                 continue
             attempt(role, lambda m=model: f"{m} replied ({llm.chat_ping(c, m)!r})")
         if cfg.embed_model:
@@ -338,7 +341,7 @@ class Doctor:
             attempt("embedding", emb)
         else:
             self.add("embedding", "skip", "llm.embed_model is not set")
-        if any(r.name in ("chat", "extract") and r.status == "fail" for r in self.results):
+        if any(r.name in ("small model", "strong model") and r.status == "fail" for r in self.results):
             self.add("structured output", "skip", "skipped because a model call above failed")
         else:
             self.check_structured(settings)
@@ -367,7 +370,7 @@ class Doctor:
         fix = (
             f"Set llm.structured_output = {working[0]!r}."
             if working
-            else f"No mode works with {llm.model_name('extract')}: {errors.get(effective, '')}"
+            else f"No mode works with {llm.model_name('layer')}: {errors.get(effective, '')}"
         )
         self.add("structured output", "fail", detail, fix)
 
@@ -389,17 +392,19 @@ class Doctor:
             if idx.rebuilt_reason:
                 self.add("index", "info", f"index will be rebuilt: {idx.rebuilt_reason}")
             c = idx.conn
-            n_entries = c.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
-            pending = c.execute("SELECT COUNT(*) FROM entries WHERE next_step != 'done'").fetchone()[0]
-            review = c.execute("SELECT COUNT(*) FROM review_items").fetchone()[0]
-            self.add("index", "ok", f"{n_entries} entries, {pending} not fully processed, {review} review items")
+            n_notes = c.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+            pending = c.execute("SELECT COUNT(*) FROM notes WHERE done = 0").fetchone()[0]
+            n_pages = c.execute(
+                "SELECT COUNT(*) FROM entities WHERE merged_into IS NULL AND status != 'provisional'"
+            ).fetchone()[0]
+            self.add("index", "ok", f"{n_notes} notes, {pending} not fully processed, {n_pages} wiki pages")
             failures = self.state.read_json("pipeline-failures.json")
             if failures:
                 eid, f = sorted(failures.items(), key=lambda kv: kv[1].get("at", ""))[-1]
                 self.add(
                     "pipeline",
                     "warn",
-                    f"{len(failures)} entries failed processing; latest {eid} at "
+                    f"{len(failures)} notes failed processing; latest {eid} at "
                     f"{f['step']}: {f['error'].splitlines()[0]}",
                     "Fix the cause, then run `brain process`.",
                 )
@@ -419,7 +424,7 @@ class Doctor:
             idx.close()
 
     def check_dream(self, storage: Storage) -> None:
-        from brain.core.formats.sidecars import DreamRun, DreamState
+        from brain.core.formats.records import DreamRun, DreamState
         from brain.core.formats.yamlio import FormatError
         from brain.core.storage.base import NotFound
 
@@ -435,7 +440,7 @@ class Doctor:
             self.add("dream", "warn", f"cannot read the last dream pass: {e}")
             return
         when = (run.finished_at or run.started_at).astimezone().strftime("%Y-%m-%d %H:%M")
-        detail = f"last pass {when}: {run.calls} model calls, {len(run.applied)} applied, {len(run.proposed)} proposed"
+        detail = f"last pass {when}: {run.calls} model calls, {len(run.events)} change(s)"
         if run.errors:
             self.add(
                 "dream", "warn", f"{detail}; {len(run.errors)} failed: {run.errors[-1]}", "Run `brain dream` again."

@@ -63,10 +63,13 @@ class TLSConfig(_Section):
 class LLMConfig(_Section):
     base_url: str = ""
     api_key_env: str = "BRAIN_API_KEY"
-    chat_model: str = ""
-    extract_model: str = ""
+    small_model: str = ""  # layers 1-8 and brief routing
+    strong_model: str = ""  # optional
     embed_model: str = ""
-    doc_model: str = ""
+    dream_uses: Literal["strong", "small"] = "strong"  # falls back to small when no strong model is set
+    answer_uses: Literal["strong", "small"] = "small"  # ask and brief answers
+    # Retry on the strong model when the small model's output fails validation.
+    escalate: Literal["off", "strong"] = "off"
     embed_dim: int = Field(default=0, ge=0)
     structured_output: Literal["auto", "tool", "native", "prompted"] = "auto"
     timeout_seconds: float = Field(default=120, gt=0)
@@ -104,9 +107,13 @@ class DreamConfig(_Section):
 
     enabled: bool = True  # whether `brain start` dreams on its own; `brain dream` always works
     nightly_at: str = "03:00"  # local time HH:MM; "" turns the nightly pass off
-    after_entries: int = Field(default=10, ge=0)  # also dream after this many new entries; 0 turns it off
+    after_notes: int = Field(default=10, ge=0)  # also dream after this many new notes; 0 turns it off
     max_calls: int = Field(default=50, ge=1)  # model calls per pass
-    rebuild_after_updates: int = Field(default=10, ge=1)  # rebuild a summary after this many new entries
+    rebuild_after_updates: int = Field(default=10, ge=1)  # rebuild a summary after this many updates
+    stale_days: int = Field(default=14, ge=1)  # re-check open questions and actions older than this
+    close_after_days: int = Field(
+        default=60, ge=1
+    )  # close a thread with no open items after this long without activity
     rebuild_after_days: int = Field(default=30, ge=1)  # or when it was last rebuilt this long ago
 
     @model_validator(mode="after")
