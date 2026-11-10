@@ -15,7 +15,7 @@ from brain.core.index import queries, search
 from brain.core.index.db import get_meta
 from brain.core.index.queries import Ent, Stmt, World
 from brain.core.llm.models import LLM
-from brain.core.temporal import age, iso_day
+from brain.core.temporal import age, iso_day, utc_iso
 
 SNIPPET_CHARS = 280
 HISTORY_LIMIT = 150
@@ -227,7 +227,7 @@ def entity_list(
 
 def active_threads(conn: sqlite3.Connection, *, now: datetime, inactivity_days: int) -> list[EntitySummary]:
     """Threads that are not closed and had activity recently, or still have open items."""
-    cutoff = (now - timedelta(days=inactivity_days)).isoformat()
+    cutoff = utc_iso(now - timedelta(days=inactivity_days))
     return [
         t
         for t in entity_list(conn, "thread")

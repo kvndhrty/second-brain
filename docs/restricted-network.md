@@ -30,14 +30,14 @@ Either from a release wheel, which already contains the web UI:
 
 ```sh
 uv tool install --managed-python --python 3.12 \
-  https://github.com/<owner>/second-brain/releases/download/vX.Y.Z/brain_journal-X.Y.Z-py3-none-any.whl
+  https://github.com/kvndhrty/second-brain/releases/download/vX.Y.Z/brain_journal-X.Y.Z-py3-none-any.whl
 ```
 
 or from a clone, which builds the web UI during install and needs Node 22+
 and the npm mirror (`npm config set registry https://npm-mirror.internal/`):
 
 ```sh
-git clone https://github.com/<owner>/second-brain.git
+git clone https://github.com/kvndhrty/second-brain.git
 cd second-brain
 uv tool install --managed-python --python 3.12 .
 ```
@@ -66,8 +66,8 @@ client_key = ""
 [llm]
 base_url = "https://llm-gateway.internal/v1"
 api_key_env = "BRAIN_API_KEY"
-chat_model = "..."
-extract_model = "..."
+small_model = "..."         # does the work on every note
+strong_model = ""           # optional; used for dreaming
 embed_model = "..."
 ```
 
@@ -108,17 +108,17 @@ BRAIN_LIVE_TESTS=1 BRAIN_TEST_LIVE_CONFIG=~/.config/brain/config.toml \
   uv run --managed-python --python 3.12 pytest tests/live        # from a clone
 ```
 
-This extracts one sample entry into a throwaway local store and asks a
-question about it. If extraction quality looks wrong, the prompts are in
-`src/brain/prompts/`; after changing them, `brain reextract --stale-prompts`
-re-runs only the entries extracted with an older version.
+This processes one sample note into a throwaway local store and asks a
+question about it. If the results look wrong, the prompts are in
+`src/brain/prompts/`, one file per step; after changing them, `brain rebuild`
+runs every note again.
 
 ## 6. Daily use
 
 ```sh
 brain start            # web UI on http://127.0.0.1:8765, background processing
 brain jot              # or write in the web UI
-brain review           # confirm new people and orgs
+brain wiki             # the pages brain keeps from your notes
 brain brief "thread or person"
 ```
 

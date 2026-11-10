@@ -20,7 +20,7 @@ from brain.core.llm.models import LLM
 from brain.core.llm.schemas import AskOutput, BriefOutput, BriefRoute, Claim
 from brain.core.pipeline.text import attr, candidate_el, check_citations, stmt_el
 from brain.core.storage.lease import LeaseError
-from brain.core.temporal import as_of, iso_day, local_date, today_el
+from brain.core.temporal import as_of, iso_day, local_date, today_el, utc_iso
 from brain.core.vault import Vault
 
 ASK_STATEMENTS = 24
@@ -224,7 +224,7 @@ def brief(
 
     def show(stmts: list[Stmt]) -> None:
         for s in stmts:
-            new = ' new="yes"' if since and s.created_at > since.isoformat() else ""
+            new = ' new="yes"' if since and s.created_at > utc_iso(since) else ""
             lines.append(stmt_el(s, today, with_id=False, extra=new))
             allowed.add(s.note_id)
 

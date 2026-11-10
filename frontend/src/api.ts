@@ -199,3 +199,16 @@ export const api = {
 
 export const pagePath = (id: string) => `/p/${q(id)}`;
 export const notePath = (id: string) => `/notes/${q(id)}`;
+
+// Timestamps from the API are UTC; show them as local dates and times.
+export function day(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso.slice(0, 10) : d.toLocaleDateString("sv-SE");
+}
+
+export function minute(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso.slice(0, 16).replace("T", " ");
+  return `${d.toLocaleDateString("sv-SE")} ${d.toLocaleTimeString("sv-SE").slice(0, 5)}`;
+}

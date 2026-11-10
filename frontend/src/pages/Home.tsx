@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { api, pagePath } from "../api";
+import { api, day, minute, pagePath } from "../api";
 import { Loading, NoteBox, NoteLink } from "../components";
 import { useInterval, useLoad } from "../hooks";
 
@@ -55,7 +55,7 @@ export function HomePage({ onSaved }: { onSaved?: () => void }) {
       <ul className="log">
         {log.data?.map((ev, i) => (
           <li key={i}>
-            <span className="meta">{ev.at.slice(0, 10)}</span> {ev.text}{" "}
+            <span className="meta">{day(ev.at)}</span> {ev.text}{" "}
             {ev.source.startsWith("n-") ? <NoteLink id={ev.source}>note</NoteLink> : <span className="meta">dreaming</span>}
           </li>
         ))}
@@ -88,7 +88,7 @@ function DreamPanel() {
       <summary>
         Dreaming:{" "}
         {last
-          ? `last pass ${(last.finished_at ?? last.started_at).slice(0, 16).replace("T", " ")}, ${last.events.length} change(s)`
+          ? `last pass ${minute(last.finished_at ?? last.started_at)}, ${last.events.length} change(s)`
           : "no pass yet"}
         {waiting > 0 && ` · ${waiting} thing(s) to look at`}
       </summary>

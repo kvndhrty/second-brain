@@ -51,7 +51,7 @@ from brain.core.pipeline.context import Calls, PipelineContext
 from brain.core.pipeline.state import _dot
 from brain.core.pipeline.text import attr, stmt_el
 from brain.core.storage.base import StorageError
-from brain.core.temporal import last_mentioned, local_date, today_el
+from brain.core.temporal import last_mentioned, local_date, today_el, utc_iso
 
 PROMPTS = ("dream_same", "dream_stale", "dream_profile")
 MAX_PAIRS = 40
@@ -167,7 +167,7 @@ class Dreamer:
                     plan.duplicates.append((e.id, other.id))
         plan.duplicates = plan.duplicates[:MAX_PAIRS]
 
-        cutoff = (now - timedelta(days=self.cfg.stale_days)).isoformat()
+        cutoff = utc_iso(now - timedelta(days=self.cfg.stale_days))
         for item in world.open_items():
             if item.created_at > cutoff:
                 continue
@@ -175,7 +175,7 @@ class Dreamer:
             if later and self.state.checked_items.get(item.id) != self._stale_sig(later):
                 plan.stale.append(item.id)
 
-        quiet = (now - timedelta(days=self.cfg.close_after_days)).isoformat()
+        quiet = utc_iso(now - timedelta(days=self.cfg.close_after_days))
         open_threads = {s.thread for s in world.open_items()}
         for t in world.roots("thread", with_provisional=False):
             last = world.last_activity(t.id)

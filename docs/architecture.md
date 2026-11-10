@@ -1,1163 +1,469 @@
 # brain — architecture
 
-This describes the design as built: milestones 1 to 5, then temporal context,
-the injected context, and dreaming (section 6). Section 10 records the
-decisions made along the way and why.
+This describes the design as built in version 0.2: notes in, wiki out. It
+replaces the review-based design of 0.1. Section 14 records the decisions
+made along the way and why.
+
+## 1. Summary
+
+- The person only writes notes and asks questions. Notes are the only input.
+- Models build and maintain everything else: people, orgs, topics, threads,
+  and a wiki page for each.
+- The work is split into layers of small calls, so a small model does it
+  reliably. A strong model is optional and is used only where configured.
+- Files in a store (local directory or S3 prefix) are the source of truth. A
+  SQLite database on local disk is a derived index (tables, FTS5, sqlite-vec
+  vectors); `brain reindex` rebuilds it from the files without calling a model.
+- Everything except the notes is generated, and `brain rebuild` regenerates
+  it from the notes by running the layers again in date order.
+- One Python package. `brain.core` holds all behaviour and has no imports of
+  Typer, FastAPI, or MCP. `brain.cli`, `brain.web`, and `brain.mcp` call a
+  single façade class (`Brain`) and only format input and output.
+- `brain start` is the one long-running process: web UI, HTTP API, MCP over
+  HTTP, and a background worker that processes new notes and dreams.
 
 The memory layers follow Anthropic's post [Components of agent
 memory](https://www.anthropic.com/research/components-of-agent-memory):
 
 | Post | brain |
 |---|---|
-| Transcripts (ground truth) | Entries, never rewritten by a model |
-| Memory notes | Fragments, written by the `extract` step |
-| Representations | Thread, person, org, and theme files; thread summaries |
+| Transcripts (ground truth) | Notes, never changed by the tool |
+| Memory notes | Statements, written by layers 1 and 2 |
+| Representations | Entity records and wiki pages |
 | Injected context | `brain context`: a short, dated summary loaded into agent sessions |
-| Dreaming | `brain dream`: an offline pass that re-checks derived notes against the entries |
+| Dreaming | Layer 9: an offline pass across all notes |
 
-## 1. Summary
+## 2. Rules
 
-- Files in a store (local directory or S3 prefix) are the source of truth.
-- A SQLite database on local disk is a derived index: graph tables, FTS5, and
-  sqlite-vec vectors. `brain reindex` rebuilds it from the files without
-  calling any model.
-- One Python package. `brain.core` holds all behaviour and has no imports of
-  Typer, FastAPI, or MCP. `brain.cli`, `brain.web`, and `brain.mcp` call a single
-  façade class (`Brain`) and only format input and output.
-- `brain start` is the one long-running process: web UI, HTTP API, MCP over
-  HTTP, and a background worker that processes pending entries. All other
-  commands are short-lived CLI calls.
-- All model and S3 traffic uses one TLS configuration (same CA and client cert
-  for both).
-- Every note given to a model carries its date and its age relative to today,
-  and derived text carries the as-of date of the newest entry it covers, so the
-  model can tell newer information from older.
+1. **Notes are never changed by the tool and never edited to correct them.**
+   A correction is a new note. Later notes take precedence over earlier ones.
+2. **Everything except notes is generated** and can be rebuilt from the notes.
+3. **The tool never asks the person to decide anything.** When a layer is
+   unsure, it records the result as provisional, and a later layer or a later
+   note settles it.
+4. **Each call does one thing.** Its input is small and bounded, its output
+   is a choice from a list or a short structure, and code validates the
+   output before using it.
+5. **Code does everything that does not need a model:** finding candidates,
+   exact name matches, date arithmetic, citation checks, and every list on a
+   wiki page.
+6. **A failed call never blocks a note.** See section 8.
 
-## 2. Package layout
+## 3. Package layout
 
 ```
-second-brain/                     repository (public on GitHub)
-├─ pyproject.toml                 dist name "brain-journal"; console script "brain"
-├─ src/brain/
-│  ├─ core/
-│  │  ├─ config.py                settings model, load order, XDG paths
-│  │  ├─ keys.py                  every storage key pattern, in one place
-│  │  ├─ formats/                 pydantic models + parse/serialize for each file type
-│  │  │  ├─ entry.py              (this directory is the durable contract)
-│  │  │  ├─ entity.py
-│  │  │  ├─ decisions.py
-│  │  │  └─ sidecars.py
-│  │  ├─ storage/
-│  │  │  ├─ base.py               Storage protocol, ObjectInfo, errors
-│  │  │  ├─ local.py
-│  │  │  ├─ s3.py
-│  │  │  ├─ probe.py              tests whether conditional writes are enforced
-│  │  │  └─ lease.py
-│  │  ├─ tls.py                   one SSLContext for httpx and boto3
-│  │  ├─ vault.py                 typed file access over Storage; takes the lease on write
-│  │  ├─ index/
-│  │  │  ├─ schema.sql
-│  │  │  ├─ db.py                 connection setup, sqlite-vec loading, capability checks
-│  │  │  ├─ sync.py               store listing vs. index manifest
-│  │  │  ├─ build.py              file -> rows (used by both sync and reindex)
-│  │  │  ├─ search.py             FTS5 + vector + rank fusion
-│  │  │  └─ graph.py              recursive-CTE traversals
-│  │  ├─ llm/
-│  │  │  ├─ client.py             OpenAI-compatible HTTP client, embeddings, doctor helpers
-│  │  │  ├─ models.py             LLM: PydanticAI structured calls in tool/native/prompted mode
-│  │  │  ├─ schemas.py            typed outputs requested from the models
-│  │  │  ├─ prompts.py            loads prompts, computes version stamps
-│  │  │  └─ fake.py               FakeLLM (scripted) and FakeOpenAI (HTTP) for tests
-│  │  ├─ pipeline/
-│  │  │  ├─ extract.py
-│  │  │  ├─ match.py              carries fragment IDs across re-extraction
-│  │  │  ├─ embed.py
-│  │  │  ├─ resolve.py            entity resolution and answer proposals
-│  │  │  ├─ threads.py            incremental thread summaries
-│  │  │  ├─ runner.py             runs pending work; idempotent per entry
-│  │  │  └─ worker.py             background loop used by `brain start` (milestone 4)
-│  │  ├─ review.py                review queue: items and the decisions that settle them
-│  │  ├─ answers.py               ask and brief: retrieval, synthesis, citation checks
-│  │  ├─ services.py              Brain façade (the only API front-ends use)
-│  │  └─ doctor.py                checks returning structured results
-│  ├─ prompts/                    one versioned .md per prompt (extract, resolve, brief, dream_*, …)
-│  ├─ cli/                        Typer app; output via rich
-│  ├─ web/                        FastAPI app; static/ holds the built frontend
-│  └─ mcp/                        MCP tools, served over HTTP (in `start`) or stdio
-├─ frontend/                      Vite + React + TypeScript
-├─ tests/
-│  ├─ contract/                   storage contract, run against local + S3
-│  ├─ index/                      schema, sync, reindex equivalence
-│  ├─ pipeline/                   full pipeline with the fake provider
-│  ├─ cli/
-│  └─ live/                       real-model tests, gated by BRAIN_LIVE_TESTS=1
-└─ docs/
+src/brain/
+├─ core/
+│  ├─ config.py            settings model, load order, XDG paths
+│  ├─ keys.py              every storage key pattern, in one place
+│  ├─ formats/             note.py, records.py (generated files), yamlio.py
+│  ├─ storage/             Storage protocol, local, s3, lease, conditional-write probe
+│  ├─ tls.py               one SSLContext for httpx and boto3
+│  ├─ vault.py             typed file access over Storage; takes the lease on write
+│  ├─ index/               schema.sql, db.py, build.py, sync.py, queries.py (World), search.py
+│  ├─ llm/                 client, models (structured calls), prompts, schemas, fake
+│  ├─ pipeline/
+│  │  ├─ layers.py         1 split, 2 classify, 3 names
+│  │  ├─ link.py           4 link names to entities
+│  │  ├─ filing.py         5 file statements under threads
+│  │  ├─ state.py          6 relate statements; 6b correction notes
+│  │  ├─ pages.py          7 write Now and Summary; 8 check each sentence
+│  │  ├─ wiki.py           render wiki/ from the index
+│  │  ├─ embed.py, text.py, context.py (Calls: fallback and escalation)
+│  │  └─ runner.py         runs the layers for a note; idempotent
+│  ├─ dream.py             9 dreaming
+│  ├─ answers.py           ask, brief (with routing)
+│  ├─ injected.py          `brain context`
+│  ├─ views.py             read models for pages, notes, search, the change log
+│  ├─ services.py          the Brain façade every front-end calls
+│  ├─ worker.py, shared.py, runtime.py, localstate.py, doctor.py, temporal.py
+├─ prompts/                one versioned .md file per prompt
+├─ cli/  web/  mcp/        thin front-ends
+frontend/                  React/Vite web UI, built into src/brain/web/static
 ```
 
-A test asserts that nothing under `brain.core` imports `typer`, `fastapi`,
-`starlette`, `uvicorn`, or `mcp`.
-
-## 3. Storage layout
+## 4. Store layout (format 2)
 
 All keys are relative to the configured prefix (S3) or root directory (local).
 
 ```
-entries/2026/10/30/20261030T143205Z-vendor-call.md     authored
-people/jane-doe.md                                     curated
-orgs/platform-team.md                                  curated
-themes/retrieval-eval.md                               curated
-threads/gpu-quota-migration.md                         curated
-decisions/e-20261030T143205Z.yaml                      curated (your changes to one entry's extracted data)
-generated/extractions/e-20261030T143205Z.json          generated by LLM
-generated/resolutions/e-20261030T143205Z.json          generated by LLM
-generated/embeddings/<model-slug>/e-20261030T143205Z.json
-generated/summaries/threads/gpu-quota-migration.json
-generated/dreams/now/gpu-quota-migration.json          generated by dreaming: the thread's Now line
-generated/dreams/proposals/e-20261030T143205Z.json     generated by dreaming: proposals about this entry's fragments
-generated/dreams/runs/20261108T030000Z.json            one dream pass: what it looked at, applied, proposed
-generated/dreams/state.json                            dreaming watermarks
-state/briefs.json                                      last brief time per node
-_system/format.json                                    format version of the store
-_system/lease.json
-_system/generation.json                                counter bumped on every write
+notes/2026/11/09/20261109T143205Z-vendor-call.md      authored; the only input
+wiki/index.md                                         generated; readable
+wiki/log.md                                           what changed, newest first
+wiki/threads/gpu-quota-migration.md
+wiki/people/jane-doe.md
+wiki/orgs/platform-team.md
+wiki/topics/retrieval-eval.md
+generated/notes/<note-id>/split.json                  one file per layer per note
+generated/notes/<note-id>/{classify,names,links,filing,state}.json
+generated/entities/<entity-id>.json                   identity: type, names, status
+generated/pages/<entity-id>.json                      the model-written page sections
+generated/embeddings/<model-slug>/<note-id>.json
+generated/dreams/runs/<timestamp>.json                one dream pass: what it changed
+generated/dreams/state.json                           what dreaming has already checked
+state/briefs.json                                     when each page was last briefed
+_system/format.json, lease.json, generation.json
 ```
 
-Three tiers, with different rules:
+- `notes/` is the only directory a person writes to. A markdown file saved
+  anywhere under it by any editor becomes a note: it is given an id and its
+  modification time, its text is kept exactly, and the bare file is replaced
+  by the note. `brain start` does this within a minute; `brain process` does
+  it at once.
+- `wiki/` holds plain markdown with `[[file-name|label]]` links, which
+  Obsidian and similar editors follow. The tool overwrites a page when it
+  changes, so a hand edit does not last. To change a page, write a note.
+- An entity id is a readable slug assigned once (`jane-doe`, `jane-doe-2` on
+  collision) and kept across renames, merges, and rebuilds, so links and page
+  paths stay stable.
+- Paths are never identity: every file carries its id. Timestamps in keys use
+  ISO 8601 basic format in UTC. Writes are whole-object; local writes go to a
+  temp file and `os.replace`.
+- There is no migration from format 1. A format 2 store starts empty.
 
-| Tier      | Written by        | Can it be regenerated?                       |
-|-----------|-------------------|----------------------------------------------|
-| authored  | you               | no                                           |
-| curated   | you (via the tool, or by hand) | no                              |
-| generated | pipeline          | yes, by calling models again (`reextract`)   |
-
-The SQLite index is derived from all three and is rebuilt without models.
-
-Rules:
-- Paths are never identity. Every file carries its `id` in frontmatter or JSON.
-- Filenames contain no `:`. Timestamps in keys use ISO 8601 basic format
-  (`20261030T143205Z`, UTC). The directory date is the UTC date, so keys sort.
-- Entry filenames are fixed at creation. Editing a title does not move the file.
-- Curated entity IDs are readable slugs assigned once (`jane-doe`, `jane-doe-2`
-  on collision). Renaming changes `name`, not `id`.
-- Writes are whole-object. Local writes go to a temp file and `os.replace`.
-
-## 4. File formats
-
-Every file has `format: 1`. A reader that sees a higher major version refuses
-to write and tells the user to upgrade.
-
-### Entry (`entries/.../*.md`)
+### Note
 
 ```markdown
 ---
-format: 1
-id: e-20261030T143205Z
-created: 2026-10-30T14:32:05-04:00
-updated: 2026-10-30T15:01:12-04:00
-title: Vendor call, quota follow-up     # optional
-tags: []                                # optional
+format: 2
+id: n-20261109T143205Z
+created: '2026-11-09T14:32:05Z'
+title: Vendor call            # optional
+about: gpu-quota-migration    # optional: the page a "This is wrong" note was written from
 ---
-Free text. The LLM never rewrites this file.
+The text, exactly as written.
 ```
 
-Edit detection uses the SHA-256 of the body (after normalizing line endings),
-not `updated`, so hand edits outside the tool are detected.
+### Layer files
 
-### Person / org / theme / thread (markdown + YAML frontmatter)
+Each has `note_id`, `input_hash`, `model`, `prompts` (name, version, and
+SHA-256 of each prompt the layer uses), `created_at`, and `events` (lines for
+the change log), plus its own data:
+
+| File | Data |
+|---|---|
+| split | `statements`: id (`s-<note timestamp>-NN`), text, and the quote it came from |
+| classify | `kinds`: statement id → fact, decision, question, action, idea, or correction |
+| names | `names`: the name as written, and person, org, or topic |
+| links | `links`: name → entity id, and how: `exact` (code), `model`, or `new` |
+| filing | `threads`: statement id → thread entity id, or none |
+| state | `relations` (later statement answers, supersedes, or repeats an earlier one) and `operations` (from correction notes) |
+
+A layer is skipped when its file has the same `input_hash` and the same
+prompt stamps. Changing a prompt reruns that layer, and the layers after it,
+the next time the note is processed; `brain rebuild` does it for every note.
+
+### Entity record
+
+```json
+{"id": "jane-doe", "type": "person", "name": "Jane Doe", "names": ["Jane", "JD"],
+ "status": "active", "merged_into": null, "not_same_as": [],
+ "created_at": "...", "created_from": "n-...", "closed_at": null,
+ "set_by": {"status": "note:n-..."}, "profile": {"role": "program manager", "org": "Platform Team"}}
+```
+
+`status` is `provisional` (no page yet), `active`, or `closed`. `set_by`
+records which fields a note set, as opposed to a model; dreaming does not
+change those.
+
+### Wiki page
 
 ```markdown
 ---
-format: 1
-id: jane-doe
-type: person
-name: Jane Doe
-aliases: [Jane, JD]
-role: Program manager
-works_on: [GPU capacity planning]
-memberships:
-  - org: platform-team
-    from: 2025-03
-    to: null
----
-Free notes.
-```
-
-```yaml
-# org
-id: platform-team
-type: org
-name: Platform Team
-aliases: [PT, platform]
-parent: infrastructure-office     # optional
-```
-
-```yaml
-# theme
-id: retrieval-eval
-type: theme
-kind: technique                   # domain | technique
-name: Retrieval evaluation
-state: active                     # proposed | active | merged
-merged_into: null
-aliases: []
-```
-
-```yaml
-# thread
 id: gpu-quota-migration
 type: thread
-name: GPU quota migration
-state: active                     # proposed | active | archived | obe | merged
-pinned: false
-merged_into: null
-obe: {date: null, reason: null}
-aliases: []                       # old names, kept after rename/merge
+names: [GPU quota migration, quota work]
+status: active
+as_of: '2026-11-09'           # date of the newest note it covers
+---
+# GPU quota migration
+
+## Now          one or two sentences, written by a model, with citations
+## Summary      three to six sentences, written by a model, with citations
+## Open         open questions and things to do          (built by code)
+## Decided      decisions that still stand, newest first (built by code)
+## History      every statement, newest first; superseded ones struck through
+## Related      links to the pages that share statements with this one
 ```
 
-Curated files are read and written with `ruamel.yaml` in round-trip mode, so
-when the tool adds an alias it does not discard your comments or key order.
-
-### Decisions file (`decisions/<entry-id>.yaml`)
-
-For each entry there are up to three files: the entry itself (your text), the
-extraction (what the LLM produced from it), and this file (what you changed
-about the extraction). The entry is not edited because it is your writing. The
-extraction is not edited because `reextract` replaces it. So your changes are
-stored here, and the index is built by taking the extraction and applying this
-file on top of it. The file exists only for entries where you changed something.
-
-```yaml
-format: 1
-entry: e-20261030T143205Z
-fragments:
-  f-e-20261030T143205Z-03:
-    status: overcome_by_events
-    obe: {date: 2026-11-04, reason: "Vendor withdrew"}
-    threads: {add: [gpu-quota-migration], remove: [vendor-eval]}
-  f-e-20261030T143205Z-05:
-    state: closed
-    closed_note: "Answered in the 11-02 sync"
-  f-e-20261030T143205Z-06:
-    someday: true                 # a big idea not tied to current work
-  f-e-20261030T143205Z-07:
-    deleted: true                 # you rejected this fragment
-  f-e-20261030T143205Z-08:
-    answers: [f-e-20261012T090000Z-02]      # accepted: this fragment answers an earlier question
-    not_answers: [f-e-20261001T090000Z-04]  # rejected proposal; not asked again
-mentions:                         # name as written in this entry -> entity id, per type
-  person:
-    "Mike": mike-chen
-    "the vendor rep": null        # null: not an entity, stop asking
-  org:
-    "the platform folks": platform-team
-  theme:
-    "capacity stuff": capacity-planning
-```
-
-Unknown keys in this file are errors (reported by `brain doctor`), so a typo
-such as `stauts:` is not silently ignored. `someday` was called `dream` before
-0.1.0; that key is still read as `someday`, and the file is written with the
-new key the next time brain changes it.
-
-When an entry is re-extracted, new fragments are matched to the old fragment
-IDs (section 6, Pipeline) so the changes above still apply to the right
-fragments. A change whose fragment no longer exists goes to the review queue.
-
-### Extraction sidecar (`generated/extractions/<entry-id>.json`)
-
-```json
-{
-  "format": 1,
-  "entry_id": "e-20261030T143205Z",
-  "entry_hash": "sha256:…",
-  "model": "extract-model-name",
-  "prompt": {"name": "extract", "version": 3, "sha256": "…"},
-  "created_at": "2026-10-30T19:02:11Z",
-  "fragments": [
-    {
-      "id": "f-e-20261030T143205Z-03",
-      "kind": "decision",
-      "text": "Move the eval cluster to the new quota pool in December.",
-      "span": [412, 530],
-      "quote": "we agreed to move…",
-      "status": "confirmed",
-      "someday": false,
-      "state": null,
-      "mentions": [{"surface": "Mike", "type": "person"}],
-      "themes": [{"surface": "capacity planning", "kind": "domain"}],
-      "threads": [{"thread": "gpu-quota-migration", "weight": 0.9},
-                  {"new": {"name": "Vendor evaluation", "description": "…"}, "weight": 0.6}]
-    }
-  ]
-}
-```
-
-`span` is character offsets into the body as hashed; `quote` is the exact text
-so provenance survives if offsets drift. `state` is `open` for questions and
-action items and `null` for other kinds.
-
-### Resolution sidecar (`generated/resolutions/<entry-id>.json`)
-
-`{format, entry_id, extraction_hash, model, prompt, created_at, mentions,
-answers}`. `mentions` has one record per distinct mention: `{surface, type:
-person|org|theme|thread, decision: link|new|pending|ignore, entity_id?,
-proposed?, confidence, candidates: [{entity_id, score}]}`. A `new` or `pending`
-record that is not settled in the decisions file becomes a review-queue item.
-Proposed people and orgs are not written to `people/` or `orgs/` until you
-confirm them. New themes and threads are written with `state: proposed` and
-recorded here as `link`. `answers` holds proposals of the form `{fragment,
-answers, confidence}` ("this fragment answers that earlier question").
-
-### Embedding sidecar (`generated/embeddings/<model-slug>/<entry-id>.json`)
-
-```json
-{"format": 1, "model": "embed-model", "dim": 1024, "dtype": "float32-le",
- "items": [{"id": "e-…", "hash": "sha256:…", "vec": "<base64>"},
-           {"id": "f-…-03", "hash": "sha256:…", "vec": "<base64>"}]}
-```
-
-Stored per model, so switching embedding models does not delete the old vectors.
-
-### Thread summary (`generated/summaries/threads/<id>.json`)
-
-`{format, thread_id, model, prompt, updated_at, through_entry, summary_md,
-citations: [entry ids]}`. `through_entry` lets the summary be updated with only
-the entries since then.
-
-### Dream files (`generated/dreams/`)
-
-All of these are generated and can be regenerated by dreaming again.
-
-- `now/<thread-id>.json`: `{format, thread_id, line, citations, through_entry,
-  model, prompt, created_at}`. One sentence on where the thread stands, for the
-  injected context. It belongs to the thread's index unit, like the summary.
-- `proposals/<entry-id>.json`: `{format, entry_id, run_id, model, created_at,
-  proposals: [{kind, fragment, other, verdict, reason, confidence, citations,
-  checked_through, thread}]}`. Pending proposals about the fragments of one entry, so
-  they belong to that entry's index unit. `kind` is `supersede` (fragment is an
-  earlier fragment that `other`, a later one, replaced), `answer` (fragment
-  answers the open item `other`), or `sweep` (a verdict on the stale item
-  `fragment`, with `other` the later fragment it rests on). The index leaves
-  out any proposal you have already decided on, so the file needs no clean-up
-  when you decide. A proposal records the thread whose pass made it, and only a
-  later pass over that thread replaces it, since a fragment can be in several
-  threads.
-- `runs/<run-id>.json`: `{run_id, started_at, finished_at, model, calls,
-  max_calls, budget_exhausted, examined, applied, proposed, errors}`.
-- `state.json`: per thread, the newest entry each step has seen
-  (`rebuilt_through`, `rebuilt_at`, `supersede_through`, `answers_through`),
-  plus `last_run`, `last_run_at`, the entry count at the last pass, and
-  `unfinished` (the last full pass stopped at `max_calls`). Watermarks are the
-  newest entry in the thread or any thread merged into it.
-
-## 5. SQLite index
-
-Location: `$XDG_CACHE_HOME/brain/<store-hash>/index.db` (default `~/.cache`,
-on macOS too). Overridable by `[index] path`.
-
-The tool runs on uv-managed Python (python-build-standalone) on macOS and
-Linux. That build bundles a recent SQLite with FTS5 and allows
-extension loading, which sqlite-vec needs. `doctor` checks the SQLite version,
-FTS5, and extension loading, and fails clearly if any is missing (for example,
-if someone installs with RHEL's system Python by mistake). Because the index is
-derived, there are no migrations: a schema version or embedding-model mismatch
-triggers a rebuild.
-
-The full DDL is in `src/brain/core/index/schema.sql`. Beyond the tables
-below, every derived table has an `owner` column naming the unit whose files
-produced the row. A unit is one entry plus its sidecars and decisions file, or
-one entity plus (for threads) its summary. When any file changes, the rows of
-the affected units are deleted and rebuilt from the current files, so the
-result never depends on the order of changes. `objects.unit` maps each key to
-its unit, and `problems` lists files that could not be parsed.
-
-```sql
-CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
--- schema_version, store_format, generation, embed_model, embed_dim, last_full_sync
-
-CREATE TABLE objects (                -- manifest: what the index was built from
-  key   TEXT PRIMARY KEY,
-  etag  TEXT NOT NULL,
-  size  INTEGER NOT NULL,
-  mtime TEXT
-);
-
-CREATE TABLE nodes (                  -- every graph node
-  id         TEXT PRIMARY KEY,        -- 'entry:e-…', 'frag:f-…', 'person:jane-doe', …
-  type       TEXT NOT NULL,           -- entry|fragment|person|org|theme|thread
-  label      TEXT NOT NULL,
-  created_at TEXT,
-  updated_at TEXT,
-  data       TEXT NOT NULL DEFAULT '{}'   -- JSON for fields not used in WHERE clauses
-);
-CREATE INDEX nodes_type ON nodes(type);
-
-CREATE TABLE entries (
-  id           TEXT PRIMARY KEY,
-  key          TEXT NOT NULL UNIQUE,
-  created_at   TEXT NOT NULL,
-  title        TEXT,
-  body         TEXT NOT NULL,
-  content_hash TEXT NOT NULL,
-  extraction   TEXT NOT NULL          -- current|pending|stale|failed
-);
-
-CREATE TABLE fragments (
-  id            TEXT PRIMARY KEY,
-  entry_id      TEXT NOT NULL,
-  kind          TEXT NOT NULL,        -- observation|decision|question|idea|claim|action_item
-  text          TEXT NOT NULL,
-  status        TEXT NOT NULL,        -- confirmed|speculative|overcome_by_events
-  status_origin TEXT NOT NULL,        -- llm|user
-  someday       INTEGER NOT NULL DEFAULT 0,
-  state         TEXT,                 -- open|closed, for questions and action items
-  closed_note   TEXT,
-  obe_date      TEXT,
-  obe_reason    TEXT,
-  span_start    INTEGER,
-  span_end      INTEGER,
-  created_at    TEXT NOT NULL         -- entry's timestamp
-);
-CREATE INDEX fragments_entry ON fragments(entry_id);
-CREATE INDEX fragments_kind_status ON fragments(kind, status);
-
-CREATE TABLE threads (
-  id            TEXT PRIMARY KEY,
-  name          TEXT NOT NULL,
-  state         TEXT NOT NULL,
-  pinned        INTEGER NOT NULL,
-  merged_into   TEXT,
-  last_activity TEXT                  -- max(created_at) of linked fragments
-);
-
-CREATE TABLE aliases (
-  alias   TEXT NOT NULL,              -- casefolded, whitespace-normalized
-  node_id TEXT NOT NULL,
-  PRIMARY KEY (alias, node_id)
-);
-
-CREATE TABLE edges (
-  id          INTEGER PRIMARY KEY,
-  src         TEXT NOT NULL,
-  dst         TEXT NOT NULL,
-  type        TEXT NOT NULL,          -- contains|mentions|about|in_thread|member_of|merged_into|answers
-  weight      REAL NOT NULL DEFAULT 1.0,
-  origin      TEXT NOT NULL,          -- llm|user
-  confirmed   INTEGER NOT NULL,       -- 1 if you created or confirmed it
-  entry_id    TEXT,                   -- provenance
-  fragment_id TEXT,
-  valid_from  TEXT,
-  valid_to    TEXT
-);
-CREATE UNIQUE INDEX edges_uniq ON edges(src, dst, type, IFNULL(fragment_id, ''));
-CREATE INDEX edges_dst ON edges(dst, type);
-
-CREATE TABLE review_items (
-  id         TEXT PRIMARY KEY,        -- stable hash of (kind, entry, surface)
-  kind       TEXT NOT NULL,           -- new_person|new_org|ambiguous_mention|proposed_theme|proposed_thread|proposed_answer|dream_obe|orphaned_decision
-  entry_id   TEXT,
-  created_at TEXT NOT NULL,
-  payload    TEXT NOT NULL            -- JSON
-);
-
-CREATE TABLE embeddings (             -- rowid is shared with vec_items
-  rowid        INTEGER PRIMARY KEY,
-  owner_id     TEXT NOT NULL UNIQUE,  -- entry or fragment id
-  model        TEXT NOT NULL,
-  content_hash TEXT NOT NULL
-);
-
--- created at build time, once the dimension is known; vectors are
--- L2-normalized on insert so L2 distance ranks the same as cosine
-CREATE VIRTUAL TABLE vec_items USING vec0(embedding float[1024]);
-
-CREATE VIRTUAL TABLE fts USING fts5(
-  owner_id UNINDEXED, owner_type UNINDEXED, title, body,
-  tokenize = 'porter unicode61'
-);
-```
-
-Every table, including `review_items`, is built from files. The review queue
-is the set of unsettled records in resolution sidecars, proposed themes and
-threads, and decisions whose fragment no longer exists, so `reindex` rebuilds
-it like everything else.
-
-Thread activity: a thread is active if `state = 'active'` and
-(`pinned = 1` or `last_activity >= now - inactivity_window`).
-
-Traversal example (nodes within two hops of a person, ignoring structural edges):
-
-```sql
-WITH RECURSIVE walk(id, depth) AS (
-  SELECT :start, 0
-  UNION
-  SELECT CASE WHEN e.src = w.id THEN e.dst ELSE e.src END, w.depth + 1
-  FROM edges e JOIN walk w ON w.id IN (e.src, e.dst)
-  WHERE w.depth < 2 AND e.type <> 'contains'
-)
-SELECT DISTINCT n.* FROM walk JOIN nodes n ON n.id = walk.id;
-```
-
-## 6. Key interfaces
-
-### Storage
-
-```python
-@dataclass(frozen=True)
-class ObjectInfo:
-    key: str
-    etag: str            # S3 ETag; local: f"{mtime_ns}-{size}"
-    size: int
-    mtime: datetime
-
-class Storage(Protocol):
-    supports_conditional_writes: bool          # set from the runtime probe, not assumed
-    def get(self, key: str) -> bytes: ...      # raises NotFound
-    def put(self, key: str, data: bytes, *,
-            if_absent: bool = False,           # S3 If-None-Match: *
-            if_match: str | None = None        # S3 If-Match: <etag>
-            ) -> ObjectInfo: ...               # raises PreconditionFailed
-    def list(self, prefix: str) -> Iterator[ObjectInfo]: ...
-    def delete(self, key: str) -> None: ...
-    def exists(self, key: str) -> bool: ...
-```
-
-This keeps the five operations from the spec. The additions are metadata in
-`list` results (so sync does not need one HEAD request per object) and the two
-precondition arguments on `put` (needed for the lease).
-
-`S3Storage(bucket, prefix, endpoint_url, region, profile, addressing_style,
-tls)` uses boto3. `addressing_style = "path"` is often required by
-S3-compatible stores.
-
-Conditional-write probe: some S3-compatible stores ignore `If-None-Match`
-without returning an error. On the first write of each process, the store
-writes a probe object twice with `If-None-Match: *` and checks that the second
-write is rejected. The result is cached in local state for 24 hours. If the
-probe fails, the lease uses read-back verification (below).
-
-### Lease
-
-The lease is a small JSON object in the store, `_system/lease.json`, that
-records which machine is currently allowed to write and until when. S3 has no
-locks, so without it two machines pointed at the same bucket would overwrite
-each other's decisions files and generation counter without any error. With one
-machine at a time this is a guard against mistakes, such as an old laptop or a
-container still configured against the bucket. Removing it changes nothing in
-normal use; it only matters when a second writer appears.
-
-```python
-class Lease:
-    def acquire(self, *, force: bool = False) -> None   # raises LeaseHeld(holder, age)
-    def ensure(self) -> None                            # called before each write batch
-    def renew(self) -> None
-    def release(self) -> None
-```
-
-Contents: `{holder_host, machine_id, pid, command, acquired_at, renewed_at,
-ttl_seconds, token}`.
-
-- The lease belongs to a machine (`machine_id` stored in local state), not a
-  process. `brain start` and CLI commands on the same machine share it and take
-  turns writing using a local `flock` on a file in the cache directory.
-- Acquire: `put(if_absent=True)`. If it exists and is expired, replace it with
-  `put(if_match=etag)`. If it is live and held by another machine, fail with the
-  holder's hostname, command, and age, and mention `--force`.
-- `brain start` renews every TTL/3. Short commands take the lease on first
-  write and release it on exit if they were the ones that acquired it.
-- Without conditional-write support: write, wait 2 seconds, read back, compare
-  `token`. This is best effort and `doctor` says so.
-
-### Vault
-
-Typed access to files. Every write method calls `lease.ensure()`, writes the
-object, then bumps `_system/generation.json`.
-
-```python
-class Vault:
-    def save_entry(self, text: str, *, title: str | None = None) -> Entry
-    def update_entry(self, entry: Entry) -> Entry
-    def iter_entries(self) -> Iterator[Entry]
-    def get_entity(self, id: str) -> Entity
-    def put_entity(self, entity: Entity) -> None
-    def get_decisions(self, entry_id: str) -> Decisions
-    def put_decisions(self, d: Decisions) -> None
-    def get_sidecar(self, kind: SidecarKind, entry_id: str) -> Sidecar | None
-    def put_sidecar(self, s: Sidecar) -> None
-```
-
-### Index sync
-
-On startup, read `_system/generation.json`. Each write through brain replaces
-it with a new random token. If the token equals `meta.generation`, skip
-listing. (A random token rather than a counter, so two processes that bump it
-at the same moment cannot produce the same value.) Writes made by this process
-update the index directly and advance `meta.generation` only if the index was
-already in sync before the write. Otherwise list the store, diff against the
-`objects` manifest by ETag, and rebuild rows for changed keys. A full listing
-also runs if the last one is older than 24 hours, and on `brain sync --full`.
-`brain reindex` deletes the database and rebuilds from a full listing.
-
-Embedding endpoint usage: needed when new or changed text is embedded (in the
-pipeline) and when a query is embedded (`ask`, `search`). Not needed by
-`reindex`, which reads vectors from embedding sidecars.
-
-### LLM
-
-```python
-class LLM:
-    def structured(self, prompt: str, output: type[T], *, role: Role,
-                   deps: dict | None = None) -> Stamped[T]
-        # role in {"chat", "extract"}; Stamped carries model name + prompt stamp
-    def embed(self, texts: list[str]) -> np.ndarray      # (n, dim) float32
-```
-
-- Chat and extraction use `pydantic-ai-slim[openai]` with an OpenAI-compatible
-  model pointed at `base_url`. The slim package avoids pulling every provider SDK.
-- Embeddings use the `openai` SDK's embeddings endpoint (already a dependency of
-  the PydanticAI OpenAI model), sharing the same `httpx2.Client`. (openai 3.x and
-  pydantic-ai 2.x use `httpx2`, a separate package from `httpx`; brain uses
-  `httpx2` throughout so the TLS client it builds is the type the SDKs expect.) If the
-  installed PydanticAI version has an embeddings API that accepts a custom
-  client, use that instead; check at implementation time.
-- `tls.py` builds one `ssl.SSLContext` from `[tls]`: OS trust store via
-  `truststore` by default, or `ca_bundle` if set; then
-  `load_cert_chain(client_cert, client_key)` if set. httpx2 gets the context;
-  boto3 gets `verify=ca_bundle` and `Config(client_cert=...)`. Proxy env vars
-  are honoured by both.
-- `structured_output = "auto" | "tool" | "native" | "prompted"` maps to
-  PydanticAI's output modes. OpenAI-compatible gateways differ in whether they
-  support tool calling or `response_format: json_schema`; `doctor` tests each
-  mode and reports which work.
-- The fake provider uses PydanticAI's `FunctionModel` to return canned outputs
-  from fixtures, and an embedder that seeds a RNG from a hash of the text.
-
-Prompts are markdown files with a frontmatter `version`. The stamp recorded on
-outputs is `{name, version, sha256}`, so an edit made without bumping the
-version is still visible.
-
-### Pipeline
-
-Per entry, each step reads files and writes one sidecar that records the exact
-version of its input. A step runs when its sidecar is missing or that input has
-changed, which makes the pipeline idempotent and resumable without a job table.
-The index records each entry's `next_step` (`extract`, `embed`, `resolve`, or
-`done`), so `brain process` knows what is pending without reading the store.
-A prompt change does not re-run anything by itself; `brain reextract
---stale-prompts` does that on request.
-
-1. `extract` → extraction sidecar. The prompt includes the 40 most recently
-   active threads (id, name, description, start of the summary), the names
-   of known people, orgs, and themes, and the people and orgs still waiting in
-   review, so the model can reuse them (a later "Priya" can be written as the
-   pending "Priya Raman" and land in the same review item). A validator
-   makes the model retry if it names a thread id that was not offered. Spans
-   are found by locating the model's `quote` in the entry (exactly, then
-   case-insensitively, then by fuzzy match), since models are unreliable with
-   character offsets. Fragment ids are carried over from the previous
-   extraction by matching kind and text (`pipeline/match.py`); ids that do not
-   match are never reused.
-2. `embed` → embedding sidecar for the entry and each fragment. Texts whose
-   hash did not change keep their vectors, so editing one sentence re-embeds
-   only what changed. This runs before `resolve` because answer proposals use
-   the vectors.
-3. `resolve` → resolution sidecar.
-   - People and orgs: an exact, unique alias links directly with no model
-     call. Otherwise candidates come from close spellings, first-name or
-     last-name matches, and acronyms; the model chooses among them. A link is
-     made only when the model picks the top candidate with confidence ≥ 0.8.
-     Anything else (a different candidate, "unsure", or "new") goes to review.
-   - Themes: the same, plus embedding similarity of theme names. With no
-     match, a theme file is created with `state: proposed` and used right away.
-     A theme whose name is the name of its own fragment's thread is dropped
-     before resolution, since it would only duplicate the thread.
-   - Threads proposed by the extraction: matched to existing threads by name;
-     otherwise a thread file is created with `state: proposed`.
-   - Answer proposals: open questions and action items from other entries
-     that are close to this entry's fragments by vector similarity are shown
-     to the model, which proposes `answers` links. They appear in review and
-     close nothing on their own.
-4. `threads` → after the entry's steps, summaries of the threads it touches
-   are updated. A summary records `through_entry`; an update sends the
-   previous summary plus only the later fragments.
-
-Pending review items never block processing. An unresolved mention is stored
-without a link until you settle it. A failed step leaves the entry saved with
-its remaining steps pending; the error is kept in
-`$XDG_STATE_HOME/brain/pipeline-failures.json` and shown by `brain doctor` and
-`brain show`. Only one process on a machine runs the pipeline at a time
-(a non-blocking lock in the state directory).
-
-Prompts live in `src/brain/prompts/` (`extract`, `resolve`, `answers`,
-`thread_summary`, `brief_route`, `brief`, `ask`, the `dream_*` prompts, and
-`probe` for `doctor`).
-
-### Review queue
-
-`brain review` walks through items one at a time. Each decision is written to
-files: a decisions-file mention mapping (`person: {"Mike": mike-chen}`) for
-each affected entry, a new or updated entity file, or a thread/theme `state`.
-Linking or creating a person can apply to every entry with the same unsettled
-name, and adds that name as an alias so future entries link without asking.
-A new-person or new-org item with no stored candidates gets candidates from
-the current entities when it is listed, so after you create "Priya Raman" the
-item for "Priya" offers to link to her.
-Accepting a proposed answer records it on the answering fragment and closes
-the earlier question or action item.
-
-Dreaming adds two kinds of item. A proposed answer it found is a
-`proposed_answer` like any other, marked `source: dream`. A `dream_obe` item
-says an earlier fragment may have been replaced by a later one. Accepting it
-marks the earlier fragment overcome by events, with the later fragment's id
-and date in the reason; rejecting it records the fragment's current status as
-yours (`status_origin: user`), which keeps it and stops dreaming from asking
-again. Both are written to the entry's decisions file.
-
-### Testing without a model
-
-`FakeLLM` (`core/llm/fake.py`) runs the real PydanticAI agents against a
-scripted model: by default simple rules over each prompt's input (sentences
-become fragments, capitalized names become people, `#tags` become themes,
-`[[Name]]` assigns a thread), or canned outputs supplied by a test. Its
-embeddings are bag-of-words vectors, so texts that share words are close.
-`BRAIN_FAKE_LLM=1` makes the CLI use it, for trying brain without an endpoint.
-`FakeOpenAI` is a fake OpenAI-compatible HTTP endpoint used to test the real
-client path, including tool, native, and prompted structured output.
-
-### Where processing runs
-
-- `brain start` runs a worker thread that processes pending work on startup,
-  after each entry saved through the web UI or MCP, and on a timer
-  (`[worker] poll_seconds`, default 60). The timer checks the generation
-  counter, and a full listing runs every 10 minutes to catch files edited
-  outside the tool.
-- `brain jot` saves the entry. If `brain start` is running on this machine
-  (found through `server.json` in the state directory), `jot` notifies it and
-  returns immediately. Otherwise `jot` processes the entry in the foreground;
-  Ctrl-C or a failure leaves the entry saved and pending.
-- `brain process` runs all pending work in the foreground, for use when
-  `start` is not running.
-- A processing lock in the state directory stops the worker and a CLI command
-  from processing at the same time.
-- Dreaming: `brain dream` runs a pass in the foreground. Inside `brain start`,
-  a worker round that processed no entry successfully (entries that keep
-  failing do not count) dreams if a pass is due: the last pass was unfinished,
-  `[dream] after_entries` new entries since the last pass, or the nightly time
-  `[dream] nightly_at` (local wall time) has passed and something is new. "Dream now" in the web
-  UI (`POST /api/dream`) asks the worker for a pass on its next idle round.
-
-### Thread operations
-
-`core/threads.py`. Rename (the old name becomes an alias, so mentions of it
-still resolve), pin, archive, reactivate, overcome by events, merge, split, and
-move. Thread-level changes are written to the thread file. Merge sets
-`state: merged` and `merged_into`, follows an existing merge chain to its
-root, refuses cycles, and copies names and aliases to the target; everything
-that reads a thread (briefs, timelines, activity, summaries) includes the
-threads merged into it. Split and move write `threads: {add, remove}` to each
-affected entry's decisions file, so the change survives re-extraction.
-Marking a thread overcome by events can also mark its open questions and
-action items overcome by events (`cascade`). Briefs on an archived or OBE
-thread tell the model so, and it describes the thread as history.
-
-### The overcome-by-events sweep
-
-`core/sweep.py` lists items that may no longer hold: open questions and action
-items older than 30 days, speculative fragments older than 30 days, and
-unpinned threads with no activity for 60 days. Items in archived or OBE threads
-are left out, and so are items whose status or open/closed state you set
-yourself (the index records `status_origin` and `state_origin`), so "keep it"
-is remembered. `brain sweep` and the "Tidy up" page offer: overcome by events
-(with a reason), close or confirm, keep, and for threads archive, OBE, or pin.
-When dreaming has checked an item, its verdict (still open, probably
-resolved, or unclear, with a reason and the later fragment it rests on) is
-shown next to it. You still decide.
-
-### Temporal context
-
-`core/temporal.py` renders every date a model sees. Rules:
-
-- Every model input begins with `<today date="2026-11-08" weekday="Sunday"/>`,
-  from the pipeline clock.
-- Every dated element has `date` and `age`, computed in code:
-  `date="2026-10-30" age="9d"`. Ages are days up to 13, weeks up to 8, then
-  months (`9d`, `3w`, `5mo`), so the model never subtracts dates.
-- Summaries and Now lines carry `as_of`: the date of the newest entry they
-  cover (`<thread_summary as_of="2026-11-04" age="4d">`). Entities carry
-  `last_mentioned`; their "recently" mentions are dated. Extraction's thread
-  list gives each thread's last activity and its summary's as-of date.
-- Within a group, items are ordered oldest to newest, so the latest is nearest
-  the end. `ask` re-sorts its excerpts by date after retrieval chooses them.
-- Dates are local calendar dates in the machine's time zone (`TZ`). Stored
-  timestamps stay UTC; an entry written at 9 pm is dated that day.
-- Each prompt that receives notes has the same paragraph: what today, date,
-  age, and as_of mean, and that later information supersedes earlier
-  information on the same point unless it says otherwise.
-
-`tests/test_temporal.py` runs every model-calling operation, dreaming included,
-against the fake LLM and fails if any input does not start with `<today>` or
-any note element lacks its date and age, so a new prompt cannot leave dates
-out. MCP results carry `today`, `age_days` next to each date, and
-`summary_as_of`; their lists run oldest to newest.
-
-### Injected context
-
-`core/injected.py` builds a short summary of current state that every agent
-session receives without asking: active and pinned threads (pinned first, then
-by last activity) with last activity, open count, and a Now line with its
-as-of date; the newest open items; decisions from the last
-`[context] recent_days` days and fragments marked overcome by events in that
-time; and what waits on the user (review items by kind, unprocessed entries).
-Every line carries a date and age and the ids that lead to `brief`,
-`get_entity`, and `get_entry`. Someday fragments and archived or OBE threads
-are left out; proposed threads are included and marked as such.
-
-It is rendered from the index on every read, so it is never stale. A thread's
-Now line comes from dreaming; until a thread has been dreamed about, the first
-sentence of its summary stands in, with the summary's as-of date. Sections are
-filled in order and cut at `[context] max_lines` and `max_bytes`, with a line
-saying what was left out; the closing lines always appear.
-
-It reaches agents four ways: `brain context` (markdown, or `--format json`),
-for example from a Claude Code `SessionStart` hook; the MCP resource
-`brain://context` and tool `get_context`; the instructions of the stdio MCP
-server, which starts fresh for each session (the HTTP server in `brain start`
-runs for days, so it leaves this out); and a panel on the web UI's home page
-showing exactly what an agent receives.
-
-### Dreaming
-
-`core/dream.py`. An offline pass over entries, fragments, and derived files. It
-never edits entries. Threads are taken in this order: pinned, then briefed in
-the last 14 days, then by last activity; archived and OBE threads are skipped.
-For each thread, a step runs only if entries arrived since that step's
-watermark in `state.json`:
-
-1. Summary rebuild: rewrites the thread summary from all of its fragments
-   (`summarize(full=True)`, the `thread_summary` prompt with no previous
-   summary). It runs after `[dream] rebuild_after_updates` new entries since
-   the last rebuild, or when the last rebuild is older than
-   `rebuild_after_days` and there is anything new. Incremental updates carry
-   errors and omissions forward; a rebuild does not.
-2. Supersession (`dream_supersede`): finds earlier fragments that a later one
-   replaced or contradicted. Pairs with confidence at least 0.7 become
-   `dream_obe` review items; fragments whose status you set are never proposed.
-   A pair that is also an answer link (accepted, pending in review, or found
-   by step 3 in the same pass) is left out: an answered question is an answer,
-   not a replacement, and review should show it once.
-3. Answers (`dream_answers`): compares the thread's open questions and action
-   items with everything written after them in the thread. Write-time answer
-   proposals only see the new entry; this sees the whole later history.
-   Links you already accepted or rejected are not proposed again.
-4. Now line (`dream_now`): one sentence on where the thread stands, written
-   directly, for the injected context. The prompt asks for 25 words; the code
-   keeps at most 35, cutting at the last sentence or clause end that fits.
-
-Then the sweep step (`dream_sweep`) checks old open and speculative items, in
-batches of 8, against the fragments written after them in their threads and
-fragments that share their words. Items with nothing written since are
-skipped, and so are items whose verdict already covers the newest of those
-fragments.
-
-Derived output (summaries, Now lines, run log, watermarks) is written
-directly; everything that changes what is recorded as true is a proposal, and
-nothing applies until you accept it. Each prompt is told what the memory is
-for rather than given narrow rules, and every output is validated: ids must
-come from the input, a later fragment must be newer than the one it replaces
-or answers, and citations must be entry ids from the input.
-
-A pass stops after `[dream] max_calls` model calls (default 50) and records
-`budget_exhausted`; work it did not reach comes first next time because its
-watermarks did not move, and the next scheduled pass is due at once
-(`unfinished` in `state.json`). A `--thread` pass does not count as the
-scheduled pass, so the rest of the store is not pushed back. `brain dream --dry-run` lists the steps and the number
-of calls without calling a model. A pass takes the processing lock, so it
-never overlaps the pipeline, and its writes go through the lease like any
-other.
-
-### Brain façade
-
-```python
-class Brain:
-    def jot(self, text: str, *, title=None, process=True) -> Entry
-    def process_pending(self) -> ProcessReport
-    def review_items(self) -> list[ReviewItem]
-    def resolve_review(self, item_id: str, decision: ReviewDecision) -> None
-    def active_threads(self) -> list[ThreadActivity]
-    def brief(self, target: str, *, since: date | None = None) -> Brief
-    def ask(self, question: str) -> Answer
-    def search(self, query: str, *, kinds=None, limit=20) -> list[Hit]
-    def set_fragment(self, fragment_id: str, change: FragmentChange) -> None
-        # status, OBE date/reason, someday flag, open/closed, thread links
-    def thread_op(self, op: ThreadOp) -> None      # rename/merge/split/pin/archive/obe
-    def get_entity(self, id: str) -> EntityView
-    def reindex(self) -> None
-    def reextract(self, selector: Selector) -> ProcessReport
-    def doctor(self) -> list[CheckResult]
-    def context(self) -> ContextDoc              # the injected context; context_text() renders it
-    def dream(self, *, thread=None) -> DreamRun  # dream_plan() for a dry run
-```
-
-The core API is synchronous. FastAPI runs it in its threadpool (`def`
-endpoints) and the MCP tools call it via `anyio.to_thread`. PydanticAI is
-called with its sync entry point inside the core.
-
-`Brief` and `Answer` are typed outputs where each claim carries
-`citations: list[entry_id]`. An output validator rejects citations that are not
-in the retrieved context and asks the model to retry (PydanticAI `ModelRetry`).
-
-Brief targets: a request that names exactly one node (a node id, an id, an
-alias, or a close name) is briefed with no extra model call. When a name
-matches one thread and otherwise only themes, the thread counts as the one
-node. Anything else is routed by the model (`brief_route`, extract role): it
-gets the request and up to 12 candidate nodes (the ones the request names,
-then the ones linked to the best search hits), each with its last activity
-and profile, and returns one to four of them, none (a brief on the request's
-words, from search), or a question when the candidates do not settle it
-(`AmbiguousTarget`, with the candidates). A brief on several nodes combines
-their fragments; its "last looked" is the earliest of theirs, and writing it
-records the time for each. The request is passed to the brief prompt so the
-brief answers it first.
-
-Brief `since` default: the last time a brief was generated for that node
-(`state/briefs.json`); if none, everything. The "what changed" section also
-covers activity in adjacent nodes (people, linked threads, themes) since the
-last entry that touched the node directly. Closed questions and action items
-appear under "recently closed", not in the open list.
-
-`ask` retrieval: FTS5 BM25 hits and sqlite-vec hits, merged by reciprocal rank
-fusion, expanded with one hop of graph neighbours, then passed to the chat model.
-
-### Front-ends
-
-- `brain start`: one uvicorn process on `127.0.0.1:<port>` serving the web UI,
-  the HTTP API, MCP over streamable HTTP at `/mcp`, and the worker. Claude Code
-  connects with `claude mcp add --transport http brain http://127.0.0.1:<port>/mcp`.
-  No authentication in v1; it binds to localhost only.
-- `brain mcp`: the same MCP tools over stdio, for when `start` is not running.
-  The MCP tool definitions live in one module used by both transports.
-
-### Web server (`brain start`)
-
-One process runs uvicorn on 127.0.0.1 with a FastAPI app (`src/brain/web/app.py`):
-the JSON API under `/api`, MCP over streamable HTTP at `/mcp`, and the built UI
-(any other path returns `index.html`, so client-side routes work on reload).
-
-- Requests share one Brain through `core/shared.py` (one lock, opened lazily).
-- The background worker (`core/worker.py`) has its own Brain and SQLite
-  connection, so model calls during processing do not block requests. It runs
-  on startup, when woken (an entry was saved through the UI, MCP, or
-  `brain jot`), every `worker.poll_seconds`, and lists the whole store every
-  10 minutes to catch files edited outside brain. MCP `add_entry` hands the
-  entry to the worker and waits for it.
-- `$XDG_STATE_HOME/brain/server.json` records the pid, port, and store. `brain
-  jot` reads it and wakes the server instead of processing in the foreground;
-  a stale file (dead pid) is ignored.
-- Shutdown work (stop the worker, release the lease, remove `server.json`)
-  runs in the app's lifespan, because uvicorn re-raises SIGTERM/SIGINT after
-  its graceful shutdown, which skips code after `uvicorn.run`.
-- No login. The app rejects a Host header other than localhost (DNS
-  rebinding) and any write that is not `application/json` (cross-site forms
-  and simple requests cannot send it without a CORS preflight, which the app
-  never approves). The MCP endpoint uses the SDK's own DNS-rebinding check.
-
-The UI is React + TypeScript + Vite in `frontend/`, with `react-router-dom`
-and Cytoscape.js for the graph (loaded only on the graph page). It is built
-into `src/brain/web/static/`; a hatch build hook (`hatch_build.py`) runs the
-build when a wheel is made from a checkout without it, and `ci/release.sh`
-builds it for release wheels. The graph joins two entities when fragments link
-to both, so a technique theme connected to two threads shows the same approach
-used in both.
-
-### MCP tools
-
-Built on the official `mcp` SDK (2.x, `MCPServer`), in `src/brain/mcp/`. Each
-tool returns a typed result (structured content plus the same data as JSON
-text) and calls one Brain method.
-
-| Tool | Read-only | What it returns |
+Only Now (threads) and Summary are written by a model. The rest is built from
+the statements, so it cannot drift from them.
+
+## 5. Layers
+
+Layers 1 to 6 run per note, in order, as soon as a note exists. Layers 7 and
+8 run for each page the note touched. Layer 9 runs offline.
+
+| # | Layer | One call per | Output | Code checks |
+|---|---|---|---|---|
+| 0 | Capture | — | the note file | — |
+| 1 | Split | note | statements, each with the words it came from | every quote is in the note |
+| 2 | Classify | statement | one kind from a fixed list | value is in the list |
+| 3 | Spot names | note | names as written, each person, org, or topic | every name occurs in the note |
+| 4 | Link | unresolved name | a candidate id, or `new` | id is one of the candidates |
+| 5 | File | statement | a candidate thread id, `new` with a name, or `none` | id is one of the candidates |
+| 6 | Relate | (new, earlier) statement pair | answers, supersedes, repeats, or unrelated | "answers" only for a question or action |
+| 6b | Correct | correction statement | one operation, then its targets | targets are candidates; the right number of them |
+| 7 | Write | page section | Now (≤ 40 words) or Summary sentences, each with citations | every citation is a note in the input |
+| 8 | Check | written sentence | supported: yes or no | — |
+| 9 | Dream | see section 7 | | |
+
+- **Layer 4.** Code links a name with no call when it matches exactly one
+  known name. Candidates for the rest have a similar spelling or share a
+  whole word ("Jane" and "Jane Doe"). `new` creates a provisional entity. It
+  gets a page when a second note mentions it; a person written with a full
+  name gets one at once. Names are processed longest first, so "Jane Doe"
+  exists before "Jane" in the same note is resolved.
+- **Layer 5.** Candidates are threads named in the note, threads already
+  chosen for this note, and the threads of the nearest earlier statements (by
+  embedding) and of statements about the same entities. A new thread is
+  provisional until a second note files something under it.
+- **Layer 6.** A new statement is compared with up to three earlier ones: the
+  nearest in meaning among those in the same thread, about the same entities,
+  or close by embedding. Only pairs that can relate are compared (anything
+  but a question can answer an open question or action; a decision or fact
+  can supersede a decision, fact, or idea). At most 24 pairs per note.
+- **Layer 7.** The summary is updated from the previous summary plus the new
+  statements once three have arrived. It is rebuilt from all statements when
+  one it covered has been superseded, answered, or retracted, and by dreaming.
+- **Layer 8.** A sentence that is not supported is dropped. When nothing
+  survives, the section stays as it was.
+
+Every dated statement given to a model carries its date and its age relative
+to today, and the input starts with `<today>`, so the model can tell newer
+information from older without date arithmetic.
+
+## 6. Changing things with later notes
+
+Because notes are the only input, every correction is a note. Two kinds are
+recognised.
+
+**A later statement about the same thing.** "The migration moved to January"
+after "We decided to migrate in December". Layer 6 records `supersedes`.
+Pages show the January statement as current; the December one stays in the
+history, struck through, with what replaced it. Nothing is deleted.
+
+**An instruction about the wiki.** Layer 2 classifies it as `correction`.
+Layer 6b turns it into one operation from a fixed list, in two calls: which
+operation, then which candidates it applies to.
+
+| Operation | Example note | Effect |
 |---|---|---|
-| `search(query, limit, types)` | yes | entries, fragments, and entities by keyword and vector similarity |
-| `ask(question)` | yes | cited claims and their sources |
-| `brief(target, since, mark_seen)` | yes | the brief sections, open fragments, and sources |
-| `get_entity(name_or_id)` | yes | details, notes, related nodes, open items, recent fragments |
-| `get_entry(entry_id)` | yes | the entry text and its fragments, for following a citation |
-| `list_active()` | yes | active and pinned threads with counts, people, and summaries |
-| `add_entry(text, title)` | no | the saved entry and, after processing, its fragments |
-| `get_context()` | yes | the injected context (also the resource `brain://context`) |
+| `same_as` | "Jane Doe and J. Doe are the same person" | the second is merged into the first |
+| `not_same_as` | "Mike Chen in finance is a different Mike from Mike Ross" | undoes a merge; the two are never merged again |
+| `rename` | "The quota thing should be called GPU quota migration" | new name; the old one still leads to the page |
+| `close` / `reopen` | "The vendor evaluation is finished" | the thread is closed, and its open items with it |
+| `retract` | "Ignore what I wrote about the outage cause" | those statements leave pages and answers; the note stays |
+| `not_part_of` | "The label work is not part of the quota migration" | its statements move to their own thread |
 
-`get_entry` is an addition to the original list, so an agent can read a cited
-entry in full. Every result has `today`, and every date has `age_days`
-beside it. `brain mcp` also appends the injected context to its instructions. `brief` does not move the user's "last looked" date unless the
-agent passes `mark_seen` (an agent often reads a brief for its own context
-without showing it).
+The operation is applied to the entity records at once and stored in the
+note's state file, so `brain rebuild` replays it in order. The later note
+wins when two conflict. An operation from a note wins over anything a model
+inferred, dreaming included. Retracting the note that retracted something
+restores it.
 
-Expected failures (model errors, lease held elsewhere, ambiguous names,
-unknown ids) are raised as `ToolError`, so the agent sees the message; other
-exceptions reach it only as "Error executing tool". The Brain is opened on the
-first call, so a storage problem is reported by the tool instead of stopping
-the server. Sync tools run on worker threads, so all calls share one lock.
+In the web UI every page has a **This is wrong** button. It opens the note
+box with the page named; what is written is saved as an ordinary note with
+`about` set, so "this is finished" is understood to mean that page.
 
-Several processes on one machine can use the same index file at once (for
-example `brain mcp` and a CLI command). Index write transactions use
-`BEGIN IMMEDIATE`, and entry and entity ids are chosen and written under the
-machine-wide write lock, so concurrent writers cannot pick the same id.
+## 7. Dreaming (layer 9)
 
-## 7. Configuration
+Dreaming looks across notes. It runs nightly and after a set number of new
+notes while `brain start` is running, or on demand with `brain dream`.
 
-Load order (later wins): defaults → `$XDG_CONFIG_HOME/brain/config.toml`
-(default `~/.config`, also on macOS) → file from `BRAIN_CONFIG` or `--config`
-→ env vars `BRAIN_<SECTION>__<KEY>` (e.g. `BRAIN_STORAGE__BUCKET`). Implemented
-with `pydantic-settings`.
+| Step | What it does | Calls |
+|---|---|---|
+| Duplicates | Compares pairs of entities with similar names; merges those the statements show to be the same | one per pair |
+| Stale items | Checks open questions and actions older than `stale_days` against later statements: answered, overtaken, or still open | one per item |
+| Quiet threads | Closes a thread with nothing open and no activity for `close_after_days`; new activity reopens it | none |
+| Profiles | Fills in a person's role and org from the statements that mention them | one per person |
+| Rebuilds | Rebuilds summaries that have been updated many times or not rebuilt for a long while | as layer 7 and 8 |
+
+It uses the strong model when `dream_uses = "strong"` and one is set,
+otherwise the small one; its calls have the same closed form as the other
+layers, so either can run them. A pass stops after `max_calls`. What it has
+checked is remembered in `generated/dreams/state.json`, so the next pass
+starts with what this one did not reach and does not repeat settled work.
+
+Dreaming never overrides an operation that came from a note. Everything it
+does is in the change log and can be reversed by a note.
+
+## 8. Models
 
 ```toml
-[storage]
-backend = "s3"                 # s3 | local
-bucket = "team-x-brain"
-prefix = "brain/"
-endpoint_url = ""              # S3-compatible stores
-region = ""
-profile = ""                   # AWS profile; otherwise the standard AWS env chain
-addressing_style = "auto"      # auto | path | virtual
-path = ""                      # local backend root
-
-[tls]                          # used for both the model endpoint and S3
-ca_bundle = ""                 # empty: OS trust store
-client_cert = ""
-client_key = ""
-
 [llm]
-base_url = "https://gateway.internal/v1"
+base_url = "..."            # any OpenAI-compatible endpoint
 api_key_env = "BRAIN_API_KEY"
-chat_model = "..."
-extract_model = "..."
+small_model = "..."         # layers 1 to 8, and brief routing
+strong_model = ""           # optional
 embed_model = "..."
-doc_model = "..."              # unused until document attachments
-embed_dim = 0                  # 0: detect and record in the index
-structured_output = "auto"     # auto | tool | native | prompted
-timeout_seconds = 120
-
-[index]
-path = ""                      # default under XDG cache
-
-[threads]
-inactivity_days = 21
-
-[lease]
-ttl_seconds = 900
-
-[server]
-port = 8765
-
-[worker]
-poll_seconds = 60
-
-[dream]
-enabled = true                 # whether `brain start` dreams on its own
-nightly_at = "03:00"           # local time; "" turns the nightly pass off
-after_entries = 10             # also dream after this many new entries; 0 turns it off
-max_calls = 50                 # model calls per pass
-rebuild_after_updates = 10     # rebuild a summary after this many new entries
-rebuild_after_days = 30
-
-[context]
-max_lines = 60
-max_bytes = 6000
-recent_days = 7
-open_items = 5
+dream_uses = "strong"       # strong | small; small when no strong model is set
+answer_uses = "small"       # which model writes ask and brief answers
+escalate = "off"            # off | strong
 ```
 
-## 8. Distribution and CI
+Each prompt file has a role: `layer` prompts run on the small model, `dream`
+and `answer` prompts on whichever model the config assigns.
 
-- Not published to PyPI. The repository is public on GitHub; you clone it and
-  run `uv tool install --managed-python --python 3.12 .`. On a network with
-  internal mirrors, Python comes from the uv mirror (`UV_PYTHON_INSTALL_MIRROR`)
-  and dependencies from the PyPI mirror. `requires-python = ">=3.11"`;
-  development uses 3.12.
-- The dist name stays `brain-journal` so it can never be confused with the
-  unrelated `brain` package on PyPI. The command is `brain`.
-- The built frontend has to reach the installing machine. Options, to decide at
-  milestone 4: build it at install time from the clone (needs Node and an npm
-  registry), or attach a prebuilt wheel to GitHub releases (needs release
-  downloads to be reachable).
-- CI (GitHub Actions; each job is a plain shell script so GitLab CI can call the
-  same scripts):
-  - lint + type check (ruff, pyright)
-  - tests on macOS and Ubuntu with uv-managed Python 3.11 and 3.13
-  - tests inside a UBI9 container with uv-managed Python, to catch RHEL-specific
-    differences (OpenSSL policy, FIPS mode, filesystem). The code uses SHA-256
-    only, never MD5, so it works with FIPS enabled.
-  - S3 contract tests against MinIO, started by the test fixture
-  - frontend: `tsc --noEmit`, `vite build`, vitest
-- S3 tests read `BRAIN_TEST_S3_ENDPOINT`; if unset, the fixture tries to start
-  MinIO with `podman` or `docker`; if neither works, the tests are skipped with
-  a reason. MinIO stopped publishing public images and binaries in late 2025,
-  and its GitHub repository is archived, so the fixture uses Chainguard's free
-  MinIO image pinned by digest (`BRAIN_TEST_MINIO_IMAGE` overrides it). `moto`
-  is a pure-Python fallback that runs without containers, if its
-  conditional-write behaviour is adequate (check when writing the tests).
+A call whose output fails validation is retried by the model with the
+validation message (PydanticAI's output retries). If it still fails:
 
-## 9. Doctor
+- with `escalate = "strong"` and a strong model set, the call is made once on
+  the strong model;
+- otherwise the layer takes its safe result: one statement per sentence
+  (split), `fact` (classify), no names, a provisional `new` entity (link),
+  unfiled (file), `unrelated` (relate), no operation (correct), the section
+  left as it was (write), not supported (check). The fallback is written to
+  the change log.
 
-`brain doctor` runs these checks and prints a fix for each failure:
+A failure that is not about the model's answer (the endpoint is down, the key
+is wrong, the store cannot be written) stops the note at that layer. The note
+stays saved and pending, the error is shown by `brain doctor`, and the next
+`brain process` or worker round continues from the layer that failed.
 
-| Check | What it does |
-|-------|--------------|
-| config | parses, validates, shows which file and env vars were applied |
-| python/sqlite | Python version, SQLite version, FTS5, extension loading, sqlite-vec loads |
-| index path | writable; warns if on NFS (SQLite locking is unreliable there) |
-| storage | put / get / list / delete a probe object under `_system/doctor/` |
-| conditional writes | runs the probe; reports enforced or fallback mode |
-| lease | current holder, age, whether it is expired |
-| TLS | which trust source is used, CA file readable, cert/key pair loads |
-| proxy | effective proxy for each endpoint; warns if a localhost URL is not in `NO_PROXY` |
-| chat / extract | one tiny call per model; each structured-output mode tried |
-| embedding | one call; dimension compared to config and to the index |
-| index health | schema version, generation vs. store, pending extractions, row counts |
-| server | whether `brain start` is running, and on which port |
-| dream | when the last pass ran, its model calls, what it applied and proposed, and its last error |
+`structured_output = "auto" | "tool" | "native" | "prompted"` maps to
+PydanticAI's output modes; gateways differ in which they support, and
+`brain doctor` tests each. Chat calls use `pydantic-ai-slim[openai]`;
+embeddings use the `openai` SDK. Both share one TLS configuration (`[tls]`:
+the OS trust store by default, or `ca_bundle`, plus an optional client
+certificate), which S3 uses too.
 
-## 10. Decision log
+Tests run every layer against a scripted fake model
+(`brain.core.llm.fake`): PydanticAI's `FunctionModel` answering each prompt
+from simple rules, and deterministic bag-of-words embeddings.
+`BRAIN_FAKE_LLM=1` runs the CLI against it.
 
-| # | Decision | Status |
-|---|----------|--------|
-| 1 | Lease per machine; `brain start` combines web, MCP (HTTP), and worker; `brain mcp` stdio kept | agreed |
-| 2 | Conditional-write support probed at runtime | agreed |
-| 3 | Your changes to extracted data stored in `decisions/<entry-id>.yaml`, applied on top of the extraction | agreed |
-| 4 | Embeddings stored as generated files so `reindex` needs no endpoint | agreed |
-| 5 | sqlite-vec as the vector index; uv-managed Python everywhere | agreed |
-| 6 | `someday` is a boolean flag (called `dream` before 0.1.0) | agreed; renamed after milestone 5 |
-| 7 | Questions and action items have `state: open | closed`, reversible; the pipeline only proposes closing | agreed |
-| 8 | Brief `since` defaults to the last brief for that node | agreed, expected to change with use |
-| 9 | People and orgs wait for review; themes and threads are created as `proposed` and used immediately | agreed |
-| 10 | One `[tls]` section for both endpoints | agreed |
-| 11 | `brain start` processes pending work in the background; `brain process` for manual runs | agreed |
-| 12 | GitHub only, no PyPI. Both ways of getting the UI to work are supported: release wheel with UI included, or build from a clone with Node | agreed; choose per machine |
-| 13 | FIPS mode must work: SHA-256 only, enforced by a test that rejects MD5/SHA-1 in the source | agreed |
-| 14 | Mentions in the decisions file are grouped by type (`person`, `org`, `theme`) | made during milestone 1 |
-| 15 | `get_entry` MCP tool added; MCP `brief` leaves "last looked" unchanged unless `mark_seen` | made during milestone 3 |
-| 16 | One process for web, MCP over HTTP, and the worker (`brain start`); the worker has its own index connection | made during milestone 4 |
-| 17 | Node 24 for building the UI; the wheel carries the built UI so installs need no Node | made during milestone 4 |
-| 18 | Thread OBE can cascade to open items; the sweep skips items you already decided on | made during milestone 5 |
-| 19 | "Dream" means offline consolidation, as in Anthropic's agent-memory post | agreed after milestone 5 |
-| 20 | Every note given to a model carries its date and age; derived text carries an as-of date; dates are local | agreed after milestone 5 |
-| 21 | Dreaming applies derived output (summaries, Now lines) directly and proposes anything that changes what is recorded as true | agreed after milestone 5 |
-| 22 | Dream proposals are stored per entry, so the entry's index rebuild turns them into review items and drops decided ones | made while building dreaming |
-| 23 | Rejecting a supersession records the current status as yours; no new decisions-file field | made while building dreaming |
-| 24 | The injected context includes proposed threads, marked, because new threads stay proposed until reviewed | made while building the injected context |
-| 25 | A name matching one thread and only themes resolves to the thread; thread-named themes are dropped at extraction | made after the Haiku smoke test |
-| 26 | Now lines are capped at 35 words in code, not only in the prompt | made after the Haiku smoke test |
-| 27 | A brief request that does not name exactly one node is routed by the model, which may pick several nodes or ask | agreed after the Haiku smoke test |
+## 9. Index
 
-## 11. Not in v1
+The index stores what each layer wrote, by unit: a note (its file, layer
+files, and embeddings), an entity (its record and page), or a dream run. A
+changed file rebuilds exactly the rows of its unit, so the index depends only
+on the current files. Tables: `notes`, `statements`, `entities`, `names`,
+`mentions`, `relations`, `operations`, `events`, `pages`, `embeddings`,
+`fts`, `vec_items`.
 
-- Attaching documents (PDFs and similar) through `llm.doc_model`.
-- Scheduled digests.
-- Merging duplicate people and organizations after they have been created.
-  Review is the guard against duplicates; a merge would rewrite the mention
-  mappings of every affected entry and remove the duplicate file, and needs no
-  file-format change.
+What is true now is computed when read, by `World` (`index/queries.py`):
+
+- merges are followed to the surviving entity;
+- a statement moved by a `not_part_of` note counts in its new thread;
+- each statement gets a status: `retracted`, `superseded`, `answered`,
+  `repeat`, or `current`. A retraction that was itself retracted does
+  nothing, and relations from a retracted statement are ignored.
+
+Sync: every write through brain replaces `_system/generation.json` with a new
+random token. If it equals the one recorded in the index, listing the store
+is skipped. Otherwise the store is listed, compared with the manifest by
+ETag, and the affected units are rebuilt. A full listing also runs at least
+once a day. There are no migrations: a schema-version or embedding-model
+mismatch rebuilds the index.
+
+The tool runs on uv-managed Python, whose SQLite has FTS5 and allows
+extension loading, which sqlite-vec needs. `brain doctor` checks all three.
+
+## 10. Storage and the lease
+
+`Storage` has five operations (`get`, `put`, `list`, `delete`, `exists`);
+`list` returns ETag, size, and modification time, and `put` takes `if_absent`
+and `if_match` for conditional writes. `LocalStorage` and `S3Storage` (boto3)
+implement it.
+
+The lease is a small JSON object, `_system/lease.json`, that records which
+machine may write and until when. S3 has no locks, so without it two machines
+pointed at one bucket would overwrite each other's files with no error. It
+belongs to a machine, not a process: `brain start` and CLI commands on one
+machine share it and take turns with a local file lock. It is taken with a
+conditional write, renewed while in use, released on exit, and expires after
+`[lease] ttl_seconds`. Some S3-compatible stores ignore `If-None-Match`; a
+probe on first write detects that, and the lease falls back to write, wait,
+and read back.
+
+## 11. Reading
+
+- **`ask`** retrieves statements by keyword (FTS5) and meaning (vectors),
+  fused by reciprocal rank, plus the summaries of the threads they belong to.
+  Retracted statements are never shown to the model; superseded ones are
+  shown marked. Every claim must cite note ids from the input.
+- **`brief`** takes a page name or a request in plain words. One exact match
+  needs no extra call; otherwise one routing call picks up to four pages from
+  candidates, or asks which was meant. The brief covers each page's summary
+  and statements, and marks what is new since the last brief on it.
+- **`brain context`** is a short, dated summary for agent sessions: active
+  threads with their Now lines, the newest open items, and recent changes,
+  within `[context] max_lines` and `max_bytes`. It is rendered on every read.
+- **The change log** (`brain log`, `wiki/log.md`, the web UI) lists what was
+  created, linked, merged, closed, answered, or superseded after each note
+  and in each dream pass. It replaces review: it is where to see a mistake
+  and decide to write a correction note.
+
+## 12. Front-ends
+
+**CLI.** `jot`, `process`, `rebuild`, `active`, `wiki`, `show`, `log`,
+`ask`, `brief`, `search`, `context`, `dream`, `start`, `mcp`, `sync`,
+`reindex`, `doctor`, `init`. `brain jot --about PAGE` writes a correction to
+a page.
+
+**Web** (`brain start`, 127.0.0.1 only). The home page is the note box, the
+active threads, and recent changes. The only write in the API is
+`POST /api/notes`. Two checks stop other websites in the browser from using
+it: the Host header must be localhost, and every write must be JSON.
+
+**MCP.** `get_context`, `brief`, `ask`, `search`, `get_page`, `get_note`,
+`list_active`, and `jot`, over stdio (`brain mcp`) and over HTTP at `/mcp`
+inside `brain start`. `brain mcp` puts the injected context in the server
+instructions, so an agent session starts with it.
+
+**Worker.** `brain start` runs a background thread with its own index
+connection. It processes pending notes on startup, when a note is saved, and
+every `[worker] poll_seconds`; it dreams when a round had nothing to process
+and a pass is due.
+
+## 13. Distribution, CI, and doctor
+
+- Not published to PyPI. Install from a release wheel (the web UI is
+  included) or from a clone (`uv tool install --managed-python --python 3.12 .`,
+  which builds the web UI and needs Node 22+). The dist name is
+  `brain-journal`; the command is `brain`. `requires-python = ">=3.11"`.
+- CI (GitHub Actions; each job is a shell script in `ci/`): lint and type
+  check (ruff, pyright); tests on macOS and Ubuntu with Python 3.11 and 3.13;
+  tests in a UBI 9 container; S3 contract tests against MinIO and moto;
+  frontend typecheck, tests, and build. Pushing a `v*` tag builds the wheel
+  and attaches it to a GitHub release.
+- The code uses SHA-256 only, so it works with FIPS mode enabled; a test
+  rejects MD5 and SHA-1 in the source.
+- `brain doctor` checks the config, Python and SQLite capabilities, the index
+  path (warns on a network filesystem), TLS files, storage access,
+  conditional writes, the lease, the proxy settings, each configured model,
+  structured-output modes, the embedding dimension, the index, files that
+  failed to parse, notes that failed processing, and the last dream pass.
+  Every failure says what to change.
+
+## 14. Decisions
+
+| # | Decision | Why |
+|---|---|---|
+| 1 | Notes are the only input; the wiki is generated | The tool is only useful if it is used often, and review queues were work that got skipped |
+| 2 | Corrections are notes, applied by a later-wins rule | One input surface; a rebuild replays corrections with everything else |
+| 3 | Many small calls instead of one large extraction | A small model is reliable when each answer is a choice from a list that code can check |
+| 4 | A failed call takes a safe result instead of blocking | An unfiled statement or an extra provisional entity is cheap, and dreaming or a note repairs it |
+| 5 | New entities and threads start provisional | One mention is not enough to earn a page; this keeps one-off names out of the wiki |
+| 6 | Page lists are built by code; only Now and Summary are model-written | Lists cannot drift from the statements, and it saves calls |
+| 7 | Every model-written sentence is checked against what it cites | Unsupported sentences are the failure a reader cannot see |
+| 8 | The wiki is markdown files in the store | It can be read in any editor and travels with the notes |
+| 9 | Effective state (merges, moves, statuses) is computed on read | Layer files stay append-only per note; nothing has to be rewritten when a later note changes things |
+| 10 | Entity ids are kept across rebuilds | Page paths and links do not change when prompts improve |
+| 11 | Dreaming uses the strong model when one is set | It runs rarely and makes the cross-note judgments where a wrong merge costs most |
+| 12 | No migration from format 1 | Format 1 held curated files that format 2 has no place for; the notes can be re-entered |
+| 13 | Files are the source of truth; SQLite is a derived index | Carried over from 0.1: the store can be read without brain, and the index can always be rebuilt |
+| 14 | One machine writes at a time, enforced by a lease | Carried over from 0.1: S3 has no locks |
+
+## 15. Not built
+
+- Dreaming does not yet split an entity that was wrongly merged; a
+  `not_same_as` note does it.
+- Dreaming does not re-run layer 6 on old pairs. Stale open items are
+  re-checked; superseded decisions are found only when the later note
+  arrives.
+- A fixed set of sample notes with expected results, run per layer against a
+  real small model, to measure whether a prompt change helps.
+- Attaching documents (PDFs and similar).
 - Authentication for `brain start`, which listens on localhost only.
-- Dreaming that suggests updates to person and org profiles (role, current
-  work, memberships) or flags likely duplicate people; acting on duplicates
-  needs the entity merge above.

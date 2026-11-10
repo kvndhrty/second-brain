@@ -1,5 +1,5 @@
 import { Link, useParams } from "react-router-dom";
-import { api, notePath } from "../api";
+import { api, day, minute, notePath } from "../api";
 import { Badge, Loading, PageChip, StatementLine } from "../components";
 import { useLoad } from "../hooks";
 
@@ -13,7 +13,7 @@ export function NotesPage() {
       {data && data.length === 0 && <p>No notes yet.</p>}
       {data?.map((n) => (
         <Link key={n.id} to={notePath(n.id)} className="entry-row">
-          <span className="meta">{n.date.slice(0, 10)}</span>
+          <span className="meta">{day(n.date)}</span>
           <span>{n.label}</span>
           <span className="meta">{n.done ? `${n.statements} statements` : "processing"}</span>
         </Link>
@@ -28,9 +28,9 @@ export function NotePage() {
   if (!n) return <Loading error={error} loading={loading} />;
   return (
     <section>
-      <h2>{n.title ?? n.created.slice(0, 10)}</h2>
+      <h2>{n.title ?? day(n.created)}</h2>
       <p className="meta">
-        {n.created.slice(0, 16).replace("T", " ")} · {n.id} {!n.done && <Badge tone="pending">processing</Badge>}
+        {minute(n.created)} · {n.id} {!n.done && <Badge tone="pending">processing</Badge>}
       </p>
       <pre className="entry-text">{n.body}</pre>
       {n.statements.length > 0 && (

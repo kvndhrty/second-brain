@@ -1,29 +1,40 @@
 # brain
 
-A work journal that an LLM turns into a linked, searchable knowledge graph.
-You write a few paragraphs a day; brain extracts decisions, questions, people,
-themes, and workstreams, and can brief you on any of them when you come back
-after weeks away.
+A work journal where you only write notes. A model reads each note and keeps
+a wiki from them: a page for every piece of work, person, team, and topic,
+with where it stands, what was decided, and what is still open. When you come
+back to something after weeks away, the page is there, and brain can brief
+you on it.
 
-Three front-ends share one core: the CLI, a web UI (`brain start`), and an MCP
-server for agents such as Claude Code. Plain files in a local directory or an
-S3 bucket are the source of truth; the search index is rebuilt from them.
+You never file, tag, or review anything. If the wiki gets something wrong,
+you write another note saying so ("Jane Doe and J. Doe are the same person",
+"the vendor evaluation is finished", "ignore what I wrote about the outage
+cause"), and later notes win over earlier ones.
 
-What it does with an entry:
+Three front-ends share one core: the CLI, a web UI (`brain start`), and an
+MCP server for agents such as Claude Code. Plain files in a local directory
+or an S3 bucket are the source of truth: your notes, and the wiki as markdown
+you can open in any editor.
 
-- Splits it into fragments (decisions, questions, action items, claims,
-  ideas) and links them to people, organizations, themes, and threads
-  (workstreams). New people and organizations wait for you to confirm them.
-- Notices when a later entry seems to answer an earlier open question, and
-  asks you before closing it.
-- Writes briefs and answers that cite the dated entries they come from. Every
-  note given to the model carries its date and age, so newer information wins.
-- Runs an offline "dream" pass that rebuilds thread summaries, proposes items
-  that later entries replaced, and writes a one-line status per thread.
-- Gives agents a short, dated summary of current state at the start of each
+What it does with a note:
+
+- Splits it into statements (facts, decisions, questions, things to do,
+  ideas) and links them to people, organizations, topics, and threads
+  (ongoing pieces of work), creating pages as they are needed.
+- Works out what the note changes: a question it answers, a decision it
+  replaces, a correction it asks for. Nothing is deleted; a replaced
+  statement stays in the page's history, struck through.
+- Rewrites the affected pages, and checks every sentence it writes against
+  the statements it cites.
+- Does this in small steps, each a choice from a list that code checks, so a
+  small, cheap model is enough. A stronger model is optional and used only
+  for "dreaming": an offline pass that merges duplicates, settles old open
+  questions, and closes threads that have gone quiet.
+- Writes briefs and answers that cite the dated notes they come from, and
+  gives agents a short, dated summary of current state at the start of each
   session.
 
-- [docs/usage.md](docs/usage.md): daily use (writing, review, briefs, keeping things current)
+- [docs/usage.md](docs/usage.md): daily use (writing, correcting, briefs, agents)
 - [docs/restricted-network.md](docs/restricted-network.md): setup on a machine with internal mirrors, S3, and a TLS gateway
 - [docs/architecture.md](docs/architecture.md): design, file formats, and decisions
 
@@ -33,11 +44,13 @@ What it does with an entry:
   newer. That build includes a recent SQLite with FTS5 and allows loading the
   sqlite-vec extension; some system Pythons do not.
 - An OpenAI-compatible model endpoint and an API key: a local proxy such as
-  LiteLLM, a company gateway, or a provider's own compatible endpoint. The
-  chat model should support tool calling or JSON-schema output.
-- Optionally, an embedding model at the same endpoint. Without one, search is
-  keyword-only and new entries are not checked against earlier open questions
-  until `brain dream` runs.
+  LiteLLM, a company gateway, or a provider's own compatible endpoint. A small
+  model is enough. It should support tool calling or JSON-schema output;
+  `brain doctor` reports which works.
+- An embedding model at the same endpoint, strongly recommended. brain uses
+  it to find which earlier statements and threads a new note is about.
+  Without one, search is keyword-only and a note is compared only with
+  statements that share a thread or a name with it.
 - Node 22+ and npm only to build the web UI from a clone. A container runtime
   (podman or docker) only for the MinIO tests.
 
@@ -49,7 +62,7 @@ To try every command without a model endpoint, set `BRAIN_FAKE_LLM=1` (see
 From a release wheel (the web UI is included; no Node needed):
 
 ```sh
-uv tool install --managed-python --python 3.12 https://github.com/kvndhrty/second-brain/releases/download/v0.1.0/brain_journal-0.1.0-py3-none-any.whl
+uv tool install --managed-python --python 3.12 https://github.com/kvndhrty/second-brain/releases/download/v0.2.0/brain_journal-0.2.0-py3-none-any.whl
 ```
 
 From a clone (the web UI is built during install, which needs Node 22+ and npm;
@@ -91,23 +104,31 @@ environment variable that holds it (default `BRAIN_API_KEY`).
 
 ### Models
 
-`chat_model` writes briefs, answers, summaries, and dream output;
-`extract_model` does extraction, name resolution, and routing, and can be a
-smaller model. For example, Anthropic's OpenAI-compatible endpoint with Claude
-Haiku for both:
+`small_model` does the work on every note and writes briefs and answers.
+`strong_model` is optional; when set, dreaming uses it. For example,
+Anthropic's OpenAI-compatible endpoint with Claude Haiku as the small model
+and Sonnet for dreaming:
 
 ```toml
 [llm]
 base_url = "https://api.anthropic.com/v1"
 api_key_env = "ANTHROPIC_API_KEY"
-chat_model = "claude-haiku-5-5"
-extract_model = "claude-haiku-5-5"
-embed_model = ""                  # Anthropic serves no embedding model
+small_model = "claude-haiku-5-5"
+strong_model = "claude-sonnet-5-5"   # optional
+embed_model = ""                     # Anthropic serves no embedding model
 ```
+
+Three more settings choose where the strong model is used: `dream_uses`
+(`"strong"` by default), `answer_uses` (`"small"` by default, for `ask` and
+`brief`), and `escalate` (`"off"` by default; `"strong"` retries a step on
+the strong model when the small model's answer fails its checks).
 
 Chat and embedding calls go to the same `base_url`. To use embeddings with a
 provider that has none, put a proxy in front that serves both, such as
 LiteLLM routing embeddings to a local model.
+
+A note costs roughly 10 to 25 small model calls, depending on how many
+statements and names it has.
 
 ### S3 bucket + local proxy
 
@@ -158,39 +179,58 @@ brain uses the OS trust store.
 |---|---|
 | `brain init` | Write a config file interactively |
 | `brain doctor` | Check config, storage, lease, TLS, proxies, model endpoints, structured output, and the index |
-| `brain jot` | Save an entry from `-m TEXT`, `--file`, stdin, or `$EDITOR`, then process it |
-| `brain review` | Confirm new people and orgs, proposed themes and threads, proposed answers, and items dreaming thinks are overcome by events |
-| `brain active` | Threads with recent activity, plus pinned ones |
-| `brain brief TARGET` | Re-entry brief on a thread, person, org, or theme, or on a request in plain words that may cover several of them |
-| `brain ask "QUESTION"` | Answer from the journal, citing dated entries |
-| `brain show [ENTRY]` | An entry's fragments with ids and status (default: latest) |
-| `brain status FRAGMENT --obe/--speculative/--confirmed/--closed/--open/--someday` | Change a fragment's status |
-| `brain thread list/show/rename/pin/unpin/archive/activate/obe/merge/split/move` | Manage threads |
-| `brain sweep` | Go through stale open items, unconfirmed speculation, and quiet threads |
-| `brain dream [--dry-run] [--thread ID]` | Offline consolidation: rebuild stale summaries, propose superseded and answered items, check the sweep, write each thread's Now line |
+| `brain jot` | Save a note from `-m TEXT`, `--file`, stdin, or `$EDITOR`, then process it. `--about PAGE` marks it as a correction to that page |
+| `brain active` | Threads with recent activity or open items, and where each stands |
+| `brain wiki [PAGE]` | Show a wiki page, or list the pages |
+| `brain brief REQUEST` | Re-entry brief on a thread, person, org, or topic, or on a request in plain words that may cover several of them |
+| `brain ask "QUESTION"` | Answer from the journal, citing dated notes |
+| `brain search WORDS` | Find pages, statements, and notes |
+| `brain show [NOTE]` | What brain made of a note: its statements, where they were filed, what changed (default: latest) |
+| `brain log` | What brain did after each note and in each dream pass |
+| `brain dream [--dry-run]` | Dreaming: merge duplicates, settle old open items, close quiet threads, fill in people's roles, rebuild worn summaries |
 | `brain context [--format json]` | A short, dated summary of current state for agent sessions |
-| `brain process` | Run any pending extraction and stale thread summaries |
-| `brain reextract [IDS] [--since D] [--stale-prompts]` | Re-run extraction after a model or prompt change; your decisions are kept |
+| `brain process` | Process any pending notes, including markdown files saved into `notes/` by hand |
+| `brain rebuild` | Discard the wiki and run every note through the model again, after a prompt or model change |
 | `brain sync [--full]` | Bring the local index up to date with the store |
 | `brain reindex` | Delete the local index and rebuild it from the store (no model calls) |
 | `brain start [--port N] [--open]` | Web UI, HTTP API, MCP over HTTP at `/mcp`, and background processing |
 | `brain mcp` | Serve the journal to agents over MCP (stdio) |
 
 To try brain without a model endpoint, set `BRAIN_FAKE_LLM=1`. Every model
-call then goes to a scripted fake that turns sentences into fragments,
-capitalized names into people, `#tags` into themes, and `[[Name]]` into a
+call then goes to a scripted fake that turns sentences into statements,
+capitalized names into people, `#tags` into topics, and `[[Name]]` into a
 thread. The output is not useful as a journal, but it exercises every command.
+
+## The store
+
+```
+notes/2026/11/09/20261109T143205Z-vendor-call.md   what you wrote; never changed
+wiki/index.md                                      the wiki, as markdown
+wiki/threads/…  wiki/people/…  wiki/orgs/…  wiki/topics/…
+wiki/log.md                                        what brain changed, newest first
+generated/                                         what each step produced; rebuilt by `brain rebuild`
+```
+
+The `wiki/` folder can be opened in Obsidian or any editor; links between
+pages and to the notes they cite work there. It is overwritten when a page
+changes, so edit by writing a note, not by editing the page.
+
+A markdown file saved anywhere under `notes/` becomes a note: `brain start`
+picks it up within a minute, and `brain process` at once. Its text is kept
+exactly.
 
 ## Web UI
 
 `brain start` serves the web UI on http://127.0.0.1:8765 (`[server] port`)
-and processes new entries in the background. While it runs, `brain jot` hands
-new entries to it instead of processing them in the foreground. Pages: active
-threads, thread/person/org/theme pages with a filterable timeline, "Brief me",
-and thread actions (pin, archive, overcome by events, rename, merge, split);
-review queue; search and ask; entries with an editor; someday ideas; "Tidy up" (the
-overcome-by-events sweep); and a graph of how threads, people, orgs, and
-themes connect.
+and processes new notes in the background. While it runs, `brain jot` hands
+new notes to it instead of processing them in the foreground.
+
+The home page is a box to write a note in, the active threads with where
+each stands, and what changed recently. The other pages are the wiki, search
+and ask (with "Brief me"), your notes, and the change log. Every wiki page
+has a **This is wrong** button: it opens the note box, and what you write
+there is saved as a note that corrects that page. Saving a note is the only
+thing the UI can change.
 
 It listens on localhost only and has no login. It rejects requests whose Host
 header is not localhost and writes that are not JSON, which stops other
@@ -222,9 +262,10 @@ claude mcp add --scope user brain \
   -- brain mcp
 ```
 
-Tools: `search`, `ask`, `brief`, `get_entity`, `get_entry`, `list_active`,
-`get_context`, and `add_entry` (writes only when you ask the agent to record
-something). Every result has today's date and an age for each dated item.
+Tools: `get_context`, `brief`, `ask`, `search`, `get_page`, `get_note`,
+`list_active`, and `jot` (writes only when you ask the agent to record
+something; a correction is a note too). Every result has today's date and an
+age for each dated item.
 
 `brain mcp` puts a short summary of current state (`brain context`) in its
 instructions, so the agent starts each session knowing the active threads and

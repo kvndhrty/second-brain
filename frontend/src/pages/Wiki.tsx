@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { api, pagePath, type PageSummary } from "../api";
+import { api, day, pagePath, type PageSummary } from "../api";
 import { Badge, CitedText, Loading, NoteBox, PageChip, StatementLine } from "../components";
 import { useLoad } from "../hooks";
 
@@ -34,7 +34,7 @@ export function WikiPage() {
                       <Link to={pagePath(p.id)}>{p.name}</Link> {p.status === "closed" && <Badge>closed</Badge>}
                     </td>
                     <td className="muted">{p.now}</td>
-                    <td className="meta">{p.last_activity?.slice(0, 10)}</td>
+                    <td className="meta">{day(p.last_activity)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -143,7 +143,7 @@ export function EntityPage() {
           <ul className="log">
             {p.log.map((ev, i) => (
               <li key={i}>
-                <span className="meta">{ev.at.slice(0, 10)}</span> {ev.text}
+                <span className="meta">{day(ev.at)}</span> {ev.text}
               </li>
             ))}
           </ul>

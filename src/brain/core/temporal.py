@@ -17,6 +17,13 @@ from datetime import UTC, date, datetime
 When = str | datetime | date
 
 
+def utc_iso(value: datetime) -> str:
+    """A timestamp as stored in the index: ISO 8601 in UTC, so that strings compare in time order."""
+    if value.tzinfo is None:
+        value = value.astimezone()
+    return value.astimezone(UTC).isoformat()
+
+
 def to_local(value: str | datetime) -> datetime:
     dt = datetime.fromisoformat(value) if isinstance(value, str) else value
     if dt.tzinfo is None:

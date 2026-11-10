@@ -11,7 +11,7 @@ from rich.table import Table
 from brain.core.answers import Answer, Brief, Source
 from brain.core.llm.schemas import Claim
 from brain.core.pipeline.runner import ProcessReport
-from brain.core.temporal import iso_day
+from brain.core.temporal import iso_day, to_local
 from brain.core.views import EntitySummary, NoteView
 
 SECTIONS = [
@@ -136,7 +136,8 @@ def print_pages(out: Console, pages: list[EntitySummary]) -> None:
 
 def print_note(out: Console, note: NoteView) -> None:
     state = "processed" if note.done else "pending"
-    out.print(f"[bold]{escape(note.title or note.id)}[/bold]  [dim]{note.created[:16]} · {note.id} · {state}[/dim]")
+    when = to_local(note.created).strftime("%Y-%m-%d %H:%M")
+    out.print(f"[bold]{escape(note.title or note.id)}[/bold]  [dim]{when} · {note.id} · {state}[/dim]")
     for s in note.statements:
         flags = [s.kind] + ([s.status] if s.status != "current" else []) + ([s.thread_name] if s.thread_name else [])
         out.print(f"• {escape(s.text)}\n  [dim]{escape(' · '.join(flags))}[/dim]")

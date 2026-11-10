@@ -30,6 +30,7 @@ from brain.core.formats.records import (
 )
 from brain.core.formats.yamlio import FormatError
 from brain.core.index.db import IndexDB, vec_blob
+from brain.core.temporal import utc_iso
 
 
 @dataclass
@@ -125,7 +126,7 @@ class UnitBuilder:
         current = split is not None and split.input_hash == note.content_hash
         if not current:
             layers = {}
-        created = note.created.isoformat()
+        created = utc_iso(note.created)
         c = self.conn
         c.execute(
             "INSERT INTO notes(id, key, created_at, title, about, body, content_hash, layers, done) "
@@ -232,7 +233,7 @@ class UnitBuilder:
         c = self.conn
         c.execute(
             "INSERT INTO entities(id, type, name, status, merged_into, created_at, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (e.id, e.type, e.name, e.status, e.merged_into, e.created_at.isoformat(), e.model_dump_json()),
+            (e.id, e.type, e.name, e.status, e.merged_into, utc_iso(e.created_at), e.model_dump_json()),
         )
         for name in e.all_names():
             c.execute(
@@ -250,7 +251,7 @@ class UnitBuilder:
                 "INSERT INTO pages(entity_id, updated_at, now, summary, data, owner) VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     e.id,
-                    page.updated_at.isoformat(),
+                    utc_iso(page.updated_at),
                     now.text if now else None,
                     summary.text if summary else None,
                     page.model_dump_json(),
@@ -269,7 +270,7 @@ class UnitBuilder:
                 "INSERT OR IGNORE INTO relations(src, dst, rel, origin, owner) VALUES (?, ?, ?, 'dream', ?)",
                 (r.src, r.dst, r.rel, files.unit),
             )
-        at = (run.finished_at or run.started_at).isoformat()
+        at = utc_iso(run.finished_at or run.started_at)
         self._events(run.events, at=at, source=f"dream:{run.run_id}", owner=files.unit)
 
 

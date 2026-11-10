@@ -18,7 +18,7 @@ from brain.core import views
 from brain.core.config import Settings
 from brain.core.index import queries
 from brain.core.index.queries import World
-from brain.core.temporal import age, iso_day, local_date
+from brain.core.temporal import age, iso_day, local_date, utc_iso
 
 MAX_THREADS = 12
 MAX_CHANGES = 10
@@ -67,7 +67,7 @@ def build(conn: sqlite3.Connection, settings: Settings, *, now: datetime) -> Con
     items = sorted(world.open_items(), key=lambda s: (s.created_at, s.id), reverse=True)
     doc.open_total = len(items)
     doc.open_items = views.lines(world, items[: cfg.open_items], today)
-    cutoff = (now - timedelta(days=cfg.recent_days)).isoformat()
+    cutoff = utc_iso(now - timedelta(days=cfg.recent_days))
     for ev in queries.events(conn, limit=60):
         if ev.at >= cutoff and ev.kind not in QUIET_EVENTS and not ev.text.endswith("(provisional)"):
             doc.changes.append((iso_day(ev.at), ev.text))
