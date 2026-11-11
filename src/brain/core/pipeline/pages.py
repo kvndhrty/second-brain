@@ -5,7 +5,8 @@ builds from the statements, so they need no model. The model writes two
 sections: Now (threads only) and Summary. Each sentence it writes cites the
 notes it rests on; layer 8 asks, per sentence, whether the cited statements
 support it, and drops the ones that are not supported. When nothing
-survives, the section is left as it was.
+survives, the section is left as it was, unless a statement it covered was
+retracted or a decision it covered was replaced: then it is removed.
 
 The summary is updated from the previous summary plus the new statements
 once a few have arrived, and rebuilt from all statements when a statement it
@@ -76,7 +77,7 @@ def _now(calls: Calls, e: Ent, stmts: list[Stmt], prev: Section | None, now: dat
         if not out.text.strip():
             raise ValueError("text is empty")
         if len(out.text.split()) > NOW_MAX_WORDS:
-            raise ValueError("at most 40 words")
+            raise ValueError(f"at most {NOW_MAX_WORDS} words")
         if not out.citations:
             raise ValueError("cite at least one note id")
         check_citations(out.citations, allowed)
@@ -141,7 +142,10 @@ def _summary(
         if (" ".join(s.text.split()), tuple(sorted(set(s.citations)))) in checked or _check(calls, s, basis, today)
     ]
     if not kept:
-        return prev
+        # Nothing new could be written. A summary whose basis changed may state something that
+        # was retracted or replaced, so it is removed; it is written again the next time the
+        # page changes.
+        return None if changed else prev
     return Section(
         sentences=[Sentence(text=" ".join(s.text.split()), citations=sorted(set(s.citations))) for s in kept],
         input_hash=_covered_hash(basis),

@@ -25,6 +25,7 @@ from brain.core.formats.records import (
     LinksFile,
     PageFile,
     StateFile,
+    contains_name,
     decode_vector,
     norm_name,
 )
@@ -53,8 +54,7 @@ OWNED = ("names", "mentions", "relations", "operations", "events", "pages", "emb
 
 
 def in_statement(surface: str, text: str, quote: str) -> bool:
-    s = norm_name(surface)
-    return s in norm_name(text) or s in norm_name(quote)
+    return contains_name(surface, text) or contains_name(surface, quote)
 
 
 class UnitBuilder:

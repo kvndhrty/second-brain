@@ -6,18 +6,21 @@ supersede it, repeat it, or none of these.
 
 Layer 6b turns each correction statement into one operation from a fixed
 list. One call picks the operation; a second picks what it applies to, from
-candidates code found. The operation is applied at once and recorded with the
-note, so `brain rebuild` replays it. An operation from a note always wins
-over anything a model inferred.
+candidates code found. Every correction in a note is decided before any is
+applied, so a call that fails leaves nothing half done. Each operation has
+one function that applies it. An operation from a note always wins over
+anything a model inferred.
 """
 
 from __future__ import annotations
 
 from array import array
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 
 from brain.core.formats.note import Note
-from brain.core.formats.records import OPEN_KINDS, EntityRecord, Operation, Relation, norm_name
+from brain.core.formats.records import OPEN_KINDS, EntityRecord, Operation, Relation, contains_name
 from brain.core.index import queries, search
 from brain.core.index.queries import CONTENT_KINDS, Ent, Stmt, World
 from brain.core.llm.schemas import OpOut, RelationOut, TargetsOut
@@ -35,6 +38,10 @@ RETRACT_CANDIDATES = 10
 ENTITY_CANDIDATES = 10
 TWO_TARGETS = ("same_as", "not_same_as", "not_part_of")
 ONE_TARGET = ("rename", "close", "reopen")
+THREADS_ONLY = ("close", "reopen")
+# Two pages can be one only if they are the same type of thing. A team is sometimes read as an
+# org and sometimes as a topic, so those two may be merged.
+MERGEABLE = ({"org", "topic"},)
 
 
 def _dot(a: bytes, b: bytes) -> float:
@@ -85,7 +92,7 @@ def _earlier(ctx: PipelineContext, world: World, note: Note, s: Stmt) -> list[St
 
 def relate(ctx: PipelineContext, calls: Calls, note: Note, now: datetime) -> list[Relation]:
     today = local_date(now)
-    world = ctx.world()
+    world = ctx.world(skip_note=note.id)
     relations: list[Relation] = []
     settled: set[str] = set()  # earlier statements this note has already answered or replaced
     pairs = 0
@@ -126,10 +133,9 @@ def relate(ctx: PipelineContext, calls: Calls, note: Note, now: datetime) -> lis
 
 def _named_entities(world: World, text: str) -> list[str]:
     """Every entity, merged ones included, one of whose names appears in the text. Longest names first."""
-    body = norm_name(text)
     found: list[tuple[int, str]] = []
     for e in world.entities.values():
-        best = max((len(n) for n in e.record.all_names() if len(n) > 2 and norm_name(n) in body), default=0)
+        best = max((len(n) for n in e.record.all_names() if len(n) > 2 and contains_name(n, text)), default=0)
         if best:
             found.append((best, e.id))
     return [eid for _, eid in sorted(found, key=lambda x: (-x[0], x[1]))]
@@ -182,9 +188,9 @@ def _entity_candidates(
         hits = [h.item_id for h in search.nearest_blob(ctx.conn, vec, k=8) if h.item_type == "statement"]
         for near in world.by_id(hits).values():
             add(near.thread)
-    if op in ("close", "reopen"):
-        # Closing applies to pieces of work, so threads come first.
-        out.sort(key=lambda eid: world.entities[eid].type != "thread")
+    if op in THREADS_ONLY:
+        # Only a piece of work can be closed or reopened.
+        out = [eid for eid in out if world.entities[eid].type == "thread"]
     return out[:ENTITY_CANDIDATES]
 
 
@@ -214,15 +220,24 @@ def _statement_candidates(ctx: PipelineContext, world: World, note: Note, s: Stm
     return sorted(cands, key=lambda o: o.created_at, reverse=True)[:RETRACT_CANDIDATES]
 
 
-def corrections(ctx: PipelineContext, calls: Calls, note: Note, linked: list[str], now: datetime) -> list[Operation]:
+@dataclass
+class _Decision:
+    statement: str  # the correction statement
+    op: str
+    targets: list[str]
+    new_name: str | None = None
+
+
+def _decide(ctx: PipelineContext, calls: Calls, note: Note, linked: list[str], now: datetime) -> list[_Decision]:
+    """Ask the model what each correction statement asks for and what it applies to. Changes nothing."""
     today = local_date(now)
-    ops: list[Operation] = []
+    world = ctx.world(skip_note=note.id)
+    about = world.get(note.about)
+    decided: list[_Decision] = []
     retracted: set[str] = set()  # by this note, so two sentences of one correction do not repeat each other
-    for s in ctx.world().of_note(note.id):
+    for s in world.of_note(note.id):
         if s.kind != "correction":
             continue
-        world = ctx.world()
-        about = world.get(note.about)
         instruction = f"<instruction>{s.text}</instruction>"
         if about:
             instruction += f'\n<written_from_page id="{attr(about.id)}" name="{attr(about.name)}"/>'
@@ -254,6 +269,12 @@ def corrections(ctx: PipelineContext, calls: Calls, note: Note, linked: list[str
                 raise ValueError(f"{op} needs exactly one target")
             if op == "rename" and not (out.new_name or "").strip():
                 raise ValueError("rename needs new_name")
+            if op == "same_as":
+                types = {world.entities[t].type for t in out.targets}
+                if len(types) > 1 and types not in MERGEABLE:
+                    raise ValueError(
+                        f"a {' and a '.join(sorted(types))} cannot be the same thing; choose other targets"
+                    )
 
         named = {r for i in _named_entities(world, s.text) if (r := world.root(i))}
         if op == "same_as" and len(named) == 1:
@@ -266,44 +287,184 @@ def corrections(ctx: PipelineContext, calls: Calls, note: Note, linked: list[str
             continue
         user = "\n".join([today_el(now), f"<operation>{op}</operation>", instruction, *shown])
         out = calls.ask("correction_targets", user, TargetsOut, fallback=TargetsOut(targets=[]), validate=validate)
-        applied = apply(ctx, calls, note, s.id, op, out.targets, out.new_name) if out.targets else None
-        if applied is None:
+        if not out.targets:
             calls.log("ignored", f'Could not tell what this correction applies to: "{s.text}"')
             continue
-        ops.append(applied)
+        decided.append(_Decision(s.id, op, list(out.targets), out.new_name))
         if op == "retract":
-            retracted.update(applied.targets)
+            retracted.update(out.targets)
+    return decided
+
+
+def corrections(ctx: PipelineContext, calls: Calls, note: Note, linked: list[str], now: datetime) -> list[Operation]:
+    """The operations this note's corrections ask for, applied in the order they were written."""
+    ops: list[Operation] = []
+    for d in _decide(ctx, calls, note, linked, now):
+        applied = apply(ctx, calls, note, d.statement, d.op, d.targets, d.new_name)
+        if applied is None:
+            calls.log("ignored", "A correction in this note could not be applied: what it names is no longer there")
+        else:
+            ops.append(applied)
     return ops
 
 
-def _origin(note: Note) -> str:
-    return f"note:{note.id}"
+# --- applying one operation --------------------------------------------------------
 
 
-def _get(ctx: PipelineContext, entity_id: str) -> EntityRecord | None:
-    try:
-        return ctx.vault.get_entity(entity_id)
-    except NotFound:
+@dataclass
+class _Apply:
+    """What an operation needs: where to write, the note it came from, and the state before it."""
+
+    ctx: PipelineContext
+    calls: Calls
+    note: Note
+    world: World
+    recs: list[EntityRecord]  # the target records, in the order the model gave them
+    made: Operation
+    new_name: str | None = None
+
+    @property
+    def origin(self) -> str:
+        return f"note:{self.note.id}"
+
+    def get(self, entity_id: str | None) -> EntityRecord | None:
+        try:
+            return self.ctx.vault.get_entity(entity_id or "")
+        except NotFound:
+            return None
+
+    def survivor(self, rec: EntityRecord) -> EntityRecord:
+        """The record a target now leads to, after merges."""
+        return self.get(self.world.root(rec.id)) or rec
+
+    def put(self, *recs: EntityRecord) -> None:
+        for r in recs:
+            self.ctx.vault.put_entity(r)
+
+    def same_root(self, a: EntityRecord, b: EntityRecord) -> bool:
+        return self.world.root(a.id) == self.world.root(b.id)
+
+    def unmerge(self, rec: EntityRecord) -> EntityRecord:
+        """Take a merged record out of the one it was merged into. Returns the record it leaves."""
+        into = self.get(rec.merged_into)
+        rec.split_from(into, self.origin)
+        self.put(rec, *([into] if into else []))
+        if into:
+            self.calls.log("split", f"{rec.name} is kept apart from {into.name} again", rec.id)
+        return into or rec
+
+    def keep_apart(self, a: EntityRecord, b: EntityRecord) -> None:
+        for x, y in ((a, b), (b, a)):
+            if y.id not in x.not_same_as:
+                x.not_same_as.append(y.id)
+        self.put(a, b)
+
+
+def _retract(a: _Apply) -> Operation | None:
+    n = len(a.made.targets)
+    a.calls.log("retracted", f"Retracted {n} earlier statement(s); they no longer appear on pages")
+    return a.made
+
+
+def _same_as(a: _Apply) -> Operation | None:
+    if len(a.recs) < 2 or a.same_root(a.recs[0], a.recs[1]):
+        return a.made  # both names already lead to one page
+    keep, gone = a.survivor(a.recs[0]), a.survivor(a.recs[1])
+    gone.merge_into(keep, a.origin)
+    a.put(gone, keep)
+    a.calls.log("merged", f"{gone.name} is the same as {keep.name}; merged", keep.id)
+    a.made.targets = [keep.id, gone.id]
+    return a.made
+
+
+def _not_same_as(a: _Apply) -> Operation | None:
+    if len(a.recs) < 2:
         return None
+    x, y = a.recs
+    if a.same_root(x, y):
+        # They were merged with each other. A target merged into some third page stays there.
+        for r in (x, y):
+            if r.merged_into:
+                a.unmerge(r)
+        x, y = (a.get(x.id) or x), (a.get(y.id) or y)  # the survivor's names changed
+    a.keep_apart(x, y)
+    a.calls.log("kept_apart", f"{x.name} and {y.name} are different and will not be merged", x.id)
+    return a.made
 
 
-def _unmerge(ctx: PipelineContext, calls: Calls, note: Note, rec: EntityRecord) -> None:
-    into = _get(ctx, rec.merged_into or "")
-    rec.merged_into = None
-    rec.set_by["merged_into"] = _origin(note)
-    if into:
-        # The survivor took these names at the merge; they go back with the entity.
-        mine = {norm_name(n) for n in rec.all_names()}
-        into.names = [n for n in into.names if norm_name(n) not in mine]
-        ctx.vault.put_entity(into)
-        calls.log("split", f"{rec.name} is kept apart from {into.name} again", rec.id)
+def _rename(a: _Apply) -> Operation | None:
+    name = " ".join((a.new_name or "").split())
+    if not name:
+        return None
+    rec = a.survivor(a.recs[0])
+    old = rec.name
+    rec.first_name = rec.first_name or old
+    rec.names = [n for n in [old, *rec.names] if n.casefold() != name.casefold()]
+    rec.name = name
+    rec.set_by["name"] = a.origin
+    a.put(rec)
+    a.calls.log("renamed", f"{old} is now called {name}", rec.id)
+    a.made.targets, a.made.name = [rec.id], name
+    return a.made
 
 
-def _keep_apart(ctx: PipelineContext, a: EntityRecord, b: EntityRecord) -> None:
-    for x, y in ((a, b), (b, a)):
-        if y.id not in x.not_same_as:
-            x.not_same_as.append(y.id)
-        ctx.vault.put_entity(x)
+def _set_status(a: _Apply) -> Operation | None:
+    rec = a.survivor(a.recs[0])
+    if rec.type != "thread":
+        return None
+    closing = a.made.op == "close"
+    rec.status = "closed" if closing else "active"
+    rec.closed_at = a.note.created if closing else None
+    rec.set_by["status"] = a.origin
+    a.put(rec)
+    word = "closed" if closing else "reopened"
+    a.calls.log(word, f"{rec.name}: {word}", rec.id)
+    a.made.targets = [rec.id]
+    return a.made
+
+
+def _not_part_of(a: _Apply) -> Operation | None:
+    """targets: the part, then the whole it was wrongly put in."""
+    if len(a.recs) < 2:
+        return None
+    part_rec, whole_rec = a.recs
+    world = a.world
+    if part_rec.merged_into and a.same_root(part_rec, whole_rec):
+        # The part was merged into the whole: take it out again.
+        a.unmerge(part_rec)
+        a.keep_apart(a.get(part_rec.id) or part_rec, a.get(whole_rec.id) or whole_rec)
+        return a.made
+    whole = world.entities[world.root(whole_rec.id) or whole_rec.id]
+    part = world.entities[world.root(part_rec.id) or part_rec.id]
+    a.keep_apart(part_rec, whole_rec)
+    if whole.type != "thread":
+        return a.made
+    if part.type == "thread":
+        dest = part.id
+    else:
+        # The part is a person, org, or topic: its statements move to a thread of the same name.
+        known = world.by_name(part.name, "thread")
+        dest = known[0].id if known else link_layer.create(a.ctx, a.calls, a.note, "thread", part.name, active=True).id
+    dest_rec = a.get(dest)
+    if dest_rec is not None and dest_rec.status == "provisional":
+        dest_rec.status = "active"  # it now holds statements, so it needs a page
+        a.put(dest_rec)
+    mentioning = {s.id for s in world.of_entity(part.id)}
+    a.made.moved = [s.id for s in world.of_entity(whole.id) if s.id in mentioning]
+    a.made.targets = [dest, whole.id]
+    a.calls.log("moved", f"{part.name} is not part of {whole.name}; moved {len(a.made.moved)} statement(s)", dest)
+    return a.made
+
+
+APPLY: dict[str, Callable[[_Apply], Operation | None]] = {
+    "retract": _retract,
+    "same_as": _same_as,
+    "not_same_as": _not_same_as,
+    "rename": _rename,
+    "close": _set_status,
+    "reopen": _set_status,
+    "not_part_of": _not_part_of,
+}
 
 
 def apply(
@@ -311,104 +472,10 @@ def apply(
 ) -> Operation | None:
     """Apply one operation to the entity records and return it for the note's state file. None if it cannot apply."""
     made = Operation(op=op, statement=sid, targets=list(targets))  # type: ignore[arg-type]
-    if op == "retract":
-        calls.log("retracted", f"Retracted {len(targets)} earlier statement(s); they no longer appear on pages")
-        return made
-    world = ctx.world()
-    recs = [_get(ctx, t) for t in targets]
-    if any(r is None for r in recs):
-        return None
-    a = recs[0]
-    assert a is not None
-    if op == "same_as":
-        if len(recs) < 2:
-            return made  # both names already point at the same entity
-        b = recs[1]
-        assert b is not None
-        if world.root(a.id) == world.root(b.id):
-            return made
-        a, b = (_get(ctx, world.root(a.id) or a.id) or a), (_get(ctx, world.root(b.id) or b.id) or b)
-        b.merged_into = a.id
-        b.set_by["merged_into"] = _origin(note)
-        for n in b.all_names():
-            a.add_name(n)
-        a.not_same_as = [x for x in a.not_same_as if x != b.id]
-        b.not_same_as = [x for x in b.not_same_as if x != a.id]
-        if a.status == "provisional":
-            a.status = "active"
-        ctx.vault.put_entity(b)
-        ctx.vault.put_entity(a)
-        calls.log("merged", f"{b.name} is the same as {a.name}; merged", a.id)
-        made.targets = [a.id, b.id]
-        return made
-    if op == "not_same_as":
-        if len(recs) < 2:
+    env = _Apply(ctx, calls, note, ctx.world(skip_note=note.id), [], made, new_name)
+    if op != "retract":
+        found = [env.get(t) for t in targets]
+        if any(r is None for r in found):
             return None
-        b = recs[1]
-        assert b is not None
-        for r in (a, b):
-            if r.merged_into:
-                _unmerge(ctx, calls, note, r)
-                ctx.vault.put_entity(r)
-        a, b = (_get(ctx, a.id) or a), (_get(ctx, b.id) or b)  # the survivor's names changed
-        _keep_apart(ctx, a, b)
-        calls.log("kept_apart", f"{a.name} and {b.name} are different and will not be merged", a.id)
-        return made
-    if op == "rename":
-        name = " ".join((new_name or "").split())
-        if not name:
-            return None
-        a = _get(ctx, world.root(a.id) or a.id) or a
-        old = a.name
-        a.first_name = a.first_name or old
-        a.names = [n for n in [old, *a.names] if norm_name(n) != norm_name(name)]
-        a.name = name
-        a.set_by["name"] = _origin(note)
-        ctx.vault.put_entity(a)
-        calls.log("renamed", f"{old} is now called {name}", a.id)
-        made.targets, made.name = [a.id], name
-        return made
-    if op in ("close", "reopen"):
-        a = _get(ctx, world.root(a.id) or a.id) or a
-        a.status = "closed" if op == "close" else "active"
-        a.closed_at = note.created if op == "close" else None
-        a.set_by["status"] = _origin(note)
-        ctx.vault.put_entity(a)
-        calls.log(
-            "closed" if op == "close" else "reopened", f"{a.name}: {'closed' if op == 'close' else 'reopened'}", a.id
-        )
-        made.targets = [a.id]
-        return made
-    if op == "not_part_of":
-        if len(recs) < 2:
-            return None
-        b = recs[1]
-        assert b is not None
-        if a.merged_into and world.root(a.id) == world.root(b.id):
-            _unmerge(ctx, calls, note, a)
-            ctx.vault.put_entity(a)
-            _keep_apart(ctx, _get(ctx, a.id) or a, _get(ctx, b.id) or b)
-            return made
-        whole = world.root(b.id) or b.id
-        part = world.root(a.id) or a.id
-        _keep_apart(ctx, a, b)
-        if world.entities[whole].type != "thread":
-            return made
-        if world.entities[part].type == "thread":
-            dest = part
-        else:
-            # The part is a person, org, or topic: its statements move to a thread of the same name.
-            name = world.entities[part].name
-            known = world.by_name(name, "thread")
-            dest = known[0].id if known else link_layer.create(ctx, calls, note, "thread", name, active=True).id
-        mentioning = {s.id for s in world.of_entity(part)}
-        made.moved = [s.id for s in world.of_entity(whole) if s.id in mentioning]
-        made.targets = [dest, whole]
-        calls.log(
-            "moved",
-            f"{world.entities[part].name} is not part of {world.entities[whole].name}; "
-            f"moved {len(made.moved)} statement(s)",
-            dest,
-        )
-        return made
-    return None
+        env.recs = [r for r in found if r is not None]
+    return APPLY[op](env)

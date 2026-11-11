@@ -8,6 +8,7 @@ depend on it.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -34,7 +35,7 @@ GENERATION = "_system/generation.json"
 PROBE_PREFIX = "_system/probe/"
 DOCTOR_PREFIX = "_system/doctor/"
 
-LAYERS = ("split", "classify", "names", "links", "filing", "state")
+LAYERS = ("split", "classify", "names", "links", "filing", "state", "pages")
 WIKI_DIRS = {"thread": "threads", "person": "people", "org": "orgs", "topic": "topics"}
 
 _TS_FORMAT = "%Y%m%dT%H%M%SZ"
@@ -49,8 +50,16 @@ def note_id_for(dt: datetime, suffix: int = 0) -> str:
     return f"{base}-{suffix}" if suffix else base
 
 
-def statement_id(note_id: str, n: int) -> str:
-    return f"s-{note_id.removeprefix('n-')}-{n:02d}"
+def statement_id(note_id: str, text: str) -> str:
+    """An id made from the statement's words, not its position.
+
+    Editing a note leaves the ids of its untouched statements as they were,
+    so a later note's relation or retraction still points at the same words.
+    A relation whose statement was edited away points at nothing and is
+    ignored.
+    """
+    digest = hashlib.sha256(" ".join(text.casefold().split()).encode()).hexdigest()[:8]
+    return f"s-{note_id.removeprefix('n-')}-{digest}"
 
 
 def note_of_statement(statement: str) -> str:

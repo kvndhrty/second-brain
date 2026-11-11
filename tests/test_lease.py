@@ -58,13 +58,13 @@ def lease(storage, machine="m1", pid=100, clock=None, **kw) -> Lease:
     )
 
 
-def test_acquire_and_release(storage):
-    a = lease(storage)
+def test_acquire_and_release(local_storage):
+    a = lease(local_storage)
     a.acquire()
-    rec, _ = read_lease(storage)
+    rec, _ = read_lease(local_storage)
     assert rec.machine_id == "m1" and rec.pid == 100
     a.release()
-    assert read_lease(storage) is None
+    assert read_lease(local_storage) is None
 
 
 def test_other_machine_is_refused_with_clear_message(storage):
@@ -76,56 +76,51 @@ def test_other_machine_is_refused_with_clear_message(storage):
     assert e.value.record.machine_id == "m1"
 
 
-def test_force_takes_over(storage):
+def test_forced_or_expired_lease_is_taken_over(local_storage):
     clock = Clock()
-    lease(storage, "m1", clock=clock).acquire()
-    lease(storage, "m2", clock=clock, force=True).acquire()
-    assert read_lease(storage)[0].machine_id == "m2"
-
-
-def test_expired_lease_is_taken_over(storage):
-    clock = Clock()
-    lease(storage, "m1", clock=clock).acquire()
+    lease(local_storage, "m1", clock=clock).acquire()
+    lease(local_storage, "m2", clock=clock, force=True).acquire()
+    assert read_lease(local_storage)[0].machine_id == "m2"
     clock.advance(601)
-    lease(storage, "m2", clock=clock).acquire()
-    assert read_lease(storage)[0].machine_id == "m2"
+    lease(local_storage, "m3", clock=clock).acquire()
+    assert read_lease(local_storage)[0].machine_id == "m3"
 
 
-def test_same_machine_shares_and_only_last_renewer_releases(storage):
+def test_short_command_does_not_delete_a_lease_another_process_still_uses(local_storage, tmp_path):
     clock = Clock()
-    server = lease(storage, "m1", pid=1, clock=clock)
+    lock = tmp_path / "lease.lock"
+    server = lease(local_storage, "m1", pid=1, clock=clock, local_lock=lock)
     server.acquire()
-    cli = lease(storage, "m1", pid=2, clock=clock)
-    cli.acquire()  # shares; renewal records pid 2
-    assert read_lease(storage)[0].pid == 2
-    server.renew()  # long-running process renews; record carries pid 1 again
-    cli.release()  # pid 2 is no longer recorded, so the lease stays
-    assert read_lease(storage) is not None
-    server.release()
-    assert read_lease(storage) is None
+    cli = lease(local_storage, "m1", pid=2, clock=clock, local_lock=lock)
+    cli.acquire()  # shares the lease; the record now carries pid 2
+    cli.release()  # the short command exits while the server is still running
+    with pytest.raises(LeaseHeld):
+        lease(local_storage, "m2", clock=clock).acquire()
+    server.release()  # the last process on this machine
+    assert read_lease(local_storage) is None
 
 
-def test_renew_detects_lost_lease(storage):
+def test_renew_detects_lost_lease(local_storage):
     clock = Clock()
-    a = lease(storage, "m1", clock=clock)
+    a = lease(local_storage, "m1", clock=clock)
     a.acquire()
     clock.advance(700)
-    lease(storage, "m2", clock=clock).acquire()  # m1 expired; m2 takes it
+    lease(local_storage, "m2", clock=clock).acquire()  # m1 expired; m2 takes it
     with pytest.raises(LeaseHeld):
         a.renew()
 
 
-def test_ensure_renews_after_a_third_of_ttl(storage):
+def test_ensure_renews_after_a_third_of_ttl(local_storage):
     clock = Clock()
-    a = lease(storage, "m1", clock=clock)
+    a = lease(local_storage, "m1", clock=clock)
     a.ensure()
-    first = read_lease(storage)[0].renewed_at
+    first = read_lease(local_storage)[0].renewed_at
     clock.advance(100)
     a.ensure()
-    assert read_lease(storage)[0].renewed_at == first
+    assert read_lease(local_storage)[0].renewed_at == first
     clock.advance(150)
     a.ensure()
-    assert read_lease(storage)[0].renewed_at != first
+    assert read_lease(local_storage)[0].renewed_at != first
 
 
 def test_probe_detects_ignored_conditions(local_storage):
@@ -141,17 +136,6 @@ def test_probe_result_is_cached(local_storage, state):
     assert "(cached)" in second.detail
     third = ensure_probed(local_storage, state, now=1000.0 + 25 * 3600)
     assert "(cached)" not in third.detail
-
-
-def test_fallback_mode_uses_read_back(local_storage):
-    store = IgnoresConditions(local_storage)
-    store.supports_conditional_writes = False
-    clock = Clock()
-    a = Lease(store, machine_id="m1", ttl_seconds=600, command="t", clock=clock, sleep=lambda s: None, pid=1)
-    a.acquire()
-    b = Lease(store, machine_id="m2", ttl_seconds=600, command="t", clock=clock, sleep=lambda s: None, pid=2)
-    with pytest.raises(LeaseHeld):
-        b.acquire()
 
 
 def test_fallback_detects_concurrent_writer(local_storage):

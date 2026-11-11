@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.core.storage.base import NotFound, ObjectInfo, PreconditionFailed, StorageError, check_key
+from brain.core.storage.base import NotFound, ObjectInfo, PreconditionFailed, StorageError, check_key, valid_key
 
 _LOCK_NAME = ".brain-cas.lock"
 
@@ -112,7 +112,7 @@ class LocalStorage:
                     continue
                 full = Path(dirpath) / name
                 key = full.relative_to(self.root).as_posix()
-                if key.startswith(prefix):
+                if key.startswith(prefix) and valid_key(key):
                     found.append((key, full))
         for key, full in sorted(found):
             try:

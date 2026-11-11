@@ -8,7 +8,7 @@ import pytest
 
 from brain.core import keys
 from brain.core.formats.note import Note
-from brain.core.formats.records import EntityRecord, SplitFile, Statement
+from brain.core.formats.records import EntityRecord, SplitFile, Statement, contains_name
 from brain.core.formats.yamlio import FORMAT_VERSION, FormatError, UnsupportedFormat
 
 NOW = datetime(2026, 11, 9, 14, 32, 5, tzinfo=UTC)
@@ -41,8 +41,10 @@ def test_keys_and_ids():
     nid = keys.note_id_for(NOW)
     assert nid == "n-20261109T143205Z" and keys.note_id_for(NOW, 2) == "n-20261109T143205Z-2"
     assert keys.note_key(NOW, nid, "vendor-call") == "notes/2026/11/09/20261109T143205Z-vendor-call.md"
-    sid = keys.statement_id(nid, 3)
-    assert sid == "s-20261109T143205Z-03" and keys.note_of_statement(sid) == nid
+    sid = keys.statement_id(nid, "We  decided on December.")
+    assert sid == keys.statement_id(nid, "we decided on december.") != keys.statement_id(nid, "We decided on January.")
+    assert sid.startswith("s-20261109T143205Z-") and keys.note_of_statement(sid) == nid
+    assert keys.note_of_statement(keys.statement_id(keys.note_id_for(NOW, 2), "x")) == "n-20261109T143205Z-2"
     assert keys.wiki_key("person", "jane-doe") == "wiki/people/jane-doe.md"
     assert keys.classify(keys.layer_key(nid, "split")) == keys.KeyInfo("layer", f"note:{nid}", layer="split")
     assert keys.classify(keys.entity_key("jane-doe")).unit == "entity:jane-doe"
@@ -72,3 +74,10 @@ def test_entity_names():
     assert e.all_names() == ["Jane Doe", "JD"]
     e.set_by["status"] = "note:n-1"
     assert e.note_set("status") and not e.note_set("name")
+    assert contains_name("Ann", "Ann's plan") and not contains_name("Ann", "Annual planning")
+    # A merge gives the survivor the other's names; undoing it takes back only those.
+    other = EntityRecord(id="j-doe", type="person", name="J. Doe", names=["JD"], created_at=NOW)
+    other.merge_into(e, "note:n-2")
+    assert e.all_names() == ["Jane Doe", "JD", "J. Doe"] and other.merged_into == "jane-doe"
+    other.split_from(e, "note:n-3")
+    assert e.all_names() == ["Jane Doe", "JD"] and other.merged_into is None

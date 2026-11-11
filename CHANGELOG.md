@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.2.1
+
+Fixes from an independent review of 0.2.0. The index is rebuilt on first run.
+Statement ids changed, so run `brain rebuild` on a store that 0.2.0 wrote.
+
+Wrong results:
+
+- Notes are now always processed in date order. Before, a note saved while an
+  earlier one was still pending or failed was processed first, and a
+  replaced decision could stay current or a close could win over a later
+  reopen. A failed note now holds the notes after it and is tried again;
+  `brain process --skip NOTE_ID` leaves one out.
+- A failure while writing a note's pages left the note marked as done, so
+  the pages were never written. It is now tried again.
+- A retracted statement could stay in a page's Summary when the summary
+  could not be rewritten. The summary is now removed until it can be.
+- Editing a note file could move a later note's retraction or "replaced by"
+  onto a different sentence. Statement ids now come from the statement's
+  words, not its position.
+- Dreaming could merge two pages a note had said are different, when a third
+  page was merged with one of them in the same pass.
+- Names were matched as parts of words: a person named "Ann" was credited
+  with statements containing "planning".
+- Corrections are checked by type: a person cannot be merged into a thread,
+  and only a thread can be closed. "X and Y are different" no longer takes X
+  out of an unrelated page it was merged into. Undoing a merge no longer
+  removes a name the surviving page had before it. A thread created by "X is
+  not part of Y" kept no page after a rebuild.
+- A correction note with several corrections is decided in full before any
+  is applied, so a failed model call leaves nothing half done.
+- With `structured_output = "auto"`, one invalid answer switched every later
+  call to prompted JSON for the life of the process.
+
+Lost or duplicated notes:
+
+- A short command (`brain jot`) deleted the write lease that `brain start`
+  on the same machine was still using, so another machine could write at the
+  same time.
+- A file being saved by an editor under `notes/` was taken half-written, and
+  taken again when the editor saved. A file is now taken once it has not
+  changed for 30 seconds.
+- One file under `notes/` with a name brain does not use (for example in
+  `.obsidian/` on S3) stopped all syncing and processing.
+- `brain jot` and the `jot` tool could report a failure after the note was
+  saved, so a retry saved it twice.
+- Text typed into `$EDITOR` or piped to `brain jot` was lost if the command
+  failed before saving. It is kept in a draft file, and the message says
+  where.
+- Cmd/Ctrl+Enter pressed twice in the web note box saved two notes.
+- A complete note file put under `notes/` by hand was not noticed for up to
+  ten minutes.
+- A failing note was retried every minute without limit. The wait now
+  doubles after each failure, up to 30 minutes.
+
+Other:
+
+- `pipeline/state.py` has one function per correction operation.
+- The test suite went from 218 tests to 168: repeated checks were merged or
+  removed, and tests were added for the defects above.
+
 ## 0.2.0
 
 Notes in, wiki out. The person only writes notes; models build and maintain

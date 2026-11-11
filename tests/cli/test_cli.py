@@ -28,9 +28,11 @@ def run(cfg: Path, *args: str, input: str | None = None):
 
 
 def test_jot_message_then_reindex(cfg, tmp_path):
+    r = run(cfg, "jot", "-m", "   ")
+    assert r.exit_code == 1 and "empty" in r.output
     r = run(cfg, "jot", "-m", "Talked to Jane about quotas.", "--title", "Quota")
     assert r.exit_code == 0, r.output
-    assert "saved n-" in r.output
+    assert "saved n-" in r.output and "saved and pending" in r.output  # no model endpoint is configured
     files = list((tmp_path / "store" / "notes").rglob("*.md"))
     assert len(files) == 1 and files[0].name.endswith("-quota.md")
     assert files[0].read_text().endswith("---\nTalked to Jane about quotas.\n")
@@ -47,11 +49,6 @@ def test_jot_from_stdin(cfg, tmp_path):
     assert f.name.endswith("-from-a-pipe.md")
 
 
-def test_jot_empty_is_refused(cfg):
-    r = run(cfg, "jot", "-m", "   ")
-    assert r.exit_code == 1 and "empty" in r.output
-
-
 def test_jot_from_editor(tmp_path, monkeypatch):
     script = tmp_path / "fake-editor.sh"
     script.write_text("#!/bin/sh\nprintf 'written in the editor\\n' > \"$1\"\n")
@@ -60,6 +57,15 @@ def test_jot_from_editor(tmp_path, monkeypatch):
     monkeypatch.setenv("EDITOR", str(script))
     assert cli._from_editor(tmp_path) == "written in the editor\n"
     assert not list(tmp_path.glob("editing-*"))
+
+
+def test_piped_text_is_kept_when_jot_fails_before_saving(cfg):
+    r = run(cfg, "jot", "--about", "no such page", input="words typed only here\n")
+    assert r.exit_code == 2
+    (draft,) = LocalState().drafts_dir.glob("draft-*.md")
+    assert draft.read_text() == "words typed only here\n" and str(draft) in r.output.replace("\n", "")
+    r = run(cfg, "jot", "--file", str(draft))
+    assert r.exit_code == 0 and not draft.exists()
 
 
 def test_lease_held_by_other_machine_exits_3_and_force_works(cfg, tmp_path):
@@ -156,11 +162,6 @@ def test_jot_processes_the_note(fake_cfg):
     assert "nothing to process" in r.output
 
 
-def test_jot_without_model_endpoint_leaves_the_note_pending(cfg):
-    r = run(cfg, "jot", "-m", "hello")
-    assert r.exit_code == 0 and "saved and pending" in r.output
-
-
 def test_show_active_wiki_ask_brief_search_log(fake_cfg):
     run(fake_cfg, "jot", "-m", "Kicked off the [[GPU quota migration]]. Does the vendor support MIG on the nodes?")
     run(fake_cfg, "jot", "-m", "Jane Doe needs to file the ticket for the [[GPU quota migration]].")
@@ -185,25 +186,6 @@ def test_show_active_wiki_ask_brief_search_log(fake_cfg):
     assert r.exit_code == 0 and "New person: Jane Doe" in r.output
 
 
-def test_correction_from_the_command_line(fake_cfg):
-    run(fake_cfg, "jot", "-m", "Kicked off the [[GPU quota migration]].")
-    run(fake_cfg, "jot", "-m", "More on the [[GPU quota migration]].")
-    r = run(fake_cfg, "jot", "-m", "This is finished.", "--about", "GPU quota migration")
-    assert r.exit_code == 0, r.output
-    assert "status: closed" in run(fake_cfg, "wiki", "gpu-quota-migration").output
-    assert "no active threads" in run(fake_cfg, "active").output
-    assert run(fake_cfg, "jot", "-m", "x", "--about", "no such page").exit_code == 2
-
-
-def test_file_saved_into_notes_is_picked_up_by_process(fake_cfg, tmp_path):
-    notes = tmp_path / "store" / "notes"
-    notes.mkdir(parents=True)
-    (notes / "from my editor.md").write_text("Jane Doe is out this week.\n")
-    r = run(fake_cfg, "process")
-    assert r.exit_code == 0 and "model call(s)" in r.output
-    assert "Jane Doe is out this week." in run(fake_cfg, "show").output
-
-
 def test_rebuild_requires_confirmation(fake_cfg):
     run(fake_cfg, "jot", "-m", "Something happened with the [[Cache rewrite]].")
     r = run(fake_cfg, "rebuild", input="n\n")
@@ -212,7 +194,7 @@ def test_rebuild_requires_confirmation(fake_cfg):
     assert r.exit_code == 0 and "rebuilt from 1 note(s)" in r.output
 
 
-def test_context_and_dream_commands(fake_cfg):
+def test_context_and_dream_commands(fake_cfg, tmp_path):
     run(fake_cfg, "jot", "-m", "We decided the [[Billing migration]] cutover is in March.")
     run(fake_cfg, "jot", "-m", "We decided the [[Billing migration]] cutover is in May instead.")
     r = run(fake_cfg, "context")
@@ -222,5 +204,5 @@ def test_context_and_dream_commands(fake_cfg):
     assert run(fake_cfg, "context", "--format", "xml").exit_code == 2
     r = run(fake_cfg, "dream", "--dry-run")
     assert r.exit_code == 0, r.output
-    r = run(fake_cfg, "dream")
-    assert r.exit_code == 0 and ("nothing changed" in r.output or "✓" in r.output)
+    assert run(fake_cfg, "dream").exit_code == 0
+    assert list((tmp_path / "store" / "generated" / "dreams" / "runs").glob("*.json"))  # a pass ran and was recorded

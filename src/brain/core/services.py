@@ -50,8 +50,9 @@ class Busy(Exception):
 @dataclass
 class RebuildReport:
     notes: int
-    failed: list[str]
+    failed: list[str]  # the note the rebuild stopped at, if any
     calls: int
+    remaining: int = 0  # notes not reached; `brain process` continues from there
 
 
 def index_path(settings: Settings, storage: Storage) -> Path:
@@ -83,6 +84,7 @@ class Brain:
             ttl_seconds=self.settings.lease.ttl_seconds,
             command=command,
             force=force_lease,
+            local_lock=self.state.lease_lock(self.storage.ident),
         )
         self.db = IndexDB(index_path(self.settings, self.storage), embed_model=self.settings.llm.embed_model)
         self.syncer = Syncer(self.db, self.storage, embed_model=self.settings.llm.embed_model)
@@ -149,7 +151,14 @@ class Brain:
     def adopt(self) -> list[Note]:
         """Turn markdown files saved into notes/ by hand into notes."""
         self.sync()
-        return self.vault.adopt_bare_notes()
+        return self._adopt()
+
+    def _adopt(self) -> list[Note]:
+        found = self.vault.adopt_bare_notes()
+        known = {r[0] for r in self.db.conn.execute("SELECT key FROM notes")}
+        if any(k not in known for k in found.in_place):
+            self.sync(full=True)  # a complete note file was put in notes/ by hand; only a listing finds it
+        return found.notes
 
     # --- models and pipeline -------------------------------------------------
 
@@ -184,20 +193,37 @@ class Brain:
     def process(
         self, note_id: str, *, force: bool = False, progress: Callable[[str], None] | None = None
     ) -> ProcessReport:
-        """Run the layers for one note and update the pages it touches."""
-        with self._processing("another brain process is processing notes; it will pick this one up"):
-            return ProcessReport([self._pipeline().run_note(note_id, force=force, progress=progress)])
+        """Process a note, after any earlier notes that are still pending.
 
-    def process_pending(self, progress: Callable[[str, str], None] | None = None) -> ProcessReport:
+        Notes are processed in date order, so if an earlier note fails this
+        one waits; `ProcessReport.result(note_id)` says so. `force` runs this
+        one note's layers again, whether or not they are current.
+        """
+        with self._processing("another brain process is processing notes; it will pick this one up"):
+            pipeline = self._pipeline()
+            if force:
+                return ProcessReport([pipeline.run_note(note_id, force=True, progress=progress)])
+            say = (lambda _note, msg: progress(msg)) if progress else None
+            return pipeline.process_pending(say, through=note_id)
+
+    def process_pending(
+        self, progress: Callable[[str, str], None] | None = None, *, wait_for_retry: bool = False
+    ) -> ProcessReport:
         self.sync()
         with self._processing("another brain process is already processing notes"):
-            self.vault.adopt_bare_notes()
-            return self._pipeline().process_pending(progress)
+            self._adopt()
+            return self._pipeline().process_pending(progress, wait_for_retry=wait_for_retry)
+
+    def skip(self, note_id: str) -> None:
+        """Leave a note that cannot be processed out of the wiki, so later notes are not held up."""
+        with self._processing("another brain process is processing notes"):
+            self._pipeline().skip(note_id)
 
     def rebuild(self, progress: Callable[[str, str], None] | None = None) -> RebuildReport:
         """Discard everything generated except entity ids, and run every note again in date order.
 
-        This is how an improved prompt reaches old notes. Entity records are
+        This is how an improved prompt reaches old notes. It stops at the first
+        note that fails; `process_pending` continues from there. Entity records are
         reset to how they were created (names, status, and merges are learned
         again from the notes) but keep their ids, so page paths and links stay
         the same. An entity no note leads to any more stays provisional, with
@@ -214,15 +240,18 @@ class Brain:
             for e in self.world().entities.values():
                 self.vault.put_entity(e.record.reset())
             ids = [r[0] for r in self.db.conn.execute("SELECT id FROM notes ORDER BY created_at, id")]
-            failed, calls = [], 0
+            failed, calls, done = [], 0, 0
             for note_id in ids:
                 say = (lambda msg, n=note_id: progress(n, msg)) if progress else None
                 result = pipeline.run_note(note_id, force=True, progress=say)
                 calls += result.calls
                 if result.error:
+                    # Later notes depend on this one, so the rebuild stops here.
                     failed.append(f"{note_id}: {result.error}")
+                    break
+                done += 1
             wiki.write(pipeline.ctx, [], self.clock(), everything=True)
-            return RebuildReport(len(ids), failed, calls)
+            return RebuildReport(len(ids), failed, calls, remaining=len(ids) - done)
 
     def failures(self) -> dict[str, dict]:
         return self.state.read_json(FAILURES)

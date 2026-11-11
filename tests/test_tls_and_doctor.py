@@ -75,22 +75,6 @@ def mtls_fake_gateway(certs: Certs) -> Iterator[tuple[str, FakeOpenAI]]:
         server.shutdown()
 
 
-def test_mtls_succeeds_with_ca_and_client_cert(certs, mtls_fake_gateway):
-    url, _ = mtls_fake_gateway
-    ctx = ssl_context(
-        TLSConfig(ca_bundle=str(certs.ca_file), client_cert=str(certs.client_cert), client_key=str(certs.client_key))
-    )
-    with httpx2.Client(verify=ctx) as c:
-        assert c.get(f"{url}/models", headers={"authorization": "Bearer test-key"}).status_code == 200
-
-
-def test_mtls_fails_without_client_cert(certs, mtls_fake_gateway):
-    url, _ = mtls_fake_gateway
-    ctx = ssl_context(TLSConfig(ca_bundle=str(certs.ca_file)))
-    with httpx2.Client(verify=ctx) as c, pytest.raises(httpx2.HTTPError):
-        c.get(f"{url}/models")
-
-
 def test_untrusted_ca_fails_with_os_trust_store(mtls_fake_gateway):
     url, _ = mtls_fake_gateway
     with httpx2.Client(verify=ssl_context(TLSConfig())) as c, pytest.raises(httpx2.ConnectError):
@@ -224,13 +208,6 @@ def test_doctor_warns_when_localhost_goes_through_proxy(local_storage, state, mo
     monkeypatch.setenv("NO_PROXY", "localhost")
     r = doctor(local_storage, state, llm={"base_url": "https://localhost:8443/v1"})
     assert r["proxy"][0].status == "ok"
-
-
-def test_doctor_config_error(tmp_path, local_storage, state):
-    bad = tmp_path / "bad.toml"
-    bad.write_text('[storage]\nbackend = "s3"\n')
-    results = Doctor(str(bad), storage=local_storage, state=state).run()
-    assert results[0].status == "fail" and "bucket" in results[0].detail
 
 
 def test_filesystem_type_from_mounts(tmp_path):

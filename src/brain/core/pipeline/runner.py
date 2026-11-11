@@ -1,19 +1,27 @@
 """Run the layers for one note, or for every note that is pending.
 
 Each layer writes one file that records a hash of its input and the versions
-of its prompts, so running again does only the work that is missing: the
-pipeline is idempotent and can be interrupted at any point. A failure (the
-endpoint is down, the store cannot be written) leaves the note saved and its
-remaining layers pending; the error is kept in local state for `brain
-doctor`. A model that answers but never validly does not fail the note: the
-layer takes its safe result (see `Calls`).
+of its prompts, so running again does only the work that is missing and the
+pipeline can be interrupted at any point. The last file, `pages`, is written
+once the note's pages and wiki files are up to date; a note is pending until
+it has that file.
+
+Notes are processed in date order, and a note is never processed while an
+earlier one is pending: what a note answers, replaces, or corrects depends on
+the notes before it. So a failure (the endpoint is down, the store cannot be
+written) stops the run at that note. The note stays saved, the error is kept
+in local state, and the note is tried again later, with a longer wait after
+each failure. `Pipeline.skip` leaves a note out for good.
+
+A model that answers but never validly does not fail the note: the layer
+takes its safe result (see `Calls`).
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from brain.core import keys
@@ -22,26 +30,27 @@ from brain.core.formats.records import (
     LAYER_MODELS,
     ClassifyFile,
     EmbeddingFile,
+    Event,
     FilingFile,
     LayerFile,
     LinksFile,
     NamesFile,
+    PagesFile,
     SplitFile,
     StateFile,
     bytes_hash,
 )
-from brain.core.formats.yamlio import FormatError
 from brain.core.index import queries
-from brain.core.llm.models import LLMError
 from brain.core.localstate import LocalState
 from brain.core.pipeline import embed as embed_step
 from brain.core.pipeline import filing, layers, pages, state, wiki
 from brain.core.pipeline import link as link_layer
 from brain.core.pipeline.context import Calls, PipelineContext, stamps
-from brain.core.storage.base import StorageError
-from brain.core.temporal import local_date
+from brain.core.temporal import local_date, utc_iso
 
 FAILURES = "pipeline-failures.json"
+RETRY_FIRST = 60  # seconds before a failed note is tried again; doubles with each failure
+RETRY_MAX = 1800
 Progress = Callable[[str], None]
 
 
@@ -56,11 +65,26 @@ class NoteResult:
 
 @dataclass
 class ProcessReport:
-    notes: list[NoteResult] = field(default_factory=list)
+    notes: list[NoteResult] = field(default_factory=list)  # notes tried, in date order; only the last can have failed
+    waiting: int = 0  # notes still pending when the run stopped
+    held: str | None = None  # a note that failed earlier and is not due to be tried again yet
 
     @property
     def failed(self) -> list[NoteResult]:
         return [n for n in self.notes if n.error]
+
+    def result(self, note_id: str) -> NoteResult:
+        """What happened to one note. If the run stopped before reaching it, the error says what it waits for."""
+        for n in self.notes:
+            if n.note_id == note_id:
+                return n
+        if self.failed:
+            why = f"it waits for an earlier note that failed ({self.failed[-1].note_id}: {self.failed[-1].error})"
+        elif self.held:
+            why = f"it waits for an earlier note that failed and will be tried again ({self.held})"
+        else:
+            return NoteResult(note_id)
+        return NoteResult(note_id, error=f"saved, not processed yet: {why}")
 
 
 class Pipeline:
@@ -75,8 +99,21 @@ class Pipeline:
                 return
             failures.pop(note_id)
         else:
-            failures[note_id] = {"step": step, "error": error, "at": datetime.now(UTC).isoformat()}
+            attempts = int(failures.get(note_id, {}).get("attempts", 0)) + 1
+            at = datetime.now(UTC)
+            wait = min(RETRY_FIRST * 2 ** (attempts - 1), RETRY_MAX)
+            failures[note_id] = {
+                "step": step,
+                "error": error,
+                "at": at.isoformat(),
+                "attempts": attempts,
+                "next_try": (at + timedelta(seconds=wait)).isoformat(),
+            }
         self.local.write_json(FAILURES, failures)
+
+    def _not_due(self, note_id: str) -> bool:
+        next_try = self.local.read_json(FAILURES).get(note_id, {}).get("next_try")
+        return bool(next_try) and datetime.fromisoformat(next_try) > datetime.now(UTC)
 
     def _layer(
         self,
@@ -175,7 +212,7 @@ class Pipeline:
             step = "state"
             say("checking what this changes")
             linked = [ln.entity for ln in links.links]
-            st, _ = self._layer(
+            st, st_b = self._layer(
                 result, note, "state", bytes_hash(split_b, classify_b, links_b, filed_b), state.PROMPTS,
                 lambda c: {
                     "relations": state.relate(ctx, c, note, now),
@@ -186,16 +223,58 @@ class Pipeline:
             assert isinstance(st, StateFile)
 
             step = "pages"
-            touched = self.touched(note_id, links, filed, st)
             say("updating pages")
-            result.pages, calls = self.update_pages(touched, now)
-            result.calls += calls
-        except (LLMError, StorageError, FormatError) as e:
+
+            def write_pages(c: Calls) -> dict[str, Any]:
+                touched = self.touched(note_id, links, filed, st)
+                changed = [eid for eid in sorted(touched) if pages.update(ctx, c, eid, now)]
+                wiki.write(ctx, touched, now)
+                late = ctx.conn.execute(
+                    "SELECT COUNT(*) FROM notes WHERE done = 1 AND created_at > ? AND id != ?",
+                    (utc_iso(note.created), note_id),
+                ).fetchone()[0]
+                if late:
+                    c.log(
+                        "out_of_order",
+                        f"This note is dated before {late} note(s) that were already processed. What those notes "
+                        "answer, replace, or correct was worked out without it. `brain rebuild` applies every "
+                        "note in date order.",
+                    )
+                return {"pages": changed}
+
+            written, _ = self._layer(
+                result, note, "pages", bytes_hash(split_b, classify_b, links_b, filed_b, st_b), (), write_pages,
+                force=force,
+            )  # fmt: skip
+            assert isinstance(written, PagesFile)
+            result.pages = written.pages
+        except Exception as e:  # noqa: BLE001 - any failure is this note's; it is recorded and tried again
             result.error = f"{step}: {e}"
             self._note_failure(note_id, step, str(e))
             return result
         self._note_failure(note_id, step, None)
         return result
+
+    def skip(self, note_id: str) -> None:
+        """Leave a note out of the wiki, so the notes after it are not held up.
+
+        It is recorded as processed with no statements. `brain rebuild` tries it again.
+        """
+        ctx = self.ctx
+        note, _ = ctx.vault.get_note(note_id, queries.note_key(ctx.conn, note_id))
+        failure = self.local.read_json(FAILURES).get(note_id)
+        why = f" It was failing at {failure['step']}: {failure['error']}" if failure else ""
+        said = Event(kind="skipped", text=f"This note was left out of the wiki.{why} `brain rebuild` tries it again.")
+        for name in keys.LAYERS:
+            first = name == keys.LAYERS[0]
+            record = LAYER_MODELS[name](
+                note_id=note.id,
+                input_hash=note.content_hash if first else "skipped",
+                created_at=ctx.clock(),
+                events=[said] if first else [],
+            )
+            ctx.write(keys.layer_key(note.id, name), record)
+        self._note_failure(note_id, "", None)
 
     def touched(self, note_id: str, links: LinksFile, filed: FilingFile, st: StateFile) -> set[str]:
         """Surviving entities whose pages this note can have changed."""
@@ -219,17 +298,33 @@ class Pipeline:
         # Include the entities themselves (a merged one loses its wiki file) and what they merged into.
         return {i for i in ids if i} | {r for i in ids if (r := world.root(i))}
 
-    def update_pages(self, entity_ids: set[str], now: datetime) -> tuple[list[str], int]:
-        calls = Calls(self.ctx.llm)
-        changed = [eid for eid in sorted(entity_ids) if pages.update(self.ctx, calls, eid, now)]
-        wiki.write(self.ctx, entity_ids, now)
-        return changed, calls.count
+    def process_pending(
+        self,
+        progress: Callable[[str, str], None] | None = None,
+        *,
+        through: str | None = None,
+        wait_for_retry: bool = False,
+    ) -> ProcessReport:
+        """Process pending notes in date order, stopping at the first that fails.
 
-    def process_pending(self, progress: Callable[[str, str], None] | None = None) -> ProcessReport:
+        `through`: stop after this note. `wait_for_retry`: do not try a note
+        that failed recently until its wait is over (the background worker).
+        """
         report = ProcessReport()
-        for note_id in queries.pending_notes(self.ctx.conn):
+        pending = queries.pending_notes(self.ctx.conn)
+        todo = pending
+        if through is not None:
+            todo = pending[: pending.index(through) + 1] if through in pending else []
+        for note_id in todo:
+            if wait_for_retry and self._not_due(note_id):
+                report.held = note_id
+                break
             say = (lambda msg, n=note_id: progress(n, msg)) if progress else None
-            report.notes.append(self.run_note(note_id, progress=say))
+            result = self.run_note(note_id, progress=say)
+            report.notes.append(result)
+            if result.error:
+                break
+        report.waiting = len(pending) - sum(1 for n in report.notes if not n.error)
         return report
 
 

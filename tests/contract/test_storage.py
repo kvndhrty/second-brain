@@ -8,25 +8,16 @@ from brain.core.storage.base import NotFound, PreconditionFailed
 from brain.core.storage.probe import probe_conditional_writes
 
 
-def test_put_get_roundtrip(storage):
+def test_put_get_exists_delete(storage):
     info = storage.put("notes/2026/10/30/a.md", b"hello")
-    assert info.key == "notes/2026/10/30/a.md"
-    assert info.size == 5
-    assert info.etag
+    assert info.key == "notes/2026/10/30/a.md" and info.size == 5 and info.etag
     assert storage.get("notes/2026/10/30/a.md") == b"hello"
-
-
-def test_get_missing_raises_not_found(storage):
+    assert storage.exists("notes/2026/10/30/a.md")
+    storage.delete("notes/2026/10/30/a.md")
+    assert not storage.exists("notes/2026/10/30/a.md")
+    storage.delete("notes/2026/10/30/a.md")  # deleting twice is not an error
     with pytest.raises(NotFound):
-        storage.get("nope/missing.md")
-
-
-def test_exists_and_delete(storage):
-    storage.put("people/jane.md", b"x")
-    assert storage.exists("people/jane.md")
-    storage.delete("people/jane.md")
-    assert not storage.exists("people/jane.md")
-    storage.delete("people/jane.md")  # deleting twice is not an error
+        storage.get("notes/2026/10/30/a.md")
 
 
 def test_list_prefix_and_metadata(storage):
@@ -74,7 +65,7 @@ def test_probe_reports_enforced(storage):
     assert list(storage.list("_system/probe/")) == []
 
 
-@pytest.mark.parametrize("bad", ["", "/abs", "a/../b", "a//b", "a\\b", ".hidden", "x/.tmp"])
-def test_rejects_invalid_keys(storage, bad):
-    with pytest.raises(ValueError):
-        storage.put(bad, b"x")
+def test_rejects_invalid_keys(storage):
+    for bad in ("", "/abs", "a/../b", "a//b", "a\\b", ".hidden", "x/.tmp"):
+        with pytest.raises(ValueError):
+            storage.put(bad, b"x")

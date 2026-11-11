@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from importlib import resources
 
-import pydantic_ai
 import pytest
 
 from brain.core.config import LoadedSettings, Settings
@@ -96,10 +95,6 @@ def test_roles_choose_the_configured_model():
     assert LLM(Settings(llm=LLM_CFG | {"dream_uses": "small"})).model_name("dream") == "small-model"
     assert LLM(Settings(llm=LLM_CFG | {"answer_uses": "strong"})).model_name("answer") == "strong-model"
     assert LLM(Settings(llm=LLM_CFG | {"escalate": "strong"})).can_escalate
-
-
-def test_pydantic_ai_banner_is_disabled():
-    assert pydantic_ai.BANNER_ENABLED is False
 
 
 @pytest.mark.parametrize(

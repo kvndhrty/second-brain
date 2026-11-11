@@ -63,6 +63,15 @@ class Storage(Protocol):
     def exists(self, key: str) -> bool: ...
 
 
+def valid_key(key: str) -> bool:
+    """False for names a listing must leave out: ones `get` would refuse, such as files under a dot directory."""
+    try:
+        check_key(key)
+    except ValueError:
+        return False
+    return True
+
+
 def check_key(key: str) -> str:
     if not key or key.startswith("/") or "\\" in key:
         raise ValueError(f"invalid storage key: {key!r}")

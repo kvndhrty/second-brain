@@ -14,7 +14,6 @@ from mcp.client.stdio import StdioServerParameters
 from brain.core import keys
 from brain.core.llm.models import LLMError
 from brain.core.shared import SharedBrain
-from brain.core.storage.lease import Lease
 from brain.mcp.server import build_server
 
 pytestmark = pytest.mark.anyio
@@ -86,18 +85,6 @@ async def test_jot_then_read_it_back(server, brain):
         assert person["name"] == "Priya Raman" and person["related"][0]["id"] == "gpu-quota-migration"
 
 
-async def test_a_correction_is_a_note(server, brain):
-    async with Client(server) as c:
-        await call(c, "jot", text=NOTE)
-        await call(c, "jot", text=FOLLOW_UP)
-        fixed, err = await call(c, "jot", text="This is finished.", about="GPU quota migration")
-        assert err is None and any("closed" in line for line in fixed["changes"])
-        page, _ = await call(c, "get_page", name_or_id="gpu-quota-migration")
-        assert page["status"] == "closed" and page["open"] == []
-        _, err = await call(c, "jot", text="x", about="no such page")
-        assert "no page for" in err
-
-
 async def test_brief_marks_seen_only_when_asked(server, brain):
     async with Client(server) as c:
         await call(c, "jot", text=NOTE)
@@ -117,6 +104,8 @@ async def test_errors_carry_useful_messages(server, brain, monkeypatch):
         assert "no page for" in err
         _, err = await call(c, "get_note", note_id="n-19990101T000000Z")
         assert "no note" in err
+        _, err = await call(c, "jot", text="x", about="no such page")
+        assert "no page for" in err
 
         def down(*a, **k):
             raise LLMError("ask: HTTP 503 from fake-small: overloaded")
@@ -127,12 +116,13 @@ async def test_errors_carry_useful_messages(server, brain, monkeypatch):
         assert "HTTP 503" in err
 
 
-async def test_jot_reports_lease_held_elsewhere(server, brain, local_storage):
-    local_storage.supports_conditional_writes = True
-    Lease(local_storage, machine_id="laptop", ttl_seconds=900, command="brain start").acquire()
-    async with Client(server) as c:
-        _, err = await call(c, "jot", text="hello")
-        assert "Another machine holds the write lease" in err
+async def test_jot_while_another_process_is_processing_returns_the_saved_note(server, brain):
+    with brain.state.try_lock("process") as got:  # what `brain start` holds while it works
+        assert got
+        async with Client(server) as c:
+            added, err = await call(c, "jot", text=NOTE)
+    assert err is None and added["note_id"] and not added["processed"]
+    assert brain.status()["notes"] == 1
 
 
 async def test_stdio_subprocess(tmp_path: Path):

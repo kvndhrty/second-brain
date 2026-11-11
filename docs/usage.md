@@ -16,11 +16,20 @@ Other ways to write:
 
 - the box at the top of the web UI (`brain start`, then http://127.0.0.1:8765);
 - the `jot` tool, from an agent session (see [Agents](#agents));
-- any editor: save a markdown file anywhere under `notes/` in the store.
-  `brain start` picks it up within a minute, and `brain process` at once.
+- any editor: save a markdown file anywhere under `notes/` in the store. It
+  becomes a note once it has not changed for 30 seconds; `brain start` looks
+  every minute, and `brain process` when you run it.
 
 A note is saved before any model is called. If the model endpoint is down,
 the note is kept and processed later.
+
+Notes are processed in the order they were written, because a note can
+answer or replace what an earlier one said. If a note fails, the notes after
+it wait and it is tried again: by `brain start` after a minute, then at
+longer intervals, and by `brain process` at once. `brain show NOTE_ID` and
+`brain doctor` show the error. If a note can never be processed,
+`brain process --skip NOTE_ID` leaves it out of the wiki so the rest can go
+on; the note itself is kept.
 
 Use names the way you normally would. "Priya", "Priya Raman", and "P. Raman"
 are worked out to be one person when the notes make that clear; when they do
@@ -194,7 +203,8 @@ brain rebuild
 ```
 
 This discards the wiki and everything under `generated/`, then runs every
-note through the model again in date order, corrections included. Pages keep
+note through the model again in date order, corrections included. If a note
+fails, the rebuild stops there and `brain process` continues it. Pages keep
 their ids and paths. Your notes are not touched. It costs as many model calls
 as processing every note once.
 

@@ -119,6 +119,14 @@ def _pair_key(a: str, b: str) -> str:
     return "|".join(sorted((a, b)))
 
 
+def _kept_apart(world: World, a: str, b: str) -> bool:
+    """True if a note said any page merged into `a` is not the same as any page merged into `b`."""
+    in_a, in_b = set(world.members(a)), set(world.members(b))
+    return any(other in in_b for m in in_a for other in world.entities[m].record.not_same_as) or any(
+        other in in_a for m in in_b for other in world.entities[m].record.not_same_as
+    )
+
+
 class Dreamer:
     def __init__(self, ctx: PipelineContext, cfg: DreamConfig) -> None:
         self.ctx = ctx
@@ -160,7 +168,7 @@ class Dreamer:
                     if other.id == e.id or key in seen:
                         continue
                     seen.add(key)
-                    if other.id in e.record.not_same_as or e.id in other.record.not_same_as:
+                    if _kept_apart(world, e.id, other.id):
                         continue
                     if self.state.checked_pairs.get(key) == self._pair_sig(world, e.id, other.id):
                         continue
@@ -227,6 +235,8 @@ class Dreamer:
             a, b = world.get(a_id), world.get(b_id)
             if a is None or b is None or a.id == b.id:
                 continue  # one of them was merged earlier in this pass
+            if _kept_apart(world, a.id, b.id):
+                continue  # a note said two of the pages now merged into these are different
             key = _pair_key(a_id, b_id)
             user = "\n".join([today_el(now), self._record_el(world, a, today), self._record_el(world, b, today)])
             same = calls.ask("dream_same", user, SameOut, fallback=SameOut(same=False)).same
@@ -238,12 +248,7 @@ class Dreamer:
                 (a, b), key=lambda e: (-world.note_count(e.id), e.status == "provisional", e.created_at, e.id)
             )
             k, g = self._get(keep.id), self._get(gone.id)
-            g.merged_into = k.id
-            g.set_by["merged_into"] = "dream"
-            for n in g.all_names():
-                k.add_name(n)
-            if k.status == "provisional":
-                k.status = "active"
+            g.merge_into(k, "dream")
             self.ctx.vault.put_entity(g)
             self.ctx.vault.put_entity(k)
             calls.log("merged", f"{g.name} and {k.name} are the same {k.type}; merged", k.id)

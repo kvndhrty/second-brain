@@ -39,8 +39,11 @@ def run_processing(out: Console, run: Callable[[Callable[[str], None]], ProcessR
 def print_report(out: Console, report: ProcessReport) -> None:
     for n in report.notes:
         if n.error:
+            out.print(f"[red]✗[/red] {n.note_id}: {escape(n.error)}")
+            later = f"{report.waiting - 1} later note(s) wait for it. " if report.waiting > 1 else ""
             out.print(
-                f"[red]✗[/red] {n.note_id}: {escape(n.error)}  [dim](still pending; retry with `brain process`)[/dim]"
+                f"  [dim]It is saved. {later}Retry with `brain process`, or leave it out of the wiki with "
+                f"`brain process --skip {n.note_id}`.[/dim]"
             )
         elif n.layers:
             pages = f"; updated {len(n.pages)} page(s)" if n.pages else ""

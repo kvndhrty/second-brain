@@ -70,8 +70,10 @@ class LogEvent:
 class World:
     """A consistent reading of the index. Build one per operation; it caches what it loads."""
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, *, skip_note: str | None = None) -> None:
+        """`skip_note`: leave out what this note's state layer recorded, for when that layer runs again."""
         self.conn = conn
+        self.skip = keys.note_unit(skip_note) if skip_note else ""
         self.entities: dict[str, Ent] = {
             r["id"]: Ent(*r)
             for r in conn.execute("SELECT id, type, name, status, merged_into, created_at, data FROM entities")
@@ -154,7 +156,9 @@ class World:
         self.retracted: dict[str, str] = {}  # statement -> the correction statement that retracted it
         self.moves: dict[str, str] = {}
         ops = c.execute(
-            "SELECT statement_id, op, targets, moved FROM operations ORDER BY created_at DESC, id DESC"
+            "SELECT statement_id, op, targets, moved FROM operations WHERE owner != ? "
+            "ORDER BY created_at DESC, note_id DESC, id DESC",
+            (self.skip,),
         ).fetchall()
         for sid, op, targets, _ in ops:  # newest first: a retraction that was itself retracted does nothing
             if op == "retract" and sid not in self.retracted:
@@ -166,7 +170,9 @@ class World:
                 for m in json.loads(moved):
                     self.moves[m] = t[0]
         self.by_rel: dict[str, dict[str, str]] = {"supersedes": {}, "answers": {}, "repeats": {}}
-        for src, dst, rel in c.execute("SELECT src, dst, rel FROM relations ORDER BY src"):
+        for src, dst, rel in c.execute(
+            "SELECT src, dst, rel FROM relations WHERE owner != ? ORDER BY src", (self.skip,)
+        ):
             if src in self.retracted:
                 continue
             if rel == "repeats":

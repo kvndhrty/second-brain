@@ -205,9 +205,16 @@ def write(brain: Brain, text: str, day: float = 0, *, about: str | None = None, 
     set_now(brain, day, brain._seq)  # type: ignore[attr-defined]
     note = brain.jot(text, about=about).note
     if process:
-        result = brain.process(note.id).notes[0]
+        result = brain.process(note.id).result(note.id)
         assert result.error is None, result.error
     return note.id
+
+
+def drop_file(storage: LocalStorage, key: str, data: bytes, *, age: float = 120) -> None:
+    """Put a file into the store as if it was saved by hand `age` seconds ago (past the settle window)."""
+    storage.put(key, data)
+    then = time.time() - age
+    os.utime(storage.root / key, (then, then))
 
 
 def statements(brain: Brain, note_id: str | None = None) -> list:

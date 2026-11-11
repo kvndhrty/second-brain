@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from datetime import datetime
 
 from brain.core.formats.note import Note
-from brain.core.formats.records import Statement, norm_name
+from brain.core.formats.records import Statement, contains_name
 from brain.core.index import queries, search
 from brain.core.index.queries import World
 from brain.core.llm.schemas import FileOut
@@ -27,7 +27,6 @@ NEAREST = 20
 
 
 def _candidates(ctx: PipelineContext, world: World, note: Note, s: Statement, chosen: list[str]) -> list[str]:
-    body = norm_name(note.body)
     ranked: list[str] = []
 
     def add(thread_id: str | None) -> None:
@@ -38,7 +37,7 @@ def _candidates(ctx: PipelineContext, world: World, note: Note, s: Statement, ch
     if about is not None and about.type == "thread":
         add(about.id)  # the note was written on this thread's page
     for t in world.roots("thread"):
-        if any(len(n) > 3 and norm_name(n) in body for n in world.names_of(t.id)):
+        if any(len(n) > 3 and contains_name(n, note.body) for n in world.names_of(t.id)):
             add(t.id)
     for t in chosen:
         add(world.root(t))

@@ -74,7 +74,7 @@ export function NoteBox({
         value={text}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && text.trim()) void submit();
+          if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && text.trim() && !busy) void submit();
         }}
         rows={about ? 3 : 5}
       />

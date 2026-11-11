@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import sys
 from array import array
 from datetime import datetime
@@ -29,7 +30,7 @@ NameType = Literal["person", "org", "topic"]
 Status = Literal["provisional", "active", "closed"]
 Rel = Literal["answers", "supersedes", "repeats"]
 Op = Literal["same_as", "not_same_as", "rename", "close", "reopen", "retract", "not_part_of"]
-LayerName = Literal["split", "classify", "names", "links", "filing", "state"]
+LayerName = Literal["split", "classify", "names", "links", "filing", "state", "pages"]
 
 
 def bytes_hash(*parts: bytes | str) -> str:
@@ -148,6 +149,12 @@ class StateFile(LayerFile):
     operations: list[Operation] = Field(default_factory=list)
 
 
+class PagesFile(LayerFile):
+    """Written once the note's pages and wiki files are up to date; until then the note is still pending."""
+
+    pages: list[str] = Field(default_factory=list)  # entities whose page file changed
+
+
 LAYER_MODELS: dict[str, type[LayerFile]] = {
     "split": SplitFile,
     "classify": ClassifyFile,
@@ -155,6 +162,7 @@ LAYER_MODELS: dict[str, type[LayerFile]] = {
     "links": LinksFile,
     "filing": FilingFile,
     "state": StateFile,
+    "pages": PagesFile,
 }
 
 
@@ -171,6 +179,7 @@ class EntityRecord(Record):
     status: Status = "provisional"
     merged_into: Id | None = None
     not_same_as: list[Id] = Field(default_factory=list)
+    gave_names: list[str] = Field(default_factory=list)  # names the entity it merged into did not have before
     created_at: datetime
     created_from: str | None = None  # note id
     first_name: str | None = None  # the name it was created with, once a note has renamed it
@@ -188,6 +197,25 @@ class EntityRecord(Record):
             return False
         self.names.append(name)
         return True
+
+    def merge_into(self, keep: EntityRecord, origin: str) -> None:
+        """Make `keep` the surviving record of the two. `origin` is "note:<id>" or "dream"."""
+        self.merged_into = keep.id
+        self.set_by["merged_into"] = origin
+        self.gave_names = [n for n in self.all_names() if keep.add_name(n)]
+        keep.not_same_as = [x for x in keep.not_same_as if x != self.id]
+        self.not_same_as = [x for x in self.not_same_as if x != keep.id]
+        if keep.status == "provisional":
+            keep.status = "active"
+
+    def split_from(self, keep: EntityRecord | None, origin: str) -> None:
+        """Undo a merge. The survivor loses only the names it took at the merge."""
+        if keep is not None:
+            gave = {norm_name(n) for n in self.gave_names}
+            keep.names = [n for n in keep.names if norm_name(n) not in gave]
+        self.merged_into = None
+        self.gave_names = []
+        self.set_by["merged_into"] = origin
 
     def note_set(self, field: str) -> bool:
         return self.set_by.get(field, "").startswith("note:")
@@ -208,6 +236,12 @@ class EntityRecord(Record):
 
 def norm_name(name: str) -> str:
     return " ".join(name.casefold().split())
+
+
+def contains_name(name: str, text: str) -> bool:
+    """True if the name appears in the text as whole words: "Ann" is in "Ann's plan", not in "planning"."""
+    n = norm_name(name)
+    return bool(n) and re.search(rf"(?<!\w){re.escape(n)}(?!\w)", norm_name(text)) is not None
 
 
 class Sentence(_Strict):

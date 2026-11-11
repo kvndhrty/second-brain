@@ -6,7 +6,7 @@ from datetime import date, datetime
 
 from brain.core import keys
 from brain.core.formats.note import Note
-from brain.core.formats.records import Kind, NameRef, Statement, norm_name
+from brain.core.formats.records import Kind, NameRef, Statement, contains_name, norm_name
 from brain.core.llm.schemas import KindOut, NamesOut, SplitItem, SplitOut
 from brain.core.pipeline.context import Calls
 from brain.core.pipeline.text import locate_quote, note_el, sentences
@@ -33,13 +33,21 @@ def split(calls: Calls, note: Note, today: date) -> list[Statement]:
     fallback = SplitOut(statements=[SplitItem(text=s, quote=s) for s in sentences(body)[:MAX_STATEMENTS]])
     out = calls.ask("split", note_el(note, today), SplitOut, fallback=fallback, validate=validate)
     seen: set[str] = set()
+    ids: set[str] = set()
     result = []
     for item in out.statements:
         text = " ".join(item.text.split())
         if not text or norm_name(text) in seen:
             continue
         seen.add(norm_name(text))
-        result.append(Statement(id=keys.statement_id(note.id, len(result) + 1), text=text, quote=item.quote.strip()))
+        quote = item.quote.strip()
+        # The quote is copied from the note, so it is the same on a second run; two statements
+        # taken from one sentence are told apart by their text.
+        sid = keys.statement_id(note.id, quote or text)
+        if sid in ids:
+            sid = keys.statement_id(note.id, f"{quote}\n{text}")
+        ids.add(sid)
+        result.append(Statement(id=sid, text=text, quote=quote))
     return result
 
 
@@ -53,10 +61,8 @@ def classify(calls: Calls, note: Note, statements: list[Statement], now: datetim
 
 
 def names(calls: Calls, note: Note, today: date) -> list[NameRef]:
-    body = norm_name(note.body)
-
     def validate(out: NamesOut) -> None:
-        bad = [n.name for n in out.names if norm_name(n.name) not in body]
+        bad = [n.name for n in out.names if not contains_name(n.name, note.body)]
         if bad:
             raise ValueError("return names exactly as written in the note; not in the note: " + ", ".join(bad))
 

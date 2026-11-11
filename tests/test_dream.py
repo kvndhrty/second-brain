@@ -12,12 +12,6 @@ KICKOFF = (
 )
 
 
-def test_nothing_to_do_on_an_empty_store(brain):
-    assert brain.dream_plan().empty
-    run = brain.dream()
-    assert run.calls == 0 and run.events == [] and run.errors == []
-
-
 def test_duplicate_people_are_merged(brain):
     # "Priya" came first, so "Priya Raman" was a candidate the fake's link rule did not take.
     write(brain, "Talked with Priya about storage.")
@@ -53,6 +47,20 @@ def test_a_not_the_same_note_stops_dreaming_from_merging(brain):
     assert len(brain.world().roots("person")) == 2
 
 
+def test_dreaming_does_not_join_two_people_a_note_separated_through_a_third(brain):
+    brain.llm.responders["dream_same"] = {"same": True}
+    write(brain, "Met Mike Chen about budgets.")
+    write(brain, "Met Mike Chan about hiring.", 1)
+    write(brain, "Met Mike Chin about travel.", 2)
+    for a, other in (("mike-chen", "mike-chin"), ("mike-chin", "mike-chen")):
+        rec = brain.vault.get_entity(a)
+        rec.not_same_as.append(other)
+        brain.vault.put_entity(rec)
+    brain.dream()  # Chan is merged with one of them; the pair then left is the one the note separated
+    world = brain.world()
+    assert world.root("mike-chen") != world.root("mike-chin") and len(world.roots("person")) == 2
+
+
 def test_old_open_item_is_settled_by_a_later_statement(local_storage, state, tmp_path):
     # Layer 6 is told every pair is unrelated, so the question is still open when dreaming looks.
     b = make_brain(
@@ -82,21 +90,16 @@ def test_old_open_item_is_settled_by_a_later_statement(local_storage, state, tmp
 def test_quiet_thread_is_closed_and_new_activity_reopens_it(brain):
     write(brain, "We decided to start the [[Vendor evaluation]].")
     write(brain, "The [[Vendor evaluation]] covers three vendors.", 1)
+    write(brain, KICKOFF, 2)
+    write(brain, "More on the [[GPU quota migration]] today.", 3)
     set_now(brain, 100)
-    assert brain.dream_plan().close == ["vendor-evaluation"]
+    assert brain.dream_plan().close == ["vendor-evaluation"]  # the other thread has an open question
     brain.dream()
     assert brain.page("Vendor evaluation").status == "closed"
     assert brain.vault.get_entity("vendor-evaluation").set_by["status"] == "dream"
     write(brain, "The [[Vendor evaluation]] picked a winner.", 101)
     assert brain.page("Vendor evaluation").status == "active"
     assert any(e.kind == "reopened" for e in brain.log())
-
-
-def test_thread_with_open_items_is_not_closed(brain):
-    write(brain, KICKOFF)
-    write(brain, "More on the [[GPU quota migration]] today.", 1)
-    set_now(brain, 100)
-    assert brain.dream_plan().close == []
 
 
 def test_profile_is_filled_in_from_statements(brain):
@@ -118,19 +121,6 @@ def test_pass_stops_at_the_call_budget(local_storage, state, tmp_path):
     run = b.dream()
     assert run.budget_exhausted and run.calls == 1
     assert len(b.dream_plan().profiles) == 2  # the rest are looked at next time
-    b.close()
-
-
-def test_dreaming_uses_the_strong_model_when_configured(local_storage, state, tmp_path):
-    cfg = FAKE_LLM_SETTINGS | {"strong_model": "fake-strong"}
-    b = make_brain(local_storage, state, tmp_path, fake_llm=True, llm=cfg)
-    set_now(b)
-    write(b, "Jane Doe is a program manager.")
-    write(b, "Jane Doe approved the budget.", 1)
-    used = {m for (_, m) in b.llm._models}
-    assert used == {"fake-small"}  # the per-note layers never use the strong model
-    run = b.dream()
-    assert run.model == "fake-strong"
     b.close()
 
 

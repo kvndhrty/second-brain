@@ -10,7 +10,8 @@ from __future__ import annotations
 import socket
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import TypeVar
 
 from brain.core import keys
@@ -19,7 +20,7 @@ from brain.core.formats.records import EntityRecord, Generation, Record, StoreFo
 from brain.core.formats.yamlio import FORMAT_VERSION, FormatError, check_format
 from brain.core.index.sync import read_generation
 from brain.core.localstate import LocalState
-from brain.core.storage.base import NotFound, ObjectInfo, PreconditionFailed, Storage
+from brain.core.storage.base import NotFound, ObjectInfo, PreconditionFailed, Storage, StorageError
 from brain.core.storage.lease import Lease
 
 # (key, info, data or None for a delete, previous generation token, new token)
@@ -27,6 +28,16 @@ WriteHook = Callable[[str, ObjectInfo, bytes | None, str | None, str], None]
 
 
 R = TypeVar("R", bound=Record)
+
+# A file put into notes/ by hand is taken once it has not changed for this long, so a file an
+# editor is still saving is not taken half-written.
+SETTLE = timedelta(seconds=30)
+
+
+@dataclass
+class Adopted:
+    notes: list[Note] = field(default_factory=list)  # bare files that were turned into notes
+    in_place: list[str] = field(default_factory=list)  # keys of complete notes at paths of the user's choosing
 
 
 class Vault:
@@ -138,40 +149,56 @@ class Vault:
             note = Note(id=note_id, created=now, title=title or None, about=about or None, body=body)
             key = keys.note_key(now, note_id, keys.slugify(title or body))
             data = note.to_text().encode()
-            info, prev, new = self._write_locked(key, data, if_absent=True)
+            self._before_write()
+            self._ensure_format_marker()
+            info = self.storage.put(key, data, if_absent=bool(self.storage.supports_conditional_writes))
+            # The note is in the store. Nothing after this may report the save as failed: the
+            # caller would save the text again. A missed generation bump or index update is
+            # repaired by the next full listing.
+            try:
+                prev, new = self._bump_generation()
+            except StorageError:
+                return note, key
         if self.on_write:
-            self.on_write(key, info, data, prev, new)
+            try:
+                self.on_write(key, info, data, prev, new)
+            except Exception:  # noqa: BLE001 - the index is rebuilt from the store
+                pass
         return note, key
 
-    def adopt_bare_notes(self) -> list[Note]:
+    def adopt_bare_notes(self, *, now: datetime | None = None) -> Adopted:
         """Turn markdown files saved into notes/ by hand into notes.
 
         A file without frontmatter gets an id and a creation time (its
-        modification time); its text is kept exactly. The bare file is removed
-        once the note is written.
+        modification time). The bare file is removed once the note is written.
+        A file that changed in the last `SETTLE` seconds is left for the next
+        pass, and so is one that cannot be read as text.
         """
-        adopted = []
+        out = Adopted()
+        newest = (now or datetime.now(UTC)) - SETTLE
         for o in list(self.storage.list(keys.NOTES)):
             if not keys.is_bare_note(o.key):
                 continue  # judged by its path, so brain's own notes are not read again on every pass
+            if o.mtime > newest:
+                continue
             try:
                 text = self.storage.get(o.key).decode()
             except (NotFound, UnicodeDecodeError):
                 continue
             if not text.strip():
                 continue
-            if text.startswith("---\n"):
-                try:
-                    Note.parse(text, where=o.key)
-                    continue  # a complete note at a path of the user's choosing; indexed where it is
-                except FormatError:
-                    pass  # frontmatter from another tool: adopt it, text unchanged
+            try:
+                Note.parse(text, where=o.key)
+                out.in_place.append(o.key)  # a complete note at a path of the user's choosing
+                continue
+            except FormatError:
+                pass  # no frontmatter, or frontmatter from another tool: adopt it as part of the text
             stem = o.key.rsplit("/", 1)[-1][:-3]
             title = stem.replace("-", " ").replace("_", " ").strip() or None
             note, _ = self.save_note(text, title=title, created=o.mtime)
             self.delete(o.key)
-            adopted.append(note)
-        return adopted
+            out.notes.append(note)
+        return out
 
     def find_note_key(self, note_id: str) -> str | None:
         stem = note_id.removeprefix("n-")

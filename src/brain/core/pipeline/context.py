@@ -40,8 +40,8 @@ class PipelineContext:
     def conn(self):
         return self.db.conn
 
-    def world(self) -> World:
-        return World(self.db.conn)
+    def world(self, *, skip_note: str | None = None) -> World:
+        return World(self.db.conn, skip_note=skip_note)
 
     def read(self, key: str, model: type[R]) -> tuple[R, bytes] | None:
         return self.vault.read_record(key, model)

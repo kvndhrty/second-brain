@@ -1,7 +1,7 @@
 import type { Page, PageSummary, Statement, Status } from "../api";
 
 export const status: Status = {
-  version: "0.2.0",
+  version: "0.2.1",
   store: "/tmp/store",
   notes: 2,
   pending: 0,

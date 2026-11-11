@@ -2,11 +2,15 @@
 
 The lease belongs to a machine, not a process. `brain start` and short CLI
 commands on the same machine share it; they serialize their writes with a
-local lock (LocalState.write_lock). See docs/architecture.md, section 6.
+local lock (LocalState.write_lock). Each process that uses the lease holds a
+shared lock on a local file while it does, and the lease is deleted on exit
+only by a process that finds no other holder of that lock. See
+docs/architecture.md, section 6.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import socket
@@ -15,6 +19,8 @@ import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import IO
 
 from brain.core import keys
 from brain.core.storage.base import NotFound, PreconditionFailed, Storage
@@ -95,6 +101,7 @@ class Lease:
         settle_seconds: float = 2.0,
         pid: int | None = None,
         force: bool = False,
+        local_lock: Path | None = None,
     ) -> None:
         self.storage = storage
         self.machine_id = machine_id
@@ -107,6 +114,34 @@ class Lease:
         self.force = force  # take the lease even if another machine holds it
         self.held = False
         self._last_check: datetime | None = None
+        # A file every brain process on this machine locks (shared) while it uses this store's lease.
+        self._lock_path = local_lock
+        self._lock_file: IO[str] | None = None
+
+    def _join_local(self) -> None:
+        if self._lock_path is not None and self._lock_file is None:
+            f = open(self._lock_path, "a")  # noqa: SIM115 - held until release
+            fcntl.flock(f, fcntl.LOCK_SH)
+            self._lock_file = f
+
+    def _leave_local(self) -> bool:
+        """Stop using the lease. True if no other process on this machine is using it.
+
+        When True, the local lock is held exclusively until `_close_local`, so
+        a process starting now waits until the lease has been deleted.
+        """
+        if self._lock_file is None:
+            return False
+        try:
+            fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+    def _close_local(self) -> None:
+        if self._lock_file is not None:
+            self._lock_file.close()  # closing drops the lock
+            self._lock_file = None
 
     def _new_record(self, token: str | None = None, acquired_at: str | None = None) -> LeaseRecord:
         now = self.clock().isoformat()
@@ -127,10 +162,15 @@ class Lease:
 
     def acquire(self, *, force: bool | None = None) -> None:
         force = self.force if force is None else force
-        if self.storage.supports_conditional_writes:
-            self._acquire_conditional(force)
-        else:
-            self._acquire_fallback(force)
+        self._join_local()
+        try:
+            if self.storage.supports_conditional_writes:
+                self._acquire_conditional(force)
+            else:
+                self._acquire_fallback(force)
+        except BaseException:
+            self._close_local()
+            raise
         self.held = True
         self._last_check = self.clock()
 
@@ -226,13 +266,27 @@ class Lease:
         self._last_check = now
 
     def release(self) -> None:
-        """Delete the lease if this process is the last one recorded on it."""
+        """Delete the lease if no other process on this machine is using it.
+
+        If another one is (`brain start` while `brain jot` exits), the lease
+        stays: deleting it would let another machine write while that process
+        still believes it holds the lease.
+        """
         if not self.held:
             return
         self.held = False
-        current = read_lease(self.storage)
-        if current is None:
-            return
-        cur, _ = current
-        if cur.machine_id == self.machine_id and cur.pid == self.pid:
-            self.storage.delete(keys.LEASE)
+        try:
+            if self._lock_path is not None:
+                last = self._leave_local()
+            else:
+                last = None  # no local lock: the pid on the lease is all there is to go by
+            if last is False:
+                return
+            current = read_lease(self.storage)
+            if current is None:
+                return
+            cur, _ = current
+            if cur.machine_id == self.machine_id and (last or cur.pid == self.pid):
+                self.storage.delete(keys.LEASE)
+        finally:
+            self._close_local()

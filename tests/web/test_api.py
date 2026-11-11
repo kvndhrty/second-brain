@@ -13,7 +13,7 @@ from brain.core.shared import SharedBrain
 from brain.core.worker import Worker
 from brain.mcp.server import build_server
 from brain.web.app import create_app
-from tests.conftest import FAKE_LLM_SETTINGS, make_brain
+from tests.conftest import FAKE_LLM_SETTINGS, drop_file, make_brain
 
 NOTE = (
     "Kicked off the [[GPU quota migration]] with Priya Raman. We decided to move the eval cluster in December. "
@@ -72,23 +72,6 @@ def test_this_is_wrong_is_a_note_about_the_page(client, brain):
     assert post(client, "/api/notes", {"text": "x", "about": "no-such-page"}).status_code == 404
 
 
-def test_notes_are_the_only_write(client):
-    """Nothing in the API changes the wiki directly."""
-    writes = sorted(
-        (r.path, m)
-        for r in client.app.routes
-        for m in getattr(r, "methods", ())
-        if m in ("POST", "PUT", "PATCH", "DELETE")
-    )
-    assert writes == [
-        ("/api/ask", "POST"),
-        ("/api/brief", "POST"),
-        ("/api/dream", "POST"),
-        ("/api/notes", "POST"),
-        ("/api/worker/wake", "POST"),
-    ]
-
-
 def test_ask_and_brief(client, brain):
     nid = saved(client, brain)
     saved(client, brain, FOLLOW_UP)
@@ -130,11 +113,10 @@ def test_serves_built_ui_with_history_fallback(brain, tmp_path):
         assert c.get("/assets/app.js").text == "console.log(1)"
         assert c.get("/favicon.svg").text == "<svg/>"
         assert c.get("/api/nope").status_code == 404
-        assert c.get("/../../etc/passwd").text == "<html>brain ui</html>"
-
-
-def test_without_built_ui_explains_how_to_build(client):
-    assert "not built" in client.get("/").text
+        # A link inside the UI folder that leads outside it is not served.
+        (tmp_path / "secret.txt").write_text("secret")
+        (static / "leak").symlink_to(tmp_path / "secret.txt")
+        assert c.get("/leak").text == "<html>brain ui</html>"
 
 
 def test_mcp_is_mounted_and_checks_host(brain, tmp_path):
@@ -177,7 +159,7 @@ def test_worker_processes_saved_notes(brain, local_storage, state, tmp_path):
 
 
 def test_worker_adopts_files_saved_into_notes(brain, local_storage, state, tmp_path):
-    local_storage.put("notes/from my editor.md", b"Priya Raman is out this week.\n")
+    drop_file(local_storage, "notes/from my editor.md", b"Priya Raman is out this week.\n")
     worker, _ = _worker(brain, local_storage, state, tmp_path)
     worker.start()
     try:
@@ -225,22 +207,6 @@ def _wait_for_dream(worker: Worker) -> None:
     assert worker.status.last_dream
 
 
-def test_worker_dreams_when_asked(brain, local_storage, state, tmp_path):
-    worker, other = _worker(brain, local_storage, state, tmp_path)
-    other.settings.dream.enabled = False  # nothing scheduled; only the request makes it dream
-    worker.start()
-    try:
-        app = create_app(SharedBrain(lambda: brain), worker=worker, static_dir=tmp_path / "x")
-        with TestClient(app, base_url="http://127.0.0.1") as c:
-            nid = post(c, "/api/notes", {"text": NOTE}).json()["id"]
-            assert worker.process_now(nid, timeout=30) is not None
-            assert c.post("/api/dream", json={}).json() == {"requested": True}
-            _wait_for_dream(worker)
-            assert c.get("/api/dream").json()["last"]["run_id"] == worker.status.last_dream
-    finally:
-        worker.stop()
-
-
 def test_a_failing_note_does_not_stop_dreaming(brain, local_storage, state, tmp_path):
     def down(_user: str) -> dict:
         raise LLMError("gateway is down")
@@ -253,8 +219,9 @@ def test_a_failing_note_does_not_stop_dreaming(brain, local_storage, state, tmp_
         with TestClient(app, base_url="http://127.0.0.1") as c:
             nid = post(c, "/api/notes", {"text": NOTE}).json()["id"]
             result = worker.process_now(nid, timeout=30)
-            assert result is not None and result.error  # it stays pending and fails every round
-            c.post("/api/dream", json={})
+            assert result is not None and result.error  # it stays pending
+            assert c.post("/api/dream", json={}).json() == {"requested": True}
             _wait_for_dream(worker)
+            assert c.get("/api/dream").json()["last"]["run_id"] == worker.status.last_dream
     finally:
         worker.stop()

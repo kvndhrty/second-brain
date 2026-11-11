@@ -95,7 +95,7 @@ wiki/people/jane-doe.md
 wiki/orgs/platform-team.md
 wiki/topics/retrieval-eval.md
 generated/notes/<note-id>/split.json                  one file per layer per note
-generated/notes/<note-id>/{classify,names,links,filing,state}.json
+generated/notes/<note-id>/{classify,names,links,filing,state,pages}.json
 generated/entities/<entity-id>.json                   identity: type, names, status
 generated/pages/<entity-id>.json                      the model-written page sections
 generated/embeddings/<model-slug>/<note-id>.json
@@ -107,9 +107,13 @@ _system/format.json, lease.json, generation.json
 
 - `notes/` is the only directory a person writes to. A markdown file saved
   anywhere under it by any editor becomes a note: it is given an id and its
-  modification time, its text is kept exactly, and the bare file is replaced
-  by the note. `brain start` does this within a minute; `brain process` does
-  it at once.
+  modification time, and the bare file is replaced by the note. The text is
+  kept as written, apart from line endings and blank lines at its start and
+  end. A file is taken once it has not changed for 30 seconds, so a file an
+  editor is still saving is not taken half-written; `brain start` looks
+  every minute and `brain process` when it is run. Files whose names brain
+  does not use (anything under a dot directory, such as `.obsidian/`) and
+  files that are not UTF-8 text are left alone.
 - `wiki/` holds plain markdown with `[[file-name|label]]` links, which
   Obsidian and similar editors follow. The tool overwrites a page when it
   changes, so a hand edit does not last. To change a page, write a note.
@@ -142,12 +146,19 @@ the change log), plus its own data:
 
 | File | Data |
 |---|---|
-| split | `statements`: id (`s-<note timestamp>-NN`), text, and the quote it came from |
+| split | `statements`: id (`s-<note timestamp>-<hash>`), text, and the quote it came from |
 | classify | `kinds`: statement id → fact, decision, question, action, idea, or correction |
 | names | `names`: the name as written, and person, org, or topic |
 | links | `links`: name → entity id, and how: `exact` (code), `model`, or `new` |
 | filing | `threads`: statement id → thread entity id, or none |
 | state | `relations` (later statement answers, supersedes, or repeats an earlier one) and `operations` (from correction notes) |
+| pages | `pages`: the entities whose page changed. Written last; a note is pending until it has this file |
+
+A statement id ends in a hash of the words the statement was taken from, not
+its position in the note. When a note file is edited, statements whose words
+did not change keep their ids, so a later note's relation or retraction
+still points at the same words. One that pointed at words that were edited
+away points at nothing and is ignored.
 
 A layer is skipped when its file has the same `input_hash` and the same
 prompt stamps. Changing a prompt reruns that layer, and the layers after it,
@@ -262,9 +273,15 @@ operation, then which candidates it applies to.
 | `retract` | "Ignore what I wrote about the outage cause" | those statements leave pages and answers; the note stays |
 | `not_part_of` | "The label work is not part of the quota migration" | its statements move to their own thread |
 
-The operation is applied to the entity records at once and stored in the
-note's state file, so `brain rebuild` replays it in order. The later note
-wins when two conflict. An operation from a note wins over anything a model
+Every correction in a note is decided before any is applied, so a model call
+that fails partway leaves nothing half done. Each operation is then applied
+to the entity records by its own function (`pipeline/state.py`) and stored
+in the note's state file. Code checks what the model chose: `close` and
+`reopen` apply only to threads; two pages can be the same only if they are
+the same type (an org and a topic may be merged, since a team is read as
+either); `not_same_as` undoes a merge only between the two pages it names. A
+merge records which names the surviving page gained, and undoing it removes
+only those. The later note wins when two conflict. An operation from a note wins over anything a model
 inferred, dreaming included. Retracting the note that retracted something
 restores it.
 
@@ -323,9 +340,29 @@ validation message (PydanticAI's output retries). If it still fails:
   the change log.
 
 A failure that is not about the model's answer (the endpoint is down, the key
-is wrong, the store cannot be written) stops the note at that layer. The note
-stays saved and pending, the error is shown by `brain doctor`, and the next
-`brain process` or worker round continues from the layer that failed.
+is wrong, the store cannot be written, a page could not be written) stops
+the note at that layer. The note stays saved and pending, the error is shown
+by `brain doctor`, and the next attempt continues from the layer that
+failed.
+
+Notes are processed in date order, and a note is never processed while an
+earlier one is pending, because what a note answers, replaces, or corrects
+depends on the notes before it. So a failed note holds the notes after it:
+
+- `brain jot` and the `jot` tool process the new note after any earlier
+  pending ones, and say so when it has to wait;
+- the worker tries a failed note again after 1 minute, then 2, 4, and so on
+  up to 30; `brain process` tries at once;
+- `brain rebuild` stops at the first note that fails, and `brain process`
+  continues from there;
+- `brain process --skip NOTE_ID` leaves a note out of the wiki for good (it
+  is recorded as processed with no statements; `brain rebuild` tries it
+  again). Nothing is left out automatically, because an error that looks
+  specific to one note is often a setting that is wrong for all of them.
+
+A note that arrives with a date before notes already processed (a file with
+an old modification time) is processed, and the change log says that
+`brain rebuild` is needed to apply it in order.
 
 `structured_output = "auto" | "tool" | "native" | "prompted"` maps to
 PydanticAI's output modes; gateways differ in which they support, and
@@ -378,8 +415,11 @@ machine may write and until when. S3 has no locks, so without it two machines
 pointed at one bucket would overwrite each other's files with no error. It
 belongs to a machine, not a process: `brain start` and CLI commands on one
 machine share it and take turns with a local file lock. It is taken with a
-conditional write, renewed while in use, released on exit, and expires after
-`[lease] ttl_seconds`. Some S3-compatible stores ignore `If-None-Match`; a
+conditional write, renewed while in use, and expires after
+`[lease] ttl_seconds`. On exit a process deletes it only if no other brain
+process on the machine is using it (each holds a shared lock on a local file
+while it does); otherwise `brain jot` exiting would let another machine
+write while `brain start` still believed it held the lease. Some S3-compatible stores ignore `If-None-Match`; a
 probe on first write detects that, and the lease falls back to write, wait,
 and read back.
 

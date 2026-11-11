@@ -13,11 +13,16 @@ def write(tmp_path, text: str):
     return p
 
 
-def test_defaults_without_file():
-    loaded = config.load()
-    assert loaded.path is None
-    assert loaded.settings.storage.backend == "local"
+def test_where_the_config_comes_from(tmp_path, monkeypatch):
+    loaded = config.load()  # no file: defaults
+    assert loaded.path is None and loaded.settings.storage.backend == "local"
     assert loaded.settings.storage.local_root().name == "store"
+    default = config.paths.default_config_path()
+    default.parent.mkdir(parents=True)
+    default.write_text("[server]\nport = 9999\n")
+    assert config.load().settings.server.port == 9999
+    monkeypatch.setenv("BRAIN_CONFIG", str(write(tmp_path, "[threads]\ninactivity_days = 7\n")))
+    assert config.load().settings.threads.inactivity_days == 7
 
 
 def test_file_then_env_override(tmp_path, monkeypatch):
@@ -31,19 +36,6 @@ def test_file_then_env_override(tmp_path, monkeypatch):
     assert s.storage.prefix == "x/"
     assert s.llm.embed_dim == 8
     assert loaded.env_overrides == ["BRAIN_STORAGE__BUCKET"]
-
-
-def test_brain_config_env_selects_file(tmp_path, monkeypatch):
-    p = write(tmp_path, "[threads]\ninactivity_days = 7\n")
-    monkeypatch.setenv("BRAIN_CONFIG", str(p))
-    assert config.load().settings.threads.inactivity_days == 7
-
-
-def test_xdg_default_path(monkeypatch, tmp_path):
-    p = config.paths.default_config_path()
-    p.parent.mkdir(parents=True)
-    p.write_text("[server]\nport = 9999\n")
-    assert config.load().settings.server.port == 9999
 
 
 def test_missing_explicit_file_is_an_error(tmp_path):

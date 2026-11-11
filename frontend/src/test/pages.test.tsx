@@ -39,9 +39,13 @@ describe("App", () => {
   it("saves a note as the only write", async () => {
     const calls = mockFetch({ ...home, "POST /api/notes": { id: "n-1" } });
     renderAt("/");
-    fireEvent.change(screen.getByLabelText("note"), { target: { value: "Met Priya about the quota." } });
-    fireEvent.click(screen.getByText("Save note"));
-    await waitFor(() => expect(calls.some((c) => c.method === "POST")).toBe(true));
+    const box = screen.getByLabelText("note");
+    fireEvent.change(box, { target: { value: "Met Priya about the quota." } });
+    // The shortcut pressed twice while the first save is in flight saves one note.
+    fireEvent.keyDown(box, { key: "Enter", metaKey: true });
+    fireEvent.keyDown(box, { key: "Enter", metaKey: true });
+    expect(await screen.findByText(/See what brain made of it/)).toBeTruthy();
+    expect(calls.filter((c) => c.method === "POST").length).toBe(1);
     const post = calls.find((c) => c.method === "POST")!;
     expect(post.url).toBe("/api/notes");
     expect(post.body).toEqual({ text: "Met Priya about the quota.", about: null });

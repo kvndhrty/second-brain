@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import shlex
 import subprocess
 import sys
@@ -144,13 +145,33 @@ def jot(
         text = _from_editor(LocalState().drafts_dir)
     if not text.strip():
         raise _fail("empty note; nothing saved")
+    # Text typed into the editor or piped in exists nowhere else, so it is kept in a file until it is saved.
+    keep = None
+    if message is None and file is None:
+        keep = LocalState().drafts_dir / f"draft-{secrets.token_hex(4)}.md"
+        keep.write_text(text, encoding="utf-8")
+    try:
+        _jot(text, title, about, force, process, file, keep)
+    except BaseException:
+        if keep is not None and keep.exists():
+            err.print(f"your text is kept in {keep}; retry with `brain jot --file {keep}`")
+        raise
+
+
+def _jot(
+    text: str, title: str | None, about: str | None, force: bool, process: bool, file: Path | None, keep: Path | None
+) -> None:
     with _brain("brain jot", force=force, sync=about is not None) as b:
         if about is not None:
             about = _page_id(b, about)
         try:
             result = b.jot(text, title=title, about=about)
         except JotFailed as e:
+            if keep is not None:
+                keep.unlink(missing_ok=True)  # `Brain.jot` kept the text in the draft its message names
             raise _fail(str(e), 3 if isinstance(e.cause, LeaseError) else 1) from None
+        if keep is not None:
+            keep.unlink(missing_ok=True)
         out.print(f"saved [bold]{result.note.id}[/bold] → {result.key}")
         if file is not None and file.parent == b.state.drafts_dir:
             file.unlink(missing_ok=True)
@@ -333,11 +354,22 @@ def _note_progress(status_line):
 
 
 @app.command()
-def process() -> None:
-    """Run the layers for every note that still needs them, including files saved into notes/ by hand."""
+def process(
+    skip: Annotated[
+        str | None,
+        typer.Option("--skip", help="Leave this note out of the wiki, so the notes after it are processed."),
+    ] = None,
+) -> None:
+    """Run the layers for every note that still needs them, including files saved into notes/ by hand.
+
+    Notes are processed in date order. If one fails, the notes after it wait
+    until it succeeds, or until it is left out with --skip NOTE_ID."""
     from brain.cli.render import run_processing
 
     with _brain("brain process") as b:
+        if skip is not None:
+            b.skip(skip)
+            out.print(f"{skip} is left out of the wiki; `brain rebuild` tries it again")
         run_processing(out, lambda progress: b.process_pending(_note_progress(progress)))
 
 
@@ -358,6 +390,10 @@ def rebuild(
         for line in report.failed:
             out.print(f"[red]✗[/red] {escape(line)}")
         if report.failed:
+            out.print(
+                f"stopped there, because later notes depend on it; {report.remaining} note(s) are still to do. "
+                "`brain process` continues."
+            )
             raise typer.Exit(1)
 
 

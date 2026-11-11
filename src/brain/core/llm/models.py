@@ -173,9 +173,7 @@ class LLM:
                     continue
                 raise LLMError(f"{prompt_name}: HTTP {e.status_code} from {name}: {_short(e.body)}") from e
             except UnexpectedModelBehavior as e:
-                last = e
-                if i + 1 < len(modes):
-                    continue
+                # The gateway accepted this mode; the output was wrong. Another mode would not help.
                 raise LLMOutputError(f"{prompt_name}: {name} did not return valid output: {e}") from e
             except ModelAPIError as e:
                 raise LLMError(f"{prompt_name}: {name}: {e}") from e

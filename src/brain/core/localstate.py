@@ -7,6 +7,7 @@ lock that serializes writes between processes on the same machine.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import uuid
@@ -64,6 +65,10 @@ class LocalState:
         d = self._ensure() / "drafts"
         d.mkdir(exist_ok=True)
         return d
+
+    def lease_lock(self, store_ident: str) -> Path:
+        """The file brain processes on this machine lock while they use one store's lease."""
+        return self._ensure() / f"lease-{hashlib.sha256(store_ident.encode()).hexdigest()[:12]}.lock"
 
     @contextmanager
     def try_lock(self, name: str) -> Iterator[bool]:

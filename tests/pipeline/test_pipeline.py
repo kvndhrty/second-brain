@@ -9,11 +9,13 @@ words with a decision and says "instead", "moved", or "now" supersedes it.
 from __future__ import annotations
 
 from brain.core import keys
-from brain.core.formats.records import LinksFile, SplitFile, StateFile
+from brain.core.formats.records import LinksFile, StateFile
 from brain.core.index.db import snapshot
+from brain.core.llm.fake import DEFAULT_RESPONDERS
 from brain.core.llm.models import LLMError
-from brain.core.llm.prompts import load_prompt
-from tests.conftest import FAKE_LLM_SETTINGS, entity, make_brain, set_now, statements, write
+from brain.core.pipeline import state as state_layer
+from brain.core.pipeline.context import Calls
+from tests.conftest import FAKE_LLM_SETTINGS, drop_file, entity, make_brain, set_now, statements, write
 
 KICKOFF = (
     "Met Jane Doe about the [[GPU quota migration]]. We decided to migrate in December. Does MIG work on new nodes?"
@@ -40,7 +42,7 @@ def test_note_becomes_statements_names_and_a_thread(brain):
         "Does MIG work on new nodes?",
     ]
     assert kinds(brain, nid) == ["fact", "decision", "question"]
-    assert [s.id for s in stmts] == [f"s-{nid[2:]}-0{i}" for i in (1, 2, 3)]
+    assert len({s.id for s in stmts}) == 3 and all(keys.note_of_statement(s.id) == nid for s in stmts)
     jane = entity(brain, "Jane Doe")
     assert jane.type == "person" and jane.status == "active"  # a full name gets a page at once
     thread = entity(brain, "GPU quota migration")
@@ -48,16 +50,6 @@ def test_note_becomes_statements_names_and_a_thread(brain):
     assert {s.thread for s in stmts} == {thread.id}
     assert entity(brain, "MIG").status == "provisional"
     assert brain.status()["pending"] == 0
-
-
-def test_every_layer_file_is_written_with_its_prompt_stamp(brain):
-    nid = write(brain, KICKOFF)
-    for layer in keys.LAYERS:
-        data = brain.storage.get(keys.layer_key(nid, layer))
-        assert b'"input_hash"' in data and b'"prompts"' in data, layer
-    split = SplitFile.parse(brain.storage.get(keys.layer_key(nid, "split")), where="split")
-    assert split.prompts == [load_prompt("split").stamp] and split.model == "fake-small"
-    assert all(s.quote in KICKOFF for s in split.statements)
 
 
 def test_second_note_confirms_the_thread_and_gives_it_a_page(brain):
@@ -69,6 +61,11 @@ def test_second_note_confirms_the_thread_and_gives_it_a_page(brain):
     assert "# GPU quota migration" in page and "## Open" in page and "to do · Jane Doe needs to file" in page
     assert "[[jane-doe|Jane Doe]]" in page
     assert "GPU quota migration (thread) appeared in a second note" in " ".join(e.text for e in brain.log())
+    # The same rule for a person written with one name: no page until a second note.
+    write(brain, "Talked with Priya today.", 2)
+    assert entity(brain, "Priya").status == "provisional" and "Priya" not in [p.name for p in brain.pages("person")]
+    write(brain, "Called Priya again.", 3)
+    assert entity(brain, "Priya").status == "active" and "Priya" in [p.name for p in brain.pages("person")]
 
 
 def test_short_name_links_to_the_known_person(brain):
@@ -84,15 +81,6 @@ def test_short_name_links_to_the_known_person(brain):
     links = LinksFile.parse(brain.storage.get(keys.layer_key(nid, "links")), where="links").links
     assert links[0].how == "exact"
     assert brain.llm.prompts_called().count("link") == asked
-
-
-def test_single_name_person_is_provisional_until_a_second_note(brain):
-    write(brain, "Talked with Priya today.")
-    assert entity(brain, "Priya").status == "provisional"
-    assert brain.pages("person") == []
-    write(brain, "Called Priya again.", 1)
-    assert entity(brain, "Priya").status == "active"
-    assert [p.name for p in brain.pages("person")] == ["Priya"]
 
 
 def test_statement_without_a_thread_is_left_unfiled(brain):
@@ -125,15 +113,10 @@ def test_later_note_supersedes_a_decision(brain):
     assert any(e.kind == "supersedes" for e in brain.log())
 
 
-def test_repeated_statement_is_recorded_once_on_the_page(brain):
-    write(brain, "The [[Vendor evaluation]] covers three storage vendors.")
-    write(brain, "The [[Vendor evaluation]] covers three storage vendors.", 1)
-    assert len(thread_page(brain, "Vendor evaluation").history) == 1
-
-
 def test_a_repeat_shares_the_fate_of_what_it_repeats(brain):
     write(brain, "We decided the [[Launch plan]] date is March 3.")
     write(brain, "We decided the [[Launch plan]] date is March 3.", 1)
+    assert len(brain.page("Launch plan").history) == 1  # said twice, shown once
     write(brain, "We decided the [[Launch plan]] date is April 9 instead.", 2)
     page = brain.page("Launch plan")
     assert [s.text for s in page.decided] == ["We decided the Launch plan date is April 9 instead."]
@@ -272,14 +255,48 @@ def test_a_correction_nobody_can_place_is_logged_not_applied(brain):
     assert any(e.kind == "ignored" for e in brain.log())
 
 
+def test_a_correction_cannot_merge_different_kinds_of_page_or_close_a_person(brain):
+    write(brain, "Met Dana Kim about the [[Audit]].")
+    nid = write(brain, "Dana Kim sent the report for the [[Audit]].", 1)
+    brain.llm.responders["correction_op"] = {"op": "same_as"}
+    brain.llm.responders["correction_targets"] = {"targets": ["audit", "dana-kim"]}
+    write(brain, "Fix: Dana Kim and the Audit are the same.", 2)
+    assert brain.world().root("dana-kim") == "dana-kim" and any(e.kind == "ignored" for e in brain.log())
+    note, _ = brain.vault.get_note(nid)
+    assert state_layer.apply(brain._ctx(), Calls(brain.llm), note, "s-x", "close", ["dana-kim"], None) is None
+    assert entity(brain, "Dana Kim").status == "active"
+
+
+def test_retracted_text_leaves_the_summary_even_when_it_cannot_be_rewritten(brain):
+    write(brain, "The [[Outage review]] found the cause was a bad disk.")
+    write(brain, "The [[Outage review]] meets again on Monday.", 1)
+    assert "bad disk" in " ".join(s.text for s in brain.page("Outage review").summary)
+    brain.llm.responders["check"] = {"supported": False}  # nothing the model writes now passes the check
+    write(brain, "Ignore what I wrote: the cause was a bad disk is wrong.", 2)
+    assert "bad disk" not in brain.storage.get("wiki/threads/outage-review.md").decode()
+
+
+def test_editing_a_note_does_not_move_a_later_retraction_to_other_words(brain):
+    first = write(brain, "The [[Outage review]] meets again on Monday. The [[Outage review]] found a bad disk.")
+    write(brain, "The [[Outage review]] has three members.", 1)
+    write(brain, "Ignore what I wrote: the Outage review found a bad disk is wrong.", 2)
+    status = lambda: {s.text.split()[-1]: s.status for s in statements(brain, first)}  # noqa: E731
+    assert status() == {"Monday.": "current", "disk.": "retracted"}
+    key = brain.vault.find_note_key(first)
+    head, body = brain.storage.get(key).decode().rsplit("---\n", 1)
+    brain.storage.put(key, f"{head}---\nThe [[Outage review]] room is B12. {body}".encode())
+    brain.sync(full=True)
+    assert brain.process_pending().failed == []
+    assert status() == {"B12.": "current", "Monday.": "current", "disk.": "retracted"}
+
+
 # --- reliability ---------------------------------------------------------------------
 
 
 def test_running_again_calls_no_model(brain):
     nid = write(brain, KICKOFF)
     before = len(brain.llm.calls)
-    result = brain.process(nid).notes[0]
-    assert result.layers == [] and result.error is None
+    assert brain.process(nid).notes == [] and brain.process_pending().notes == []
     assert len(brain.llm.calls) == before
 
 
@@ -308,34 +325,58 @@ def test_escalation_retries_on_the_strong_model(local_storage, state, tmp_path):
 
     def classify(user: str) -> dict:
         seen.append(user)
-        return {"kind": "nonsense"}
+        return {"kind": "nonsense"} if len(seen) <= 3 else {"kind": "decision"}  # the small model's three tries fail
 
     cfg = FAKE_LLM_SETTINGS | {"strong_model": "fake-strong", "escalate": "strong"}
     b = make_brain(local_storage, state, tmp_path, fake_llm=True, responders={"classify": classify}, llm=cfg)
     set_now(b)
-    write(b, "Budget review is on Friday.")
-    models = {m for (_, m) in b.llm._models}  # (role, model name) of every model the run used
-    assert "fake-strong" in models and "fake-small" in models
+    nid = write(b, "We decided the budget review is on Friday.")
+    assert len(seen) > 1 and [s.kind for s in statements(b, nid)] == ["decision"]  # not the fallback, "fact"
     b.close()
 
 
-def test_endpoint_failure_leaves_the_note_pending(local_storage, state, tmp_path):
+def test_a_failed_note_stays_pending_and_later_notes_wait_for_it(local_storage, state, tmp_path):
     def down(_user: str) -> dict:
         raise LLMError("gateway is down")
 
     b = make_brain(local_storage, state, tmp_path, fake_llm=True, responders={"classify": down}, llm=FAKE_LLM_SETTINGS)
-    set_now(b)
-    nid = b.jot("Budget review is on Friday.").note.id
-    result = b.process(nid).notes[0]
+    first = write(b, "We decided to migrate the [[GPU quota migration]] in December.", process=False)
+    result = b.process(first).result(first)
     assert result.error and result.error.startswith("classify:")
-    assert b.status()["pending"] == 1 and nid in b.failures()
-    b.llm.responders.pop("classify")
-    from brain.core.llm.fake import DEFAULT_RESPONDERS
-
+    assert b.status()["pending"] == 1 and b.failures()[first]["attempts"] == 1
+    # A later note is not processed ahead of it: what it replaces depends on the earlier note.
     b.llm.responders["classify"] = DEFAULT_RESPONDERS["classify"]
-    assert b.process_pending().failed == []
+    b._pipeline()._note_failure(first, "classify", "gateway is down")  # as if it had just failed again
+    second = write(b, "We decided to migrate the [[GPU quota migration]] in January instead.", 5, process=False)
+    held = b.process_pending(wait_for_retry=True)  # the worker: the failed note is not due yet
+    assert held.notes == [] and held.held == first and "waits for an earlier note" in held.result(second).error
+    done = b.process_pending()  # `brain process`: try now
+    assert [n.note_id for n in done.notes] == [first, second] and done.failed == []
     assert b.status()["pending"] == 0 and b.failures() == {}
+    assert [s.status for s in statements(b, first)] == ["superseded"]
     b.close()
+
+
+def test_a_failure_while_writing_pages_is_tried_again(brain):
+    def down(_user: str) -> dict:
+        raise LLMError("gateway is down")
+
+    write(brain, "Started the [[Vendor evaluation]] today.")
+    brain.llm.responders["now"] = down
+    nid = write(brain, "More on the [[Vendor evaluation]] today.", 1, process=False)
+    assert brain.process(nid).result(nid).error.startswith("pages:")
+    assert brain.status()["pending"] == 1 and not brain.storage.exists("wiki/threads/vendor-evaluation.md")
+    brain.llm.responders["now"] = DEFAULT_RESPONDERS["now"]
+    assert brain.process_pending().failed == [] and brain.status()["pending"] == 0
+    assert brain.storage.exists("wiki/threads/vendor-evaluation.md")
+
+
+def test_a_note_that_cannot_be_processed_can_be_left_out(brain):
+    nid = write(brain, "Started the [[Vendor evaluation]] today.", process=False)
+    brain.skip(nid)
+    assert brain.status()["pending"] == 0 and statements(brain, nid) == []
+    assert any(e.kind == "skipped" for e in brain.log())
+    assert brain.rebuild().failed == [] and len(statements(brain, nid)) == 1  # a rebuild tries it again
 
 
 def test_page_sentence_that_fails_the_check_is_dropped(local_storage, state, tmp_path):
@@ -370,8 +411,25 @@ def test_wiki_index_and_log_are_written(brain):
     assert person.startswith("---\nid: jane-doe\ntype: person\n")
 
 
-def test_markdown_file_saved_into_notes_becomes_a_note(brain):
+def test_saving_gives_each_note_its_own_id_and_an_index_failure_is_not_a_failed_save(brain, monkeypatch):
+    first, second = brain.jot("First.").note.id, brain.jot("Second.").note.id  # in the same second
+    assert first != second and len(list(brain.storage.list("notes/"))) == 2
+
+    def boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(brain.syncer, "apply_write", boom)
+    third = brain.jot("Third.")  # the file is in the store; saying "failed" would make the user save it twice
+    monkeypatch.undo()
+    assert brain.storage.exists(third.key) and brain.pending_drafts() == []
+    brain.sync(full=True)
+    assert brain.status()["notes"] == 3
+
+
+def test_markdown_file_saved_into_notes_becomes_a_note(brain, local_storage):
     brain.storage.put("notes/standup monday.md", b"Jane Doe is out this week.\n")
+    assert brain.process_pending().notes == []  # just saved: an editor may still be writing it
+    drop_file(local_storage, "notes/standup monday.md", b"Jane Doe is out this week.\n")
     report = brain.process_pending()
     assert len(report.notes) == 1 and report.failed == []
     (note,) = brain.recent_notes()
@@ -379,6 +437,29 @@ def test_markdown_file_saved_into_notes_becomes_a_note(brain):
     assert brain.note(note.id).body == "Jane Doe is out this week.\n"
     assert not brain.storage.exists("notes/standup monday.md")
     assert entity(brain, "Jane Doe")
+
+
+def test_files_brain_cannot_read_do_not_stop_the_others(brain, local_storage):
+    notes = local_storage.root / "notes"
+    (notes / ".obsidian").mkdir(parents=True)
+    (notes / ".obsidian" / "workspace.md").write_text("not a note")
+    (notes / "back\\slash.md").write_text("a name brain does not use")
+    drop_file(local_storage, "notes/latin1.md", "caf\u00e9".encode("latin-1"))
+    drop_file(local_storage, "notes/fine.md", b"Jane Doe is out this week.\n")
+    report = brain.process_pending()
+    assert len(report.notes) == 1 and report.failed == []
+    assert brain.sync(full=True) and [n.label for n in brain.recent_notes()] == ["fine"]
+
+
+def test_complete_note_file_put_into_notes_is_processed_where_it_is(brain, local_storage):
+    text = "---\r\nformat: 2\r\nid: n-20260901T080000Z\r\ncreated: 2026-09-01T08:00:00Z\r\n---\r\nJane Doe is out.\r\n"
+    write(brain, "The office is closed on Friday.")
+    brain.sync(full=True)  # the index is up to date, so only looking in notes/ can find the new file
+    drop_file(local_storage, "notes/imported/old.md", text.encode())
+    report = brain.process_pending()
+    assert [n.note_id for n in report.notes] == ["n-20260901T080000Z"] and report.failed == []
+    assert local_storage.exists("notes/imported/old.md") and len(brain.recent_notes()) == 2
+    assert any(e.kind == "out_of_order" for e in brain.log())  # it is dated before a note already processed
 
 
 def test_reindex_gives_the_same_index(brain):

@@ -20,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from brain.core.pipeline.runner import NoteResult
+from brain.core.pipeline.runner import NoteResult, ProcessReport
 from brain.core.services import Brain, Busy
 
 FULL_LIST_SECONDS = 600
@@ -86,14 +86,15 @@ class Worker:
         w.event.wait(timeout)
         return w.result
 
-    def _finish(self, results: list[NoteResult], brain: Brain) -> None:
+    def _finish(self, report: ProcessReport, brain: Brain) -> None:
+        """Answer whoever waits for a note: it was processed, it failed, or it waits for an earlier note."""
         with self._waiters_lock:
-            done = {r.note_id: r for r in results}
             pending = {r[0] for r in brain.db.conn.execute("SELECT id FROM notes WHERE done = 0")}
+            stopped = bool(report.failed or report.held)
             for note_id in list(self._waiters):
-                if note_id in done or note_id not in pending:
+                if stopped or note_id not in pending:
                     for w in self._waiters.pop(note_id):
-                        w.result = done.get(note_id) or NoteResult(note_id)
+                        w.result = report.result(note_id)
                         w.event.set()
 
     def _run(self) -> None:
@@ -108,18 +109,21 @@ class Worker:
                     if not brain.llm.configured:
                         self.status.enabled = False
                         self.status.current = "idle: no model endpoint configured"
-                        brain.sync()
-                        self._finish([], brain)
+                        brain.adopt()  # files put into notes/ by hand are still taken in
+                        self._finish(ProcessReport(), brain)
                     else:
                         if time.monotonic() - last_full >= self.full_list:
                             brain.sync(full=True)
                             last_full = time.monotonic()
                         self.status.current = "processing"
-                        report = brain.process_pending(progress=self._progress)
+                        report = brain.process_pending(progress=self._progress, wait_for_retry=True)
                         self.status.processed += sum(1 for e in report.notes if not e.error)
                         self.status.failed += len(report.failed)
-                        self.status.last_error = report.failed[-1].error if report.failed else None
-                        self._finish(report.notes, brain)
+                        if report.failed:
+                            self.status.last_error = f"{report.failed[-1].note_id}: {report.failed[-1].error}"
+                        elif not report.held:
+                            self.status.last_error = None
+                        self._finish(report, brain)
                         if not any(e.error is None for e in report.notes):
                             self._maybe_dream(brain)
                         self.status.current = "idle"
@@ -143,11 +147,11 @@ class Worker:
 
     def _maybe_dream(self, brain: Brain) -> None:
         reason = "requested" if self._dream_requested else brain.dream_due()
-        self._dream_requested = False
         if reason is None:
             return
         self.status.current = f"dreaming: {reason}"
         run = brain.dream(progress=lambda msg: self._progress("", f"dreaming: {msg}"))
+        self._dream_requested = False  # only once the pass has run: a failed attempt is made again
         self.status.last_dream = run.run_id
         if run.errors:
             self.status.last_error = run.errors[-1]

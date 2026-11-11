@@ -11,7 +11,7 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 
 from brain.core.config import StorageConfig, TLSConfig
-from brain.core.storage.base import NotFound, ObjectInfo, PreconditionFailed, StorageError, check_key
+from brain.core.storage.base import NotFound, ObjectInfo, PreconditionFailed, StorageError, check_key, valid_key
 from brain.core.tls import boto_tls
 
 _PRECONDITION_CODES = {"PreconditionFailed", "ConditionalRequestConflict", "412", "409"}
@@ -84,8 +84,8 @@ class S3Storage:
             for page in pages:
                 for obj in page.get("Contents", []):
                     key = obj["Key"][len(self.prefix) :]
-                    if not key or key.endswith("/"):
-                        continue
+                    if not key or key.endswith("/") or not valid_key(key):
+                        continue  # a folder marker, or a name brain does not use (a tool's dot directory)
                     yield ObjectInfo(
                         key=key,
                         etag=_unquote(obj.get("ETag", "")),

@@ -279,7 +279,14 @@ def build_server(
         if process_note is not None:
             outcome = process_note(saved.note.id)
         else:
-            outcome = handle.call(lambda b: b.process(saved.note.id).notes[0], sync=False)
+
+            def run(b: Brain):
+                try:
+                    return b.process(saved.note.id).result(saved.note.id)
+                except (Busy, LeaseError):
+                    return None  # the note is saved; the process that is running will pick it up
+
+            outcome = handle.call(run, sync=False)
         if outcome is None:
             result.error = "still processing in the background; check later with get_note"
             return result

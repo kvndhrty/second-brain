@@ -62,7 +62,7 @@ To try every command without a model endpoint, set `BRAIN_FAKE_LLM=1` (see
 From a release wheel (the web UI is included; no Node needed):
 
 ```sh
-uv tool install --managed-python --python 3.12 https://github.com/kvndhrty/second-brain/releases/download/v0.2.0/brain_journal-0.2.0-py3-none-any.whl
+uv tool install --managed-python --python 3.12 https://github.com/kvndhrty/second-brain/releases/download/v0.2.1/brain_journal-0.2.1-py3-none-any.whl
 ```
 
 From a clone (the web UI is built during install, which needs Node 22+ and npm;
@@ -217,9 +217,14 @@ The `wiki/` folder can be opened in Obsidian or any editor; links between
 pages and to the notes they cite work there. It is overwritten when a page
 changes, so edit by writing a note, not by editing the page.
 
-A markdown file saved anywhere under `notes/` becomes a note: `brain start`
-picks it up within a minute, and `brain process` at once. Its text is kept
-exactly.
+A markdown file saved anywhere under `notes/` becomes a note once it has not
+changed for 30 seconds: `brain start` looks every minute, and `brain process`
+when you run it.
+
+Notes are processed in date order. If one fails (the model endpoint is down),
+it stays saved, the notes after it wait, and it is tried again. `brain
+process --skip NOTE_ID` leaves a note out of the wiki if it can never be
+processed.
 
 ## Web UI
 
